@@ -823,7 +823,7 @@ pub fn decode_entities(text: &str) -> String {
 }
 
 /// The character of an entity name (between `&` and `;`).
-fn entity(name: &str) -> Option<char> {
+pub(crate) fn entity(name: &str) -> Option<char> {
     if let Some(number) = name.strip_prefix('#') {
         let code = match number.strip_prefix(['x', 'X']) {
             Some(hex) => u32::from_str_radix(hex, 16).ok()?,

@@ -35,7 +35,7 @@ A debug build opens a console window next to the GUI; a release build does not.
 |---|---|
 | Settings, working configuration, profiles | `%APPDATA%\siteone-crawler-gui\` |
 | Runs (one folder each), HTTP and AI caches, `crash.log` | `%LOCALAPPDATA%\siteone-crawler-gui\` (the runs folder can be moved in Settings) |
-| Passwords and API keys | Windows Credential Manager, service `siteone-crawler-gui` |
+| Passwords and API keys | Windows Credential Manager, service `siteone-crawler-gui` (a data folder set with `SITEONE_GUI_DATA_DIR` has a service of its own, `siteone-crawler-gui <hash>`) |
 
 `SITEONE_GUI_DATA_DIR` replaces both folders with one (portable use, tests); a relative path is
 read against the folder the GUI is started from. The GUI makes its data folder its working
@@ -60,7 +60,10 @@ runs everything:
   (`cargo build -p siteone-crawler`, a no-op when up to date) and crawl a small generated site served
   by the crawler's own `--serve-offline` on 127.0.0.1 — no network. The external link check and the
   link texts — and the retries of `tests/core_retry.rs` — run against a small HTTP server written in
-  the tests (`tests/link_server`, on 127.0.0.1 and ::1).
+  the tests (`tests/link_server`, on 127.0.0.1 and ::1); the credential tests across https and http
+  against one that speaks both on one port (`tests/tls_server`, with a throwaway self-signed
+  certificate). `tests/core_powershell.rs` runs exported and pasted command lines in the real
+  `pwsh` and `powershell` when present (skipped with a message otherwise).
 - **UI tests** `tests/ui_*.rs` with `egui_kittest`: interactions on every page, and PNG snapshots
   of every page and tab (two sizes, light and dark) written to `gui/tests/snapshots/`. A snapshot
   is checked for size and for not being blank, not compared with a reference image; look at the
@@ -115,6 +118,13 @@ cargo test -p siteone-crawler-gui
   start port); other pages of the site are fetched without them. A run from History that used them
   does not fetch its pages (History keeps no password; Setup's is never borrowed). A page that
   changed since the crawl, or a link built by a script, shows "not found on the page".
+- **Line of the reference**: the same fetch locates the link in the file, so *Found on* ends with
+  the place to fix — `…/page-styles.css:1929`, or line and column on a minified line
+  (`style.min.css:1:20345`); the tooltip and the link report add "(and N more)" when the page
+  references the link again. A "found on" that is a stylesheet (a missing font or background image
+  in a `url()`) is fetched too, within the same 200 pages (up to 8 MB of it; 2 MB of a page); its
+  link text reads "in a stylesheet". The position is in the file as fetched after the crawl: a page
+  that changed since, or a link built by a script, has none.
 - **Retry** (Link checker tab, after the crawl): selected rows, or the retry queue, are requested
   again one by one — a crawled URL by the crawler (one process per URL, exactly one request: no
   robots.txt, no assets, no links, a redirect not followed), an external link by the app's check.
@@ -132,8 +142,21 @@ cargo test -p siteone-crawler-gui
 - **Importing** a config file or a command replaces the configuration including its passwords:
   `--http-auth`, `--mail-smtp-pass` and `--upload-password` not in the import are cleared; the AI
   API key stays unless the import has one. Saved profiles keep their passwords. A pasted command is
-  read as PowerShell or as Bash, as chosen in the dialog (the two shells *Copy* writes for); cmd
-  syntax is not read, and a PowerShell variable (`$name`, `$(…)`) is refused rather than guessed.
+  read with the quoting of PowerShell and of Bash (the two shells *Copy* writes for), and the dialog
+  says which reading it imports: when both give the same arguments, none is named; when only one
+  shell can read it, that one; when they differ, the shell the text shows (a Windows path such as
+  `C:\Exports\site` or `'it''s'` is PowerShell; a `\` line ending, `'\''` or `$'…'` is Bash), with
+  the other reading one click away. Without such a sign, or with signs of both, the app does not
+  guess: it shows how each shell reads the first differing argument and asks. cmd syntax is not
+  read, and a variable (`$name`, `$(…)`, a Bash `` `…` ``) is refused rather than guessed, as is
+  anything else the shell would not pass as written (an unquoted `;`, `|`, `&`, a redirection,
+  PowerShell's `--%`, Bash's `~` and `!` history references, a second command, …). Bash glob
+  characters (`*`, `?`, `[`) are taken as written. PowerShell is read as PowerShell 7.3 or later
+  passes it; the Bash reading is not checked against a real Bash.
+- **Copy as PowerShell** writes for PowerShell 7.3 or later, where every value reaches the crawler
+  exactly. Windows PowerShell 5.1 passes a value with a double quote, or with a space and a trailing
+  backslash, differently; the app then warns and names the options. Both were checked against the
+  real shells (`tests/core_powershell.rs`).
 - **Relative input paths** (`--url-list`, `--ai-prompt-file`, `--ai-api-key-file`,
   `--ai-schema-file`, `--ci-baseline`, `--browser-path`, `--ffmpeg-path`) name files in
   `%LOCALAPPDATA%\siteone-crawler-gui\`; the command preview shows the absolute path the crawler

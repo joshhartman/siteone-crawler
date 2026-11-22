@@ -86,7 +86,7 @@ gui/
       profiles.rs          # saved configurations
       history.rs           # run records
       link_check.rs        # external links of a run (from the result JSON), check results, external-links.json
-      link_text.rs         # link texts per source page, URL normalization, link-texts.json
+      link_text.rs         # link texts and reference positions per source page, URL normalization, link-texts.json
       retry.rs             # retry queue and results, retries.json, the retry child's argv, merge into the run
       link_report.rs       # link-report.html (rendering, escaping), grouping by page
       coverage.rs          # what a run checked and did not (scope from the result JSON, gaps)
@@ -97,7 +97,7 @@ gui/
       runner.rs            # child process: spawn, stop, kill, stdout/stderr, events tail
       tools.rs             # one-shot calls: --version, --ai-list-models, --ai-check
       link_check.rs        # the external link check (§4.7): blocking HTTP on worker threads
-      link_text.rs         # link texts (§4.8): fetches source pages of the crawled site, reads links
+      link_text.rs         # link texts (§4.8): fetches source pages of the crawled site, reads links and locates them
       retry.rs             # a retry pass (§4.9): one crawler child per crawled URL, the link check for external links
       ansi.rs              # ANSI SGR + carriage-return handling → styled lines
       shell.rs             # open file/URL, reveal in Explorer, command quoting
@@ -283,17 +283,20 @@ after the crawl (`backend/link_check.rs`, no egui; workers + `mpsc` + waker like
 ### 4.8 Link texts
 
 The crawler records no link text. To help find a broken link on its page, the app fetches the pages
-the broken and external links were found on and reads the text of the link that points to each
-(`backend/link_text.rs`).
+the broken and external links were found on and reads the text of the link that points to each and
+where in the file it is — the line to go and fix (`backend/link_text.rs`).
 
 - **Which pages**: after a crawl, the pages of the internal 404s (the `404` table's `sourceUqId`);
   once the run's external links are checked, also the pages of the external links. Each page is
   fetched once per run; what it says about every target the run knows is kept. At most 200 pages
-  per run (the rest is reported). Stylesheets are not fetched (`CSS url()`).
+  per run (the rest is reported). A *found on* that is a stylesheet (a missing font or background
+  image referenced by `url()`) is fetched like a page and counts within the same 200.
 - **Only the crawled site**: a page whose host is not the start host (`www.` aside) is never
   requested; redirects (at most 10, followed by the app) only within the site. Like the crawler:
   the User-Agent rule of §4.7, `--proxy`, `--timeout` (≥ 10 s), `--accept-invalid-certs`. One page
-  at a time, 500 ms apart, at most 2 MB read, HTML only.
+  at a time, 500 ms apart; HTML and CSS only (by `Content-Type`, else a `.css` path); at most 2 MB of
+  a page and 8 MB of a stylesheet read (an unminified framework bundle can outgrow a page; a
+  reference beyond the cap is not found).
 - **Credentials**: `--http-auth` and the `--header` values go with a request — the first and each
   redirect, judged on its own URL — only where the crawler sends them
   (`ParsedUrl::may_send_credentials`: not from https to http; for an IP address or a single-label
@@ -308,7 +311,25 @@ the broken and external links were found on and reads the text of the link that 
   and host case, default port, fragment, trailing slash, percent-encoding). `<a>`: its text,
   whitespace collapsed (around an image without text: `[image: alt]` / `[image]`); `<area>`/`<img>`:
   `alt`; otherwise the tag (`<script src>`). Up to three different texts joined by ` | `, at most 200
-  characters. A page that does not reference the target: *not found on the page*.
+  characters. A page that does not reference the target: *not found on the page*. A reference
+  the elements above do not cover (an inline `style`, a `<style>` block, `<object data>`, …) is
+  named by what it is (`<div style> url()`). A stylesheet has no link text: *in a stylesheet*
+  (*not found in the stylesheet* when it no longer references the target).
+- **The position** of the reference in the file as fetched, kept next to the text: the first
+  reference's line and column (1-based, in characters, where the URL text starts) and how many
+  references the page has. Found by a tolerant scan of the raw text (the HTML parser gives no
+  positions): in HTML, the attribute values that hold URLs (`href`, `src`, `srcset` items,
+  `poster`, `<object data>`, `action`, `<meta content>`, …), entities decoded before the value is
+  resolved, and the `url()` of inline `style` attributes and `<style>` blocks; in a stylesheet,
+  `url()` (quoted or not) and `@import "…"`, resolved against the stylesheet's own URL. Comments
+  and the text of `<script>` are skipped. URLs are resolved (`<base href>` honoured) and compared
+  as for the text. Shown as `…/page-styles.css:1929`; a reference on a line longer than 500
+  characters (a minified file) as line and column, `style.min.css:1:20345`. Honest limits: the
+  position is in the file as fetched after the crawl; a page that changed since, or a link that a
+  script builds, has none (the cell is as without it).
+- **External links**: their *found on* pages (from `external-urls`, any number) are fetched under
+  the same rules — once the run's external links are checked, pages of the crawled site only,
+  within the same 200 — and get positions there; no request is added for positions.
 - The crawler keeps only the first page that referenced an internal URL (404s only), so the app
   cannot list every page that links to a URL.
 
@@ -414,7 +435,9 @@ external resource, light and dark by `prefers-color-scheme`, printable).
   checked); **What was checked**; then one table per group that has rows — broken internal pages,
   broken internal assets, broken external links (an older run's crawled external URLs included),
   refused external links — and, folded (`<details>`), the working external links. Columns: status,
-  URL, title or kind, link text, found on. Last, **Broken links by page**.
+  URL, title or kind, link text, found on — each page with where it references the link
+  (`…/page-styles.css:1929`, "(and 2 more)" for further references on that page; the link opens
+  the page without it). Last, **Broken links by page**.
 - **What was checked** (`model/coverage.rs`): *Scope* — the start host, with or without `www.`, and
   the `--allowed-domain-for-crawling` and `--include-regex` values of the result JSON's `options`;
   *Crawled URLs* — the number and the newest answers by class ("268 OK (2xx), 1 redirect (3xx),
@@ -439,7 +462,7 @@ external resource, light and dark by `prefers-color-scheme`, printable).
   `--max-visited-urls` without listing them, so those gaps never carry a number.
 - **Broken links by page**: the rows of the groups above that are broken or refused, grouped by
   the page they were found on, as *By page* in the Link checker tab: a heading per page (a link,
-  the number of links), its links (status, URL, title or kind, link text); a link found on several
+  the number of links), its links (status, URL, title or kind, line on that page, link text); a link found on several
   pages under each; pages with more links first, then by URL; the links of no known page last
   under "Page not reported by the crawler" with the reason. Left out when it would only repeat the
   groups — a single group (all on one page, or no page known) or no page known — and when nothing is
@@ -554,21 +577,56 @@ imported command without `--timeout` gets the app's default.
   directories stay relative (they land in the run folder, §4.2). An imported config file's relative
   input paths name files next to it: made absolute against its folder on import.
 - Import: a CLI config file (one argument per line, `#` comments) or a pasted command line →
-  `CrawlConfig`; unknown options are listed to the user, not dropped silently. The paste dialog has
-  **Import as PowerShell** and **Import as Bash**: the command is split with that shell's quoting
-  rules (`split_command_line`) — the shells the app exports for, so what the app copied pastes back
-  exactly (unit test: Windows paths, apostrophes incl. typographic ones, spaces, quotes, backticks,
-  `$`, line breaks, continuation lines). PowerShell: `'…'` literal with `''` for `'`; `"…"` with
-  backtick escapes and `""`; outside quotes a backtick takes the next character, before a line break
-  it continues the line; `#` at an argument's start is a comment; a variable or expression (`$name`,
-  `$(…)`) outside single quotes is refused, not evaluated. Bash: POSIX rules (`shlex`), `\` + line
-  break continues the line. Nothing is run in a shell; cmd syntax is not read. It
+  `CrawlConfig`; unknown options are listed to the user, not dropped silently. A pasted command is
+  split with the quoting rules of PowerShell and of Bash (`split_command_line`) — the shells the app
+  exports for — and `read_command_line` decides which reading applies (`CommandLineReading`):
+  **same** argv from both → imported, no shell named; **only one** shell reads it → that one,
+  named ("Read as PowerShell", with the other shell's reason); both read it **differently** → the
+  signs in the text decide (`shell_hints`), and the dialog names the reading, the sign and the
+  first argument the other shell would read differently, with *Import as Bash instead* (or
+  PowerShell) one click away. PowerShell signs: a backslash before a letter, digit, `.`, `_` or `-`
+  outside quotes (a path, which Bash would take as an escape), a doubled single quote inside single
+  quotes, a backtick before a line break or inside double quotes, the call operator `&` before the
+  program. Bash signs: a backslash before a line break, `'\''`, `\"` `\$` `\\` inside double quotes,
+  `$'…'`, an argument that goes on after the quoted string it starts with (PowerShell makes two of
+  it). No sign, or signs of both → **no guess**: the dialog shows how each shell reads the first
+  differing argument and offers *Import as PowerShell* and *Import as Bash*, neither preselected.
+  **Neither** reads it → Import is off and both errors are shown, the more plausible shell's first
+  (by the signs; PowerShell without one). The app never imports a value that differs from what the
+  shell would pass without saying so. What the app copied for either shell is read back as that
+  shell, or as both alike, with its argv (unit test: Windows paths, apostrophes incl. typographic
+  ones, spaces, quotes, backticks, `$`, line breaks, continuation lines, a configuration as
+  exported). PowerShell, read as PowerShell 7.3+ passes it to a program
+  (checked against the real shells, §8): `'…'` literal with `''` for `'`; `"…"` with backtick
+  escapes and `""`; outside quotes a backtick escapes the next character the same way, between
+  arguments before a line break it continues the line; an argument that starts with a quoted
+  string ends with it (`'a'b` is two); `#` or `<#…#>` at an argument's start is a comment; Unicode
+  whitespace separates. Refused with the reason, never guessed: a variable or expression (`$name`,
+  `$(…)`, `@…`), an unquoted `;` `|` `&` `(` `)` `{` `}`, a redirection, a comma next to a space,
+  quote or comma (a list, passed differently by 5.1 and 7), an argument starting with a single dash
+  that PowerShell splits at `.`, `[` or a backtick (`-t=5.5`), `--%`, a line break without a
+  continuation followed by more, `` `0 ``, and `` `e `` / `` `u{…} `` (5.1 and 7 differ). Bash, as
+  Bash reads a command's arguments (`split_bash`): blanks separate, adjacent parts form one; `'…'`
+  literal; `"…"` takes `\` only before `$` `` ` `` `"` `\` and a line break; `$'…'` with the C
+  escapes (`\n`, `\t`, `\'`, `\xHH`, `\u…`, …); outside quotes `\` escapes the next character and
+  before a line break continues the line; `#` at an argument's start is a comment. Refused with the
+  reason: a variable, expansion or command substitution (`$name`, `${…}`, `$(…)`, `` `…` ``,
+  `$"…"`), an unquoted `;` `|` `&` `<` `>` `(` `)` `{` `}`, `~` at an argument's start, a `!` that a
+  terminal's Bash reads as a history reference, a line break without a continuation followed by
+  more, a `$'…'` that decodes to a NUL or to bytes that are not UTF-8. Glob characters (`*` `?`
+  `[`) are taken as written (a pattern that matches no file is passed so; an option argument
+  `--name=…` names none). Nothing is run in a shell; cmd syntax is not read. It
   replaces the configuration with its passwords: `--http-auth`, `--mail-smtp-pass`,
   `--upload-password` the import does not contain are cleared, never carried to another site. The
   AI API key stays unless the import has one (it belongs to the provider, not to a site; as in
   *Reset all*). Saved profiles keep their passwords.
 - Export: config-file text; command line quoted for PowerShell or for POSIX shells. Secrets are
-  masked (`••••`) in previews and exports unless the user chooses *Include secrets*.
+  masked (`••••`) in previews and exports unless the user chooses *Include secrets*. The PowerShell
+  command is for PowerShell 7.3 or later, where every value reaches the crawler exactly (an
+  argument starting with a single `-` is quoted too: PowerShell would split `-t=5.5`). Windows
+  PowerShell 5.1 passes a value with a `"`, an empty one, or one with whitespace ending in `\`
+  differently, and no quoting is right for both: *Copy as PowerShell* says so in its tooltip and,
+  when the command holds such a value, warns with the option names (`powershell_legacy_hazards`).
 
 ### 5.3 Presets (`model/presets.rs`)
 
@@ -610,11 +668,11 @@ fixture.
 | Profiles | `<config>/profiles/<slug>.json` | name + `CrawlConfig` |
 | Runs | `<runs>/<run-id>/` | `run.json` (meta + configuration snapshot + summary numbers), `events.ndjson`, `console.log`, outputs |
 | External link check | `<runs>/<run-id>/external-links.json` | per link: outcome, status, failure, final URL, title, time, pages found on; `complete: false` for a stopped check; loaded for past runs |
-| Link texts | `<runs>/<run-id>/link-texts.json` | per source page: fetched (target → text), stylesheet, or not fetched (why); the number of pages over the cap |
+| Link texts | `<runs>/<run-id>/link-texts.json` | per source page: an HTML page read (target → text, target → position: line, column, count, long line), a stylesheet read (target → position), a stylesheet not fetched (files of earlier versions), or not fetched (why); the number of pages over the cap. Positions are optional: files of earlier versions load |
 | Retries | `<runs>/<run-id>/retries.json` | the retry queue in order; per retried URL the first answer, the newest answer, the reason of a retry that could not be made (fields of older files, `retriedAt` and `retries`, are ignored) |
 | Link report | `<runs>/<run-id>/link-report.html` | written by the app from the current state (§4.10) |
 | Caches | `<data>/cache/http`, `<data>/cache/ai` | shared between runs |
-| Secrets | Windows Credential Manager, service `siteone-crawler-gui` | account = `<profile-slug or "session">/<option>` |
+| Secrets | Windows Credential Manager, service `siteone-crawler-gui`; with the `SITEONE_GUI_DATA_DIR` override `siteone-crawler-gui <hash of the folder>`, so two data folders never share secrets | account = `<profile-slug or "session">/<option>` |
 
 `<config>` = `%APPDATA%\siteone-crawler-gui`, `<data>` = `%LOCALAPPDATA%\siteone-crawler-gui`,
 `<runs>` = `<data>\runs` unless changed in Settings. `SITEONE_GUI_DATA_DIR` overrides both roots
@@ -682,6 +740,15 @@ active the button is disabled with the tooltip "A crawl is running" and a link t
 **Profile bar.** Select a profile (loads it; asks first when there are unsaved changes), *Save*,
 *Save as…*, and a menu: *Rename*, *Delete*, *Import config file…*, *Paste command line…*,
 *Export config file…*, *Reset to defaults*. A dot marks unsaved changes.
+
+**Paste command line dialog.** One text field, a status line under it that follows the text
+(§5.2: "PowerShell and Bash read this the same way" · "Read as PowerShell (sign). Bash would read
+“…” instead." · the question · the errors), then the buttons: **Import** (off while the field is
+empty or neither shell reads the text) and **Cancel**; with a detected reading also *Import as
+Bash instead* (or PowerShell); when no sign decides, *Import as PowerShell* and *Import as Bash*
+instead of Import, neither of them primary. The import's message names the shell when one was
+chosen ("Imported 3 options from the command line (read as PowerShell)"). The dialog says that
+PowerShell is read as 7.3 or later passes it.
 
 **Simple view.** A grid of preset cards (icon, name, one-line description; the active one is
 highlighted; no card for *Custom*, §5.3) followed by sections that expose the most used options
@@ -781,15 +848,19 @@ crawl's outcome, which does not wait for the check.
   check (§4.7) that are broken or refused, with the status in words ("Refused 403", "404",
   "Connection failed", "Timeout", "TLS error", "Too many redirects"). *Found on* is joined from the
   result JSON's `404` table for crawled URLs (404s only) and is the check's pages for external links
-  (the first, "+N more" with the full list in the tooltip and in Copy list). *Link text* (§4.8) is
-  the text of the link on that page, or "not found on the page", "source not fetched", "CSS url()",
-  "pending…". Views with counts: *All broken*, *Internal pages*, *Internal assets*, *External
+  (the first, "+N more" with the full list in the tooltip and in Copy list). Once the page was read,
+  *Found on* ends with where it references the link (§4.8): `…/page-styles.css:1929`, or
+  `style.min.css:1:20345` on a long line — the page is cut in the middle when the column is narrow,
+  the position never; the tooltip has the full page and "Referenced at line 1929 (and 2 more) in
+  the file as fetched after the crawl."; opening the page opens it without the position. *Link
+  text* (§4.8) is the text of the link on that page, or "not found on the page", "in a
+  stylesheet", "not found in the stylesheet", "source not fetched", "pending…". Views with counts: *All broken*, *Internal pages*, *Internal assets*, *External
   broken*, *All external* (every checked link, working ones included, with the page **title**; the
   final URL of a redirect in the tooltip; broken and refused first). Filter by text (URL, title,
   link text, found on; and by status class when opened from the Overview's breakdown); sortable;
   resizable columns, long values cut in the middle with the full value in the tooltip; **Copy list**
-  (tab-separated: Status, Where, URL, Link text, Found on, and Title and Final URL in *All
-  external*); a row menu opens the URL, where it redirects, or the page it was found on. A banner
+  (tab-separated: Status, Where, URL, Link text, Found on — each page with its position — and Title
+  and Final URL in *All external*); a row menu opens the URL, where it redirects, or the page it was found on. A banner
   above says where the check stands: not checked ("N external links were found but not checked"
   with **Check external links now**, disabled with the reason while a crawl or another check runs),
   waiting, running (n of m, **Stop check**), stopped (with Check now), failed; a finished check is
@@ -803,7 +874,8 @@ crawl's outcome, which does not wait for the check.
   enough for one line): the broken views laid out as in Xenu's "broken links, ordered by page" — a
   heading row per page the links were found on (drawn across the row: page icon, or a stylesheet
   icon, the page cut in the middle, "3 broken links"; double-click or the menu opens it, the menu
-  copies it), under it its links with Status, Kind, Where, URL and the link text on that page (no
+  copies it), under it its links with Status, Kind, Where, URL, *Line* (where that page references
+  the link: `1929`, `1:20345`; "(and N more)" in the tooltip) and the link text on that page (no
   *Found on*). A link found on several pages (external links carry all their sources) is under
   each; pages with more links first, then by URL; the links whose page is not known last under
   "Page not reported by the crawler" ("Pages known when the crawl finishes" while it runs, "Page not
@@ -813,7 +885,8 @@ crawl's outcome, which does not wait for the check.
   Shift ranges (over the rows as drawn), the header checkbox (every link once), the row menu and
   Retry now work as by link; the selection is a set of URLs, so a link ticked under one page is
   ticked under every page, and switching the layout keeps it. **Copy list** gives one line per link
-  and page: Found on (empty when not known), Status, Where, URL, Link text. *All external* and
+  and page: Found on (empty when not known; with the position on that page), Status, Where, URL,
+  Link text. *All external* and
   *Retry queue* are listed by link (the chip is disabled with the reason). The choice stays when
   another run is shown.
 
@@ -918,7 +991,12 @@ links: the join of `skipped` and `external-urls` into the link list (links vs fi
 de-duplication, cap); title extraction (entities, whitespace, missing, beyond the read limit,
 non-UTF-8); status and failure classification; per-host scheduling; the switch never reaching the
 argv; `external-links.json` round trip; link-text extraction (relative links, `<base href>`, image
-links, nested markup, entities, several anchors, `srcset`, not found); page titles of the URLs tab.
+links, nested markup, entities, several anchors, `srcset`, not found); the reference locator
+(attributes of several kinds, entities, `<base href>`, `srcset` items, inline `style` and `<style>`
+blocks, comments and scripts skipped, CSS `url()` quoted, unquoted and with spaces, `@import`,
+`../` paths, a minified one-line file giving the column, several occurrences, none); a
+`link-texts.json` of an earlier version still loading; Copy list and the link report with
+positions; page titles of the URLs tab.
 Retries: the queue (order, no duplicates, the first answer kept, a failure stays queued), the
 `retries.json` round trip (a file with the fields no longer kept still loads) and a damaged file set
 aside, the merge of newest answers into the URL rows and their counters, the child's argv (request
@@ -944,7 +1022,9 @@ redirect loop, a timeout, a closed connection, garbage, a 5 MB body (read stops 
 text, TLS against a plain port — exactly one request per checked link and none for what the pages
 reference; the site's headers and cookies never sent; one request at a time per host with the gap;
 a cancelled check sends nothing more; source pages fetched once, credentials only to the site, no
-request to another host (not even by a redirect).
+request to another host (not even by a redirect); two stylesheets (one minified) fetched through
+the real fetch, each once, with the line (and column) of every `url()` and nothing they reference
+requested.
 
 **Credential tests** (`gui/tests/core_credentials.rs`, `tests/link_server`; `gui/tests/ui_credentials.rs`):
 source pages send neither `--http-auth` nor a custom `--header` after an https → http downgrade, to
@@ -954,6 +1034,22 @@ again* of the current run use its own password after Setup changed (and none it 
 run from History borrows Setup's password for neither its source pages nor its retries, and *Run
 again* of it clears Setup's passwords; an import for another site drops the old passwords (the AI
 key stays), uses imported ones and leaves saved profiles' passwords in the store.
+`gui/tests/core_credentials_tls.rs` does the same across schemes against `tests/tls_server` (HTTP
+and HTTPS on one port, a throwaway self-signed certificate accepted through
+`--accept-invalid-certs`): an https start's https page gets both; its redirect to http — another
+port or the same one — sends neither on the http hop; an http start's redirect to https gets both
+on the start port and neither on another (the CLI's rule refuses only https → http); a redirect to
+another host is not followed.
+
+**PowerShell tests** (`gui/tests/core_powershell.rs`, the real `pwsh` and Windows `powershell` when
+present, else skipped with a message): exported command lines (hard values as scalars, list items
+and bare arguments; a configuration as the app exports it; the multi-line form with backtick
+continuations) run as pasted input with the program replaced by a function and by a native program
+built with `rustc` that writes its argv — in PowerShell 7 every value arrives exactly; with legacy
+passing (5.1, or 7 in `Legacy` mode) exactly the values `powershell_legacy_hazards` names differ
+(5.1). Hand-written command lines: what the PowerShell reading accepts is what each shell passes;
+the refused ones are listed in the test. The Bash reading (`split_bash`) has unit tests only; no
+test runs a real Bash.
 
 **Retry tests** (`gui/tests/core_retry.rs`, the real crawler binary and `tests/link_server`): a retry
 of a crawled URL sends exactly one request (no robots.txt, no asset, no link, the redirect not
@@ -1002,7 +1098,11 @@ page, Retry now from it, disabled in *All external*). `ui_setup.rs`: *Skip cart 
 on by default with its patterns in the command and nothing counted as changed; off removes them
 and counts in Scope and the modified state; the user's pattern stays first; off survives a
 restart. Snapshots `run-by-page*` show the layout (with a retry queue and a selection: the
-fullest toolbar) and `setup-action-links` the switch. `ui_retry_e2e.rs` crawls
+fullest toolbar) and `setup-action-links` the switch. `ui_run.rs` (positions): a 404 found on a
+page and one found on a stylesheet show `:212` and `:1929` after the page, the suffix whole in a
+narrow window, "in a stylesheet" as the link text, the *Line* of each link by page, Copy list and
+`link-report.html` with the positions; snapshots `run-broken-positions*` and
+`run-by-page-positions*`. `ui_retry_e2e.rs` crawls
 a site with a missing page, creates the page, retries the row from the Link checker tab with the real
 crawler, finds the new answer in the row and the URL no longer in `link-report.html`. The UI tests turn link texts off (`App::fetch_link_texts`) where the
 scripted runs name real sites, so no test makes a request outside the machine.

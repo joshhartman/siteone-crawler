@@ -329,7 +329,7 @@ fn apply_preset(app: &mut App, index: usize) {
 pub fn open_reset_all(app: &mut App) {
     app.open_dialog(confirm(
         "Reset all options?",
-        "Every option goes back to the CLI default, passwords included (the API key stays). The URL is kept.",
+        "Every option goes back to its default, passwords included (the API key stays). The URL is kept.",
         "Reset all",
         ButtonKind::Danger,
         Action::ResetAll,
@@ -407,29 +407,170 @@ pub fn start_paste_command_line(app: &mut App) {
 fn open_paste_dialog(app: &mut App) {
     app.open_dialog(
         Dialog::new("Paste a command line")
-            .message("Paste a siteone-crawler command and import it with the quoting rules of its shell, PowerShell or Bash. Its options replace the current configuration; passwords it does not contain are cleared (the AI API key stays).")
+            .message("Paste a siteone-crawler command written for PowerShell or Bash; the app tells which shell's quoting it reads it with (PowerShell as 7.3 or later passes it). Its options replace the current configuration; passwords it does not contain are cleared (the AI API key stays).")
             .multiline_input("Command line", "siteone-crawler --url=https://example.com/ --workers=5")
-            .button(
-                "Import as PowerShell",
-                ButtonKind::Primary,
-                Action::ImportCommandLine(Shell::PowerShell),
-            )
-            .button("Import as Bash", ButtonKind::Secondary, Action::ImportCommandLine(Shell::Posix))
-            .cancel("Cancel"),
+            .refresh(refresh_paste_dialog),
     );
 }
 
-fn import_command_line(app: &mut App, mut dialog: Dialog<Action>, shell: Shell) {
+/// The status line and the buttons of the paste dialog for its text (GUI-SPEC §5.2): how the
+/// command reads, and when PowerShell and Bash read it differently which reading is used — or,
+/// without a sign of the shell, the question.
+fn refresh_paste_dialog(dialog: &mut Dialog<Action>) {
+    use config::CommandLineReading::*;
+    let text = dialog.input_text();
+    dialog.buttons.clear();
+    let import = |dialog: &mut Dialog<Action>, enabled: bool| {
+        dialog.push_button(
+            "Import",
+            ButtonKind::Primary,
+            Some(Action::ImportCommandLine(None)),
+            enabled,
+        );
+    };
+    if text.is_empty() {
+        dialog.status = None;
+        import(dialog, false);
+        dialog.push_button("Cancel", ButtonKind::Secondary, None, true);
+        return;
+    }
+    dialog.status = Some(match config::read_command_line(&text) {
+        Same(_) => {
+            import(dialog, true);
+            (Tone::Success, "PowerShell and Bash read this the same way.".to_string())
+        }
+        Only { shell, other_error, .. } => {
+            import(dialog, true);
+            (
+                Tone::Info,
+                format!(
+                    "Read as {}. {} cannot read it: {other_error}",
+                    shell.label(),
+                    shell.other().label()
+                ),
+            )
+        }
+        Detected {
+            shell,
+            argv,
+            hint,
+            other,
+        } => {
+            let instead = shell.other();
+            dialog.push_button(
+                format!("Import as {} instead", instead.label()),
+                ButtonKind::Secondary,
+                Some(Action::ImportCommandLine(Some(instead))),
+                true,
+            );
+            import(dialog, true);
+            let difference = match first_difference(&argv, &other) {
+                (_, Some(theirs)) => format!("would read {} instead", shown(theirs)),
+                (Some(mine), None) => format!("would leave out {}", shown(mine)),
+                (None, None) => "would read it differently".to_string(),
+            };
+            (
+                Tone::Info,
+                format!("Read as {} ({hint}). {} {difference}.", shell.label(), instead.label()),
+            )
+        }
+        Ambiguous {
+            powershell,
+            bash,
+            hints,
+        } => {
+            for shell in [Shell::PowerShell, Shell::Posix] {
+                dialog.push_button(
+                    format!("Import as {}", shell.label()),
+                    ButtonKind::Secondary,
+                    Some(Action::ImportCommandLine(Some(shell))),
+                    true,
+                );
+            }
+            let reads = |argv: Option<&str>| argv.map(shown).unwrap_or_else(|| "nothing".to_string());
+            let (ps, sh) = first_difference(&powershell, &bash);
+            let why = if hints.is_empty() {
+                "nothing in it shows which shell it is written for".to_string()
+            } else {
+                let signs: Vec<String> = hints
+                    .iter()
+                    .map(|hint| format!("{} ({})", hint.what, hint.shell.label()))
+                    .collect();
+                format!("it has signs of both: {}", signs.join(", "))
+            };
+            (
+                Tone::Warning,
+                format!(
+                    "PowerShell and Bash read this differently (PowerShell: {}; Bash: {}), and {why}. Which shell is it for?",
+                    reads(ps),
+                    reads(sh)
+                ),
+            )
+        }
+        Invalid {
+            shell,
+            error,
+            other_error,
+        } => {
+            import(dialog, false);
+            let message = if error == other_error {
+                format!("Neither PowerShell nor Bash can read this. {error}")
+            } else {
+                format!(
+                    "As {}: {error}\nAs {}: {other_error}",
+                    shell.label(),
+                    shell.other().label()
+                )
+            };
+            (Tone::Danger, message)
+        }
+    });
+    dialog.push_button("Cancel", ButtonKind::Secondary, None, true);
+}
+
+/// The first argument where two readings differ, from each (`None` past its end).
+fn first_difference<'a>(a: &'a [String], b: &'a [String]) -> (Option<&'a str>, Option<&'a str>) {
+    let at = a.iter().zip(b).take_while(|(a, b)| a == b).count();
+    (a.get(at).map(String::as_str), b.get(at).map(String::as_str))
+}
+
+/// An argument in quotes for the status line: line breaks and tabs visible, long ones shortened.
+fn shown(arg: &str) -> String {
+    const MAX: usize = 70;
+    let visible = arg.replace('\n', "\\n").replace('\r', "\\r").replace('\t', "\\t");
+    let short: String = visible.chars().take(MAX).collect();
+    let ellipsis = if visible.chars().count() > MAX { "…" } else { "" };
+    format!("“{short}{ellipsis}”")
+}
+
+fn import_command_line(app: &mut App, mut dialog: Dialog<Action>, shell: Option<Shell>) {
+    use config::CommandLineReading::*;
     let text = dialog.input_text();
     if text.is_empty() {
         dialog.error = Some("Paste a command line first.".to_string());
         app.open_dialog(dialog);
         return;
     }
-    match config::split_command_line(&text, shell) {
+    let (read, shell) = match shell {
+        Some(shell) => (config::split_command_line(&text, shell), Some(shell)),
+        None => match config::read_command_line(&text) {
+            Same(argv) => (Ok(argv), None),
+            Only { shell, argv, .. } | Detected { shell, argv, .. } => (Ok(argv), Some(shell)),
+            Ambiguous { .. } => (
+                Err("PowerShell and Bash read this differently: choose the shell it is written for.".to_string()),
+                None,
+            ),
+            Invalid { error, .. } => (Err(error), None),
+        },
+    };
+    match read {
         Ok(args) => {
             let imported = config::import_args(&app.schema, &args);
-            apply_import(app, imported, "the command line");
+            let source = match shell {
+                Some(shell) => format!("the command line (read as {})", shell.label()),
+                None => "the command line".to_string(),
+            };
+            apply_import(app, imported, &source);
         }
         Err(error) => {
             dialog.error = Some(error);

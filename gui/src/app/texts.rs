@@ -1,7 +1,8 @@
 //! Link texts as the app drives them (GUI-SPEC §4.8): after a crawl, the source pages of its
-//! internal 404s are fetched (pages of the crawled site only) to read the text of the broken link;
-//! once the external link check of a run has run, so are the source pages of its external links.
-//! Every page is fetched once per run: what it says about every target the run knows is kept in
+//! internal 404s — HTML pages and stylesheets — are fetched (pages of the crawled site only) to
+//! read the text of the broken link and where the page references it; once the external link
+//! check of a run has run, so are the source pages of its external links. Every page is fetched
+//! once per run: what it says about every target the run knows is kept in
 //! `<run>/link-texts.json`.
 //!
 //! One fetch at a time ([`App::text_job`]). Like the link check it belongs to a run folder: it goes
@@ -21,7 +22,7 @@ use super::{App, PastLoad};
 use crate::backend::link_text::{self, SourceSettings, TextHandle, TextMsg};
 use crate::model::config::CrawlConfig;
 use crate::model::link_check::RunLinks;
-use crate::model::link_text::{LinkTexts, MAX_SOURCE_PAGES, PageTexts, is_stylesheet};
+use crate::model::link_text::{LinkTexts, MAX_SOURCE_PAGES, PageTexts};
 use crate::model::results::ResultLoad;
 
 /// At most this many page messages are applied per frame.
@@ -99,18 +100,13 @@ impl App {
                 missing.join("; ")
             )
         });
-        // Stylesheets, pages of other hosts, pages over the cap and every page of a run whose
-        // credentials are not known are settled without a request.
+        // Pages of other hosts, pages over the cap and every page of a run whose credentials are
+        // not known are settled without a request. A stylesheet is a page like any other: it is
+        // fetched to locate its `url()` references, and counts within the cap.
         let mut fetch = Vec::new();
-        let mut fetched_or_wanted = texts
-            .pages
-            .values()
-            .filter(|page| matches!(page, PageTexts::Fetched { .. }))
-            .count();
+        let mut fetched_or_wanted = texts.pages.values().filter(|page| page.is_read()).count();
         for page in pages {
-            let settled = if is_stylesheet(&page) {
-                Some(PageTexts::Stylesheet)
-            } else if !settings.is_site_page(&page) {
+            let settled = if !settings.is_site_page(&page) {
                 Some(PageTexts::NotFetched {
                     reason: "Only pages of the crawled site are fetched.".to_string(),
                 })

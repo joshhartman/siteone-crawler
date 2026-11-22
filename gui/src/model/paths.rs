@@ -42,6 +42,12 @@ impl AppPaths {
         Self::resolve(override_dir, dirs::config_dir(), dirs::data_local_dir())
     }
 
+    /// The data folder when it was set with the override (`SITEONE_GUI_DATA_DIR`): then both
+    /// roots are that one folder.
+    pub fn override_root(&self) -> Option<&Path> {
+        (self.config == self.data).then_some(self.data.as_path())
+    }
+
     /// Pure form of [`Self::discover`]: an override (if set and not empty) is both roots.
     pub fn resolve(
         override_dir: Option<OsString>,

@@ -233,12 +233,25 @@ fn grid(ui: &mut Ui, table: &ResultTable, rows: &[u32], actions: &mut Vec<RunAct
             let wanted: Vec<f32> = table
                 .columns
                 .iter()
-                .map(|column| {
-                    let chars = if column.width > 0 {
+                .enumerate()
+                .map(|(index, column)| {
+                    let declared = if column.width > 0 {
                         column.width.clamp(6, 60)
                     } else {
                         16
-                    } as f32;
+                    };
+                    // No wider than the header and the longest of the first rows need: an empty
+                    // column must not take the room of a column whose text is cut.
+                    let content = table
+                        .rows
+                        .iter()
+                        .take(200)
+                        .filter_map(|row| row.get(index))
+                        .map(|cell| cell.chars().count())
+                        .max()
+                        .unwrap_or(0)
+                        .max(column.name.chars().count());
+                    let chars = declared.min(content as i64 + 2).max(6) as f32;
                     chars * 7.0 + 16.0
                 })
                 .collect();

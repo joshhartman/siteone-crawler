@@ -369,8 +369,9 @@ pub enum Action {
     ImportConfigFile,
     /// Opens the dialog to paste a command line.
     PasteCommandLine,
-    /// Imports the command line in the input, read with the quoting rules of this shell.
-    ImportCommandLine(Shell),
+    /// Imports the command line in the input: read with the quoting rules of this shell, or with
+    /// the shell detected (`None`, `config::read_command_line`).
+    ImportCommandLine(Option<Shell>),
     /// Exports a config file; the check box says whether secrets are included.
     ExportConfigFile,
     ResetAll,

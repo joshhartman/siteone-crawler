@@ -12,6 +12,8 @@ use crate::ui::widgets;
 
 /// Shown next to the command while "Check external links" is on: the command does not do it.
 const EXTERNAL_NOTE: &str = "+ external links checked by the app";
+/// The PowerShell command passes every value exactly in PowerShell 7.3+ (config::quote_powershell).
+const POWERSHELL_TOOLTIP: &str = "For PowerShell 7.3 or later. Windows PowerShell 5.1 passes a value with a double quote, or with a space and a trailing backslash, differently; the app warns when the command has one.";
 const EXTERNAL_NOTE_TOOLTIP: &str = "Check external links is a setting of this app, not a crawler option: after the crawl the app requests each external link once. It is not part of the command.";
 
 pub fn show(app: &mut App, ui: &mut Ui) {
@@ -57,14 +59,20 @@ pub fn show(app: &mut App, ui: &mut Ui) {
                 ops::open_reset_all(app);
             }
             let mut copied = None;
+            let mut legacy = Vec::new();
             let (copy, _) = egui::containers::menu::MenuButton::new(widgets::with_icon(
                 icons::ICON_CONTENT_COPY,
                 "Copy",
             ))
             .ui(ui, |ui| {
                 ui.set_min_width(200.0);
-                if ui.button("Copy as PowerShell").clicked() {
+                if ui
+                    .button("Copy as PowerShell")
+                    .on_hover_text(POWERSHELL_TOOLTIP)
+                    .clicked()
+                {
                     copied = Some(("PowerShell command", ops::command_text(app, Shell::PowerShell, reveal)));
+                    legacy = config::powershell_legacy_hazards(&argv);
                 }
                 if ui.button("Copy as Bash").clicked() {
                     copied = Some(("Bash command", ops::command_text(app, Shell::Posix, reveal)));
@@ -89,7 +97,14 @@ pub fn show(app: &mut App, ui: &mut Ui) {
                 .on_hover_text("Copy the command or a config file");
             if let Some((what, text)) = copied {
                 ui.ctx().copy_text(text);
-                app.toasts.success(format!("{what} copied to the clipboard."));
+                if legacy.is_empty() {
+                    app.toasts.success(format!("{what} copied to the clipboard."));
+                } else {
+                    app.toasts.warning(format!(
+                        "{what} copied to the clipboard. Run it in PowerShell 7.3 or later: Windows PowerShell 5.1 would pass {} differently.",
+                        legacy.join(", ")
+                    ));
+                }
             }
             if has_secrets {
                 let (glyph, tip) = if reveal {

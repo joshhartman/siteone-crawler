@@ -2,7 +2,9 @@
 //!
 //! A [`Dialog`] is plain data — title, message, an optional list, an optional text input and
 //! check box, and buttons that each carry an action of the caller's type `A`. The caller keeps the
-//! dialog, calls [`Dialog::show`] every frame and performs the chosen action.
+//! dialog, calls [`Dialog::show`] every frame and performs the chosen action. A dialog with a
+//! refresh function ([`Dialog::refresh`]) sets its status line and buttons from the input text as
+//! it changes.
 
 use eframe::egui::{self, Frame, Id, Key, Margin, RichText, ScrollArea, Stroke};
 
@@ -22,6 +24,7 @@ pub struct DialogButton<A> {
     pub kind: ButtonKind,
     /// `None` closes the dialog without an action (Cancel).
     pub action: Option<A>,
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -44,9 +47,15 @@ pub struct Dialog<A> {
     pub input: Option<DialogInput>,
     /// A check box: label and state.
     pub check: Option<(String, bool)>,
+    /// A line under the input that follows its text (e.g. how a pasted command line reads).
+    pub status: Option<(Tone, String)>,
     /// An error shown above the buttons (e.g. "a profile with this name exists").
     pub error: Option<String>,
     pub buttons: Vec<DialogButton<A>>,
+    /// Sets the status and the buttons from the input text, whenever the text changes.
+    refresh: Option<fn(&mut Dialog<A>)>,
+    /// The input text of the last refresh.
+    refreshed_for: Option<String>,
     focused: bool,
 }
 
@@ -71,9 +80,30 @@ impl<A: Clone> Dialog<A> {
             code: None,
             input: None,
             check: None,
+            status: None,
             error: None,
             buttons: Vec::new(),
+            refresh: None,
+            refreshed_for: None,
             focused: false,
+        }
+    }
+
+    /// Keeps the status line and the buttons in step with the input text: `refresh` runs now and
+    /// whenever the text changes.
+    pub fn refresh(mut self, refresh: fn(&mut Dialog<A>)) -> Self {
+        self.refresh = Some(refresh);
+        self.refresh_now();
+        self
+    }
+
+    fn refresh_now(&mut self) {
+        if let Some(refresh) = self.refresh {
+            let text = self.input_text();
+            if self.refreshed_for.as_ref() != Some(&text) {
+                self.refreshed_for = Some(text);
+                refresh(self);
+            }
         }
     }
 
@@ -123,21 +153,24 @@ impl<A: Clone> Dialog<A> {
     }
 
     pub fn button(mut self, label: impl Into<String>, kind: ButtonKind, action: A) -> Self {
-        self.buttons.push(DialogButton {
-            label: label.into(),
-            kind,
-            action: Some(action),
-        });
+        self.push_button(label, kind, Some(action), true);
         self
     }
 
     pub fn cancel(mut self, label: impl Into<String>) -> Self {
+        self.push_button(label, ButtonKind::Secondary, None, true);
+        self
+    }
+
+    /// Adds a button; `None` closes the dialog without an action. For a refresh function, which
+    /// sets the buttons anew.
+    pub fn push_button(&mut self, label: impl Into<String>, kind: ButtonKind, action: Option<A>, enabled: bool) {
         self.buttons.push(DialogButton {
             label: label.into(),
-            kind: ButtonKind::Secondary,
-            action: None,
+            kind,
+            action,
+            enabled,
         });
-        self
     }
 
     /// The text of the input, trimmed.
@@ -245,6 +278,11 @@ impl<A: Clone> Dialog<A> {
                     }
                     submit = !input.multiline && response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
                 }
+                self.refresh_now();
+                if let Some((tone, status)) = &self.status {
+                    ui.add_space(theme::GRID * 0.5);
+                    super::inline_message(ui, *tone, status);
+                }
                 if let Some((label, checked)) = &mut self.check {
                     ui.add_space(theme::GRID);
                     ui.checkbox(checked, label.as_str());
@@ -257,11 +295,15 @@ impl<A: Clone> Dialog<A> {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     // Right to left: the last button is the leftmost; the primary one goes right.
                     for button in self.buttons.iter().rev() {
+                        let enabled = button.enabled;
                         let clicked = match button.kind {
-                            ButtonKind::Primary => super::primary_button(ui, true, None, &button.label, 30.0).clicked(),
+                            ButtonKind::Primary => {
+                                super::primary_button(ui, enabled, None, &button.label, 30.0).clicked()
+                            }
                             ButtonKind::Danger => {
                                 let response = ui
-                                    .add(
+                                    .add_enabled(
+                                        enabled,
                                         egui::Button::new(theme::semibold(&button.label).color(egui::Color32::WHITE))
                                             .fill(p.danger)
                                             .min_size(egui::vec2(0.0, 30.0)),
@@ -270,7 +312,10 @@ impl<A: Clone> Dialog<A> {
                                 response.clicked()
                             }
                             ButtonKind::Secondary => ui
-                                .add(egui::Button::new(&button.label).min_size(egui::vec2(0.0, 30.0)))
+                                .add_enabled(
+                                    enabled,
+                                    egui::Button::new(&button.label).min_size(egui::vec2(0.0, 30.0)),
+                                )
                                 .accessible_name(&button.label)
                                 .clicked(),
                         };
@@ -286,7 +331,7 @@ impl<A: Clone> Dialog<A> {
                     && let Some(action) = self
                         .buttons
                         .iter()
-                        .find(|button| button.kind != ButtonKind::Secondary)
+                        .find(|button| button.kind != ButtonKind::Secondary && button.enabled)
                         .and_then(|button| button.action.clone())
                 {
                     outcome = DialogOutcome::Chosen(action);
@@ -301,6 +346,9 @@ impl<A: Clone> Dialog<A> {
 
 impl<A: PartialEq> PartialEq for DialogButton<A> {
     fn eq(&self, other: &Self) -> bool {
-        self.label == other.label && self.kind == other.kind && self.action == other.action
+        self.label == other.label
+            && self.kind == other.kind
+            && self.action == other.action
+            && self.enabled == other.enabled
     }
 }

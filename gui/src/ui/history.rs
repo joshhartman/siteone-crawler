@@ -427,6 +427,14 @@ fn runs_table(
                             }
                         }
                         let response = row.response();
+                        let selected = history.selected.as_ref() == Some(&item.dir);
+                        response.widget_info(|| {
+                            let label = match &item.record {
+                                Ok(record) => format!("Run {} of {}", item.run_id, record.url),
+                                Err(_) => format!("Damaged run folder {}", item.run_id),
+                            };
+                            egui::WidgetInfo::selected(egui::Role::ListBoxOption, true, selected, label)
+                        });
                         if response.clicked() {
                             clicked = Some((item.dir.clone(), false));
                         }

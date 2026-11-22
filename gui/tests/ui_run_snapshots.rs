@@ -403,3 +403,23 @@ fn run_retry_files() {
         },
     );
 }
+
+/// The Link checker with where each page references its broken link: a page (`:212`) and a
+/// stylesheet (`:1929`), by link and by page.
+#[test]
+fn run_broken_links_with_positions() {
+    each_variant(
+        "run-broken-positions",
+        |_, app| keep(runs::finished_with_positions(app)),
+        tab("Link checker"),
+    );
+    each_variant(
+        "run-by-page-positions",
+        |_, app| keep(runs::finished_with_positions(app)),
+        |harness| {
+            harness.get_by_role_and_label(Role::Tab, "Link checker").click();
+            harness.run();
+            harness.get_by_role_and_label(Role::CheckBox, "By page").click();
+        },
+    );
+}

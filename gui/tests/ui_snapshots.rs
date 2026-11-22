@@ -147,6 +147,52 @@ fn a_confirmation_dialog() {
     });
 }
 
+/// An app without changes (the paste dialog opens without asking first).
+fn unmodified(env: &Env) -> siteone_crawler_gui::app::App {
+    let mut app = env.app();
+    app.session.config.url = "https://example.com/".to_string();
+    app
+}
+
+/// The paste dialog with a command typed into it.
+fn paste_dialog(text: &'static str) -> impl Fn(&mut egui_kittest::Harness<'_, siteone_crawler_gui::app::App>) {
+    move |harness| {
+        harness
+            .get_by_role_and_label(Role::Button, "More profile actions")
+            .click();
+        harness.run();
+        harness.get_by_label("Paste command line…").click();
+        harness.run();
+        harness
+            .get_by_role_and_label(Role::MultilineTextInput, "Command line")
+            .focus();
+        harness.run();
+        harness
+            .get_by_role_and_label(Role::MultilineTextInput, "Command line")
+            .type_text(text);
+    }
+}
+
+#[test]
+fn the_paste_dialog_with_a_detected_shell() {
+    each_variant(
+        "dialog-paste-detected",
+        unmodified,
+        paste_dialog(
+            "siteone-crawler --url=https://example.com/ --offline-export-dir=C:\\Exports\\site '--user-agent=Sam''s bot'",
+        ),
+    );
+}
+
+#[test]
+fn the_paste_dialog_asking_for_the_shell() {
+    each_variant(
+        "dialog-paste-ambiguous",
+        unmodified,
+        paste_dialog("siteone-crawler --url=https://example.com/ --user-agent=a\\ b --workers=3"),
+    );
+}
+
 #[test]
 fn setup_all_sections_open() {
     each_variant(

@@ -72,45 +72,45 @@ pub fn show(app: &mut App, ui: &mut Ui) {
         if save.clicked() {
             ops::save(app);
         }
-        if ui
-            .add(egui::Button::new("Save as…"))
-            .accessible_name("Save as")
-            .clicked()
-        {
+        let save_as = ui.add(egui::Button::new("Save as…")).accessible_name("Save as");
+        if save_as.clicked() {
             ops::open_save_as(app);
         }
-        let (menu_button, _) = egui::containers::menu::MenuButton::new(icons::ICON_MORE_HORIZ.rich_text().size(18.0))
-            .ui(ui, |ui| {
-                ui.set_min_width(220.0);
-                if ui
-                    .add_enabled(has_profile, egui::Button::new("Rename…"))
-                    .on_disabled_hover_text("Select a profile first")
-                    .clicked()
-                {
-                    ops::open_rename(app);
-                }
-                if ui
-                    .add_enabled(has_profile, egui::Button::new("Delete…"))
-                    .on_disabled_hover_text("Select a profile first")
-                    .clicked()
-                {
-                    ops::open_delete(app);
-                }
-                ui.separator();
-                if ui.button("Import config file…").clicked() {
-                    ops::start_import_config_file(app);
-                }
-                if ui.button("Paste command line…").clicked() {
-                    ops::start_paste_command_line(app);
-                }
-                if ui.button("Export config file…").clicked() {
-                    ops::open_export(app);
-                }
-                ui.separator();
-                if ui.button("Reset to defaults…").clicked() {
-                    ops::open_reset_all(app);
-                }
-            });
+        // As high as the text buttons beside it: the glyph is no taller than their text, and the
+        // minimum size gives the height of "Save as…".
+        let more = egui::Button::new(icons::ICON_MORE_HORIZ.rich_text().size(14.0))
+            .min_size(egui::vec2(save_as.rect.height() + 4.0, save_as.rect.height()));
+        let (menu_button, _) = egui::containers::menu::MenuButton::from_button(more).ui(ui, |ui| {
+            ui.set_min_width(220.0);
+            if ui
+                .add_enabled(has_profile, egui::Button::new("Rename…"))
+                .on_disabled_hover_text("Select a profile first")
+                .clicked()
+            {
+                ops::open_rename(app);
+            }
+            if ui
+                .add_enabled(has_profile, egui::Button::new("Delete…"))
+                .on_disabled_hover_text("Select a profile first")
+                .clicked()
+            {
+                ops::open_delete(app);
+            }
+            ui.separator();
+            if ui.button("Import config file…").clicked() {
+                ops::start_import_config_file(app);
+            }
+            if ui.button("Paste command line…").clicked() {
+                ops::start_paste_command_line(app);
+            }
+            if ui.button("Export config file…").clicked() {
+                ops::open_export(app);
+            }
+            ui.separator();
+            if ui.button("Reset to defaults…").clicked() {
+                ops::open_reset_all(app);
+            }
+        });
         let _ = menu_button
             .accessible_name("More profile actions")
             .on_hover_text("More profile actions");

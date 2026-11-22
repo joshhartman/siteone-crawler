@@ -130,7 +130,7 @@ pub fn field_row<R>(
 pub fn changed_dot(ui: &mut Ui, p: &Palette) {
     let (rect, response) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), Sense::hover());
     ui.painter().circle_filled(rect.center(), 3.5, p.accent);
-    response.on_hover_text("Changed from the CLI default");
+    response.on_hover_text("Changed from the default");
 }
 
 /// A chip: a short label in a rounded pill, tinted by its tone.

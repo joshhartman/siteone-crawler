@@ -2,16 +2,36 @@
 //! Manager), never in profiles, history, logs or previews.
 //!
 //! Service `siteone-crawler-gui`, account `<scope>/<option>`, where the scope is a profile slug or
-//! `session` (the working configuration), e.g. `session/--http-auth`.
+//! `session` (the working configuration), e.g. `session/--http-auth`. A data folder set with
+//! `SITEONE_GUI_DATA_DIR` has a service of its own ([`service_name`]).
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use std::path::Path;
 use std::sync::Mutex;
 
 use super::config::{AI_API_KEY, MASK};
 
 /// The credential-store service name.
 pub const SERVICE: &str = "siteone-crawler-gui";
+
+/// The credential-store service of a data folder: [`SERVICE`] for the default folders; for a
+/// folder set with `SITEONE_GUI_DATA_DIR`, a name of its own (`siteone-crawler-gui <hash of the
+/// folder>`). Profiles and the session live in the data folder, so two data folders must not
+/// read, overwrite or delete each other's `session/…` and `<profile>/…` secrets.
+pub fn service_name(override_dir: Option<&Path>) -> String {
+    let Some(dir) = override_dir else {
+        return SERVICE.to_string();
+    };
+    // FNV-1a over the lower-cased path (Windows paths do not distinguish case): stable across
+    // runs and versions, which a std hasher is not.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in dir.to_string_lossy().to_lowercase().bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{SERVICE} {hash:016x}")
+}
 
 /// The scope of the working configuration's secrets.
 pub const SESSION_SCOPE: &str = "session";
@@ -42,19 +62,25 @@ pub trait SecretStore: Send + Sync {
     fn delete(&self, account: &str) -> Result<(), SecretError>;
 }
 
-/// The OS credential store through `keyring`.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct KeyringStore;
+/// The OS credential store through `keyring`, under one service name ([`service_name`]).
+#[derive(Debug, Clone)]
+pub struct KeyringStore {
+    service: String,
+}
 
 impl KeyringStore {
-    fn entry(account: &str) -> Result<keyring::Entry, SecretError> {
-        keyring::Entry::new(SERVICE, account).map_err(|error| SecretError(error.to_string()))
+    pub fn new(service: String) -> Self {
+        Self { service }
+    }
+
+    fn entry(&self, account: &str) -> Result<keyring::Entry, SecretError> {
+        keyring::Entry::new(&self.service, account).map_err(|error| SecretError(error.to_string()))
     }
 }
 
 impl SecretStore for KeyringStore {
     fn get(&self, account: &str) -> Result<Option<String>, SecretError> {
-        match Self::entry(account)?.get_password() {
+        match self.entry(account)?.get_password() {
             Ok(value) => Ok(Some(value)),
             Err(keyring::Error::NoEntry) => Ok(None),
             Err(error) => Err(SecretError(error.to_string())),
@@ -62,13 +88,13 @@ impl SecretStore for KeyringStore {
     }
 
     fn set(&self, account: &str, value: &str) -> Result<(), SecretError> {
-        Self::entry(account)?
+        self.entry(account)?
             .set_password(value)
             .map_err(|error| SecretError(error.to_string()))
     }
 
     fn delete(&self, account: &str) -> Result<(), SecretError> {
-        match Self::entry(account)?.delete_credential() {
+        match self.entry(account)?.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
             Err(error) => Err(SecretError(error.to_string())),
         }
@@ -258,6 +284,25 @@ mod tests {
         let replaced = new.replacing(&current);
         assert_eq!(replaced.get("--http-auth"), Some("b:new"));
         assert_eq!(replaced.get(AI_API_KEY), Some("sk-new"));
+    }
+
+    #[test]
+    fn a_data_folder_set_by_override_has_its_own_service() {
+        assert_eq!(service_name(None), SERVICE);
+        let a = service_name(Some(Path::new(r"D:\Portable\crawler")));
+        let b = service_name(Some(Path::new(r"D:\Portable\other")));
+        assert!(
+            a.starts_with("siteone-crawler-gui ") && a.len() == SERVICE.len() + 17,
+            "{a}"
+        );
+        assert_ne!(a, b);
+        assert_ne!(a, SERVICE);
+        // The same folder, whatever its case, is the same service on every run.
+        assert_eq!(a, service_name(Some(Path::new(r"d:\portable\CRAWLER"))));
+        assert_eq!(
+            service_name(Some(Path::new("x"))),
+            "siteone-crawler-gui af63f54c86021707"
+        );
     }
 
     #[test]

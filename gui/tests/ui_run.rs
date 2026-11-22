@@ -743,3 +743,115 @@ fn the_external_link_check_shows_progress_and_stop_keeps_what_was_checked() {
     let first_ok = all.iter().position(|row| row.status == "200").expect("an OK link");
     assert!(all[..first_ok].iter().all(|row| row.status != "200"));
 }
+
+/// The texts of the drawn labels that end with `suffix`.
+fn labels_ending_with(harness: &Harness<'_, App>, suffix: &str) -> Vec<String> {
+    harness
+        .query_all_by(|node| node.value().is_some_and(|value| value.ends_with(suffix)))
+        .filter_map(|node| node.accesskit_node().value().map(|value| value.to_string()))
+        .collect()
+}
+
+#[test]
+fn found_on_ends_with_where_the_page_references_the_link() {
+    for size in [LARGE, ui_common::SMALL] {
+        let env = Env::new();
+        let mut app = env.app();
+        let _control = runs::finished_with_positions(&mut app);
+        let mut harness = harness(app, size, egui::Theme::Light);
+        settle(&mut harness);
+        click(&mut harness, Role::Tab, "Link checker");
+        let rows = broken_rows(harness.state());
+        let page = rows
+            .iter()
+            .find(|row| row.url == runs::FIXTURE_404)
+            .expect("the 404 row");
+        assert_eq!(page.found_on(), Some(runs::FIXTURE_404_SOURCE));
+        assert_eq!(page.positions, [":212"]);
+        assert_eq!(page.link_text, "Content type analysis");
+        // A missing image referenced by a stylesheet: no link text, the line of its `url()`.
+        let image = rows
+            .iter()
+            .find(|row| row.url == runs::HERO_IMAGE)
+            .expect("the image row");
+        assert_eq!(image.found_on(), Some(runs::STYLESHEET));
+        assert_eq!(image.positions, [":1929"]);
+        assert_eq!(image.link_text, "in a stylesheet");
+        // Drawn: the page cut in the middle in a narrow window, the position always whole.
+        let drawn = labels_ending_with(&harness, "css:1929");
+        assert_eq!(drawn.len(), 1, "{drawn:?}");
+        assert!(
+            drawn[0] == format!("{}:1929", runs::STYLESHEET)
+                || (drawn[0].starts_with("http") && drawn[0].contains('…')),
+            "whole, or cut in the middle: {drawn:?}"
+        );
+        let drawn = labels_ending_with(&harness, "/:212");
+        assert_eq!(drawn.len(), 1, "{drawn:?}");
+        // Copy list: the page with the position.
+        let copied = siteone_crawler_gui::ui::run::broken::copy_text(&rows, false);
+        assert!(
+            copied.contains(&format!(
+                "\t{}\tin a stylesheet\t{}:1929\n",
+                runs::HERO_IMAGE,
+                runs::STYLESHEET
+            )),
+            "{copied}"
+        );
+
+        // By page: the page is the heading, the line belongs to the link's row.
+        harness.get_by_role_and_label(Role::CheckBox, "By page").click();
+        settle(&mut harness);
+        let groups = siteone_crawler_gui::ui::run::broken_pages(harness.state());
+        let (_, stylesheet_rows) = groups
+            .iter()
+            .find(|(page, _)| page.as_deref() == Some(runs::STYLESHEET))
+            .expect("the stylesheet's group");
+        assert_eq!(stylesheet_rows[0].position_on(runs::STYLESHEET), ":1929");
+        assert!(shows_text(&harness, "1929"));
+        let copied = siteone_crawler_gui::ui::run::broken::copy_text_by_page(&groups);
+        assert!(
+            copied.contains(&format!("{}:1929\t404\t", runs::STYLESHEET)),
+            "{copied}"
+        );
+    }
+}
+
+#[test]
+fn the_link_report_gives_where_each_page_references_the_link() {
+    let env = Env::new();
+    let mut app = env.app();
+    let _control = runs::finished_with_positions(&mut app);
+    let mut harness = harness(app, LARGE, egui::Theme::Light);
+    settle(&mut harness);
+    let run_dir = harness.state().current_run.as_ref().expect("run").plan.run_dir.clone();
+    harness.state_mut().write_link_report(&run_dir);
+    let path = run_dir.join("link-report.html");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let html = loop {
+        settle(&mut harness);
+        if let Ok(html) = std::fs::read_to_string(&path)
+            && html.contains(":1929")
+        {
+            break html;
+        }
+        assert!(Instant::now() < deadline, "the report was not written");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let stylesheet = format!(
+        "<a href=\"{0}\">{0}</a><span class=\"pos\">:1929</span>",
+        runs::STYLESHEET
+    );
+    assert!(html.contains(&stylesheet), "{html}");
+    let page = format!(
+        "<a href=\"{0}\">{0}</a><span class=\"pos\">:212</span> <span class=\"more\">(and 1 more)</span>",
+        runs::FIXTURE_404_SOURCE
+    );
+    assert!(html.contains(&page), "{html}");
+    assert!(html.contains("<td>in a stylesheet</td>"), "{html}");
+    // Broken links by page: the line of each link on its page.
+    assert!(html.contains("<td class=\"line\">1929</td>"), "{html}");
+    assert!(
+        html.contains("<td class=\"line\">212 <span class=\"more\">(and 1 more)</span></td>"),
+        "{html}"
+    );
+}

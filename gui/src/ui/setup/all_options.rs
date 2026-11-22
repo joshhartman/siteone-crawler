@@ -240,7 +240,7 @@ fn option_list(app: &mut App, ui: &mut Ui, flat: bool) {
                     } else if app.setup.only_changed {
                         (
                             "No option is changed".to_string(),
-                            "Every option is at its CLI default. Changed options are listed here.",
+                            "Every option is at its default. Changed options are listed here.",
                         )
                     } else {
                         ("This group has no editable options".to_string(), "")

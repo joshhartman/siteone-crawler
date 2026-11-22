@@ -643,7 +643,13 @@ fn url_table(ui: &mut Ui, view: &RunView<'_>, urls: &mut UrlsUi, titles: &PageTi
                         }
                     });
                     row.col(|ui| {
-                        table::cell_text(ui, RichText::new(&*url.url).color(p.text));
+                        // Cut in the middle: the end of a URL tells one page from another.
+                        let font = egui::TextStyle::Body.resolve(ui.style());
+                        let shown = table::middle_truncate(ui, &url.url, &font, ui.available_width());
+                        let response = ui.add(egui::Label::new(RichText::new(&shown).color(p.text)).truncate());
+                        if shown != *url.url {
+                            response.on_hover_text(&*url.url);
+                        }
                     });
                     row.col(|ui| {
                         let title = titles.get(number as usize);

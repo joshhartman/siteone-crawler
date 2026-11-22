@@ -1,6 +1,7 @@
 //! Link texts (GUI-SPEC §4.8): fetches the source pages of a run's broken and external links — only
-//! pages of the crawled site — and reads, for each target URL, the text of the link that points to
-//! it ([`link_texts`]).
+//! pages of the crawled site, HTML pages and stylesheets — and reads, for each target URL, the text
+//! of the link that points to it ([`link_texts`]) and where the reference is in the file
+//! ([`locate`]: line and column, the place to go and fix).
 //!
 //! # Rules
 //!
@@ -14,12 +15,21 @@
 //! - Like the crawler: the run's User-Agent rule ([`super::link_check::user_agent`]), `--proxy`,
 //!   `--timeout` (at least 10 s), `--accept-invalid-certs`.
 //! - One page at a time, at least [`super::link_check::HOST_GAP`] apart; at most [`MAX_PAGE_BYTES`]
-//!   of a page are read; only an HTML answer below 400 is read.
+//!   of a page ([`MAX_STYLESHEET_BYTES`] of a stylesheet) are read; only an HTML or CSS answer below
+//!   400 is read.
 //! - **The text:** for `<a>`/`<area>` the text content, whitespace collapsed (an `<a>` without text
 //!   around an image: `[image: alt]` or `[image]`; an `<area>`: its `alt`); for `<img>` its `alt`;
 //!   otherwise the tag and attribute (`<script src>`). Several different texts for one target: the
 //!   first three joined by ` | `. At most 200 characters. URLs are compared in their normalized
 //!   form ([`crate::model::link_text::normalized`]), resolved against the page URL and `<base href>`.
+//! - **The position** ([`locate`]): a tolerant scan of the raw text (`scraper` gives no source
+//!   positions) for the attribute values that hold URLs (`href`, `src`, `srcset` items, `poster`,
+//!   `<object data>`, …) and the `url()` of inline `style` attributes and `<style>` blocks —
+//!   entities decoded before the value is resolved — and, in a stylesheet, for `url()` (quoted or
+//!   not) and `@import "…"`, resolved against the stylesheet's own URL. Comments and the text of
+//!   `<script>` are skipped: a link a script builds has no position. The first reference's line
+//!   and column (1-based, in characters, where the URL text starts) and the number of references
+//!   are kept.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, Read};
@@ -36,11 +46,13 @@ use scraper::{ElementRef, Html, Selector};
 use super::catch_panic_unchecked;
 use super::link_check::{HOST_GAP, MIN_TIMEOUT, user_agent};
 use crate::model::config::{CrawlConfig, Value};
-use crate::model::link_text::{PageTexts, normalized, same_site, url_key};
+use crate::model::link_text::{LONG_LINE_CHARS, PageTexts, RefPosition, is_stylesheet, normalized, same_site, url_key};
 use crate::model::schema::OptionSchema;
 
 /// The most of a source page that is read.
 pub const MAX_PAGE_BYTES: usize = 2 * 1024 * 1024;
+/// The most of a stylesheet that is read: an unminified framework bundle can outgrow a page.
+pub const MAX_STYLESHEET_BYTES: usize = 8 * 1024 * 1024;
 /// A link text longer than this is cut (with `…`).
 pub const MAX_TEXT_CHARS: usize = 200;
 /// At most this many different texts per target and page.
@@ -169,6 +181,388 @@ pub fn link_texts(html: &str, page_url: &str, targets: &[String]) -> BTreeMap<St
     found
         .into_iter()
         .map(|(key, texts)| (key, cut(&texts.join(" | "), MAX_TEXT_CHARS)))
+        .collect()
+}
+
+// ---------------------------------------------------------------------------------------------
+// Locating the references in the source
+// ---------------------------------------------------------------------------------------------
+
+/// What a source file is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceKind {
+    Html,
+    Css,
+}
+
+/// The first reference to a target in a source file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Located {
+    pub position: RefPosition,
+    /// What references it first: `<img src>`, `<div style> url()`, `<style> url()`, `url()`,
+    /// `@import`.
+    pub what: String,
+}
+
+/// A URL as written in a source file: the byte offset of its text, the URL (entities decoded) and
+/// what references it.
+struct Reference {
+    offset: usize,
+    url: String,
+    what: String,
+}
+
+/// Attributes whose value is one URL (`srcset`, `imagesrcset` and `style` are read apart).
+fn is_url_attribute(tag: &str, name: &str) -> bool {
+    match name {
+        "href" | "src" | "poster" | "action" | "formaction" | "cite" | "background" | "longdesc" | "manifest"
+        | "xlink:href" => true,
+        "data" => tag == "object",
+        "content" => tag == "meta",
+        _ => false,
+    }
+}
+
+fn is_space(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | b'\x0c')
+}
+
+fn skip_spaces(bytes: &[u8], mut at: usize) -> usize {
+    while bytes.get(at).copied().is_some_and(is_space) {
+        at += 1;
+    }
+    at
+}
+
+/// The first `needle` at or after `from`, ignoring ASCII case.
+fn find_ignore_case(bytes: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+    if needle.is_empty() || from >= bytes.len() {
+        return None;
+    }
+    bytes
+        .get(from..)?
+        .windows(needle.len())
+        .position(|window| window.eq_ignore_ascii_case(needle))
+        .map(|at| at + from)
+}
+
+/// The first `byte` at or after `from`.
+fn find_byte(bytes: &[u8], byte: u8, from: usize) -> Option<usize> {
+    bytes
+        .get(from..)?
+        .iter()
+        .position(|candidate| *candidate == byte)
+        .map(|at| at + from)
+}
+
+fn starts_with_ignore_case(bytes: &[u8], prefix: &[u8]) -> bool {
+    bytes
+        .get(..prefix.len())
+        .is_some_and(|start| start.eq_ignore_ascii_case(prefix))
+}
+
+/// The end of a CSS string opened before `from` with `quote`: its closing quote, a line end, or the
+/// end of the text.
+fn string_end(bytes: &[u8], from: usize, quote: u8) -> usize {
+    let mut at = from;
+    while let Some(&byte) = bytes.get(at) {
+        if byte == quote || byte == b'\n' {
+            return at;
+        }
+        at += if byte == b'\\' { 2 } else { 1 };
+    }
+    bytes.len()
+}
+
+/// `raw` with its character references decoded, and for each byte of the result the offset in
+/// `raw` it came from (one more entry for the end).
+fn decode_mapped(raw: &str) -> (String, Vec<usize>) {
+    let mut out = String::with_capacity(raw.len());
+    let mut map = Vec::with_capacity(raw.len() + 1);
+    let mut at = 0;
+    while let Some(rest) = raw.get(at..).filter(|rest| !rest.is_empty()) {
+        if rest.starts_with('&')
+            && let Some(semicolon) = rest.get(1..rest.len().min(12)).and_then(|window| window.find(';'))
+            && let Some(character) = rest.get(1..=semicolon).and_then(super::link_check::entity)
+        {
+            out.push(character);
+            map.extend(std::iter::repeat_n(at, character.len_utf8()));
+            at += semicolon + 2;
+            continue;
+        }
+        let Some(character) = rest.chars().next() else {
+            break;
+        };
+        out.push(character);
+        map.extend((0..character.len_utf8()).map(|byte| at + byte));
+        at += character.len_utf8();
+    }
+    map.push(raw.len());
+    (out, map)
+}
+
+/// The `url()` and `@import "…"` references of CSS text: (byte offset of the URL text, the URL,
+/// what). Comments are skipped, and so are other strings.
+fn css_references(css: &str) -> Vec<(usize, String, &'static str)> {
+    let bytes = css.as_bytes();
+    let text = |start: usize, end: usize| css.get(start..end.min(css.len())).unwrap_or("").to_string();
+    let mut found = Vec::new();
+    let mut at = 0;
+    while let Some(rest) = bytes.get(at..).filter(|rest| !rest.is_empty()) {
+        if rest.starts_with(b"/*") {
+            at = find_ignore_case(bytes, b"*/", at + 2).map_or(bytes.len(), |end| end + 2);
+        } else if starts_with_ignore_case(rest, b"@import") {
+            at = skip_spaces(bytes, at + 7);
+            if let Some(&quote) = bytes.get(at).filter(|byte| matches!(byte, b'"' | b'\'')) {
+                let end = string_end(bytes, at + 1, quote);
+                found.push((at + 1, text(at + 1, end), "@import"));
+                at = end + 1;
+            }
+        } else if starts_with_ignore_case(rest, b"url(")
+            && !at
+                .checked_sub(1)
+                .and_then(|before| bytes.get(before))
+                .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            let start = skip_spaces(bytes, at + 4);
+            match bytes.get(start) {
+                Some(&quote) if quote == b'"' || quote == b'\'' => {
+                    let end = string_end(bytes, start + 1, quote);
+                    found.push((start + 1, text(start + 1, end), "url()"));
+                    at = end + 1;
+                }
+                _ => {
+                    let end = find_byte(bytes, b')', start).unwrap_or(bytes.len());
+                    let url = text(start, end);
+                    let url = url.trim_end();
+                    if !url.is_empty() {
+                        found.push((start, url.to_string(), "url()"));
+                    }
+                    at = end + 1;
+                }
+            }
+        } else if matches!(rest[0], b'"' | b'\'') {
+            at = string_end(bytes, at + 1, rest[0]) + 1;
+        } else {
+            at += 1;
+        }
+    }
+    found
+}
+
+/// The references of one attribute whose value `raw` starts at byte `start` of the page.
+fn attribute_references(tag: &str, name: &str, raw: &str, start: usize, found: &mut Vec<Reference>) {
+    if name != "srcset" && name != "imagesrcset" && name != "style" && !is_url_attribute(tag, name) {
+        return;
+    }
+    let (value, map) = decode_mapped(raw);
+    let at = |offset: usize| start + map.get(offset).copied().unwrap_or(0);
+    match name {
+        "srcset" | "imagesrcset" => {
+            let mut offset = 0;
+            for candidate in value.split(',') {
+                let lead = candidate.len() - candidate.trim_start().len();
+                if let Some(url) = candidate.split_whitespace().next() {
+                    found.push(Reference {
+                        offset: at(offset + lead),
+                        url: url.to_string(),
+                        what: format!("<{tag} {name}>"),
+                    });
+                }
+                offset += candidate.len() + 1;
+            }
+        }
+        "style" => {
+            for (offset, url, _) in css_references(&value) {
+                found.push(Reference {
+                    offset: at(offset),
+                    url,
+                    what: format!("<{tag} style> url()"),
+                });
+            }
+        }
+        _ => {
+            let lead = value.len() - value.trim_start().len();
+            let url = value.trim();
+            if !url.is_empty() {
+                found.push(Reference {
+                    offset: at(lead),
+                    url: url.to_string(),
+                    what: format!("<{tag} {name}>"),
+                });
+            }
+        }
+    }
+}
+
+/// The URL references of an HTML page in document order, and the first `<base href>` (decoded).
+fn html_references(html: &str) -> (Vec<Reference>, Option<String>) {
+    let bytes = html.as_bytes();
+    let length = bytes.len();
+    let mut found = Vec::new();
+    let mut base = None;
+    let mut at = 0;
+    while let Some(open) = find_byte(bytes, b'<', at) {
+        at = open + 1;
+        if bytes.get(at..).is_some_and(|tail| tail.starts_with(b"!--")) {
+            at = find_ignore_case(bytes, b"-->", at + 3).map_or(length, |end| end + 3);
+            continue;
+        }
+        // End tags, `<!DOCTYPE>`, a `<` in text.
+        if !bytes.get(at).is_some_and(u8::is_ascii_alphabetic) {
+            continue;
+        }
+        let name_end = (at..length)
+            .find(|&i| !(bytes[i].is_ascii_alphanumeric() || matches!(bytes[i], b'-' | b':')))
+            .unwrap_or(length);
+        let tag = html.get(at..name_end).unwrap_or("").to_ascii_lowercase();
+        at = name_end;
+        // The attributes, up to `>`.
+        loop {
+            while bytes.get(at).is_some_and(|byte| is_space(*byte) || *byte == b'/') {
+                at += 1;
+            }
+            match bytes.get(at) {
+                None => break,
+                Some(b'>') => {
+                    at += 1;
+                    break;
+                }
+                _ => {}
+            }
+            let name_start = at;
+            while bytes
+                .get(at)
+                .is_some_and(|byte| !is_space(*byte) && !matches!(byte, b'=' | b'>' | b'/'))
+            {
+                at += 1;
+            }
+            if at == name_start {
+                at += 1;
+                continue;
+            }
+            let name = html.get(name_start..at).unwrap_or("").to_ascii_lowercase();
+            let look = skip_spaces(bytes, at);
+            if bytes.get(look) != Some(&b'=') {
+                at = look;
+                continue;
+            }
+            let look = skip_spaces(bytes, look + 1);
+            let (start, end, next) = match bytes.get(look) {
+                Some(&quote) if quote == b'"' || quote == b'\'' => {
+                    let end = find_byte(bytes, quote, look + 1).unwrap_or(length);
+                    (look + 1, end, end + 1)
+                }
+                _ => {
+                    let end = (look..length)
+                        .find(|&i| is_space(bytes[i]) || bytes[i] == b'>')
+                        .unwrap_or(length);
+                    (look, end, end)
+                }
+            };
+            let raw = html.get(start..end).unwrap_or("");
+            if tag == "base" && name == "href" {
+                if base.is_none() {
+                    base = Some(decode_mapped(raw).0.trim().to_string());
+                }
+            } else {
+                attribute_references(&tag, &name, raw, start, &mut found);
+            }
+            at = next;
+        }
+        at = at.min(length);
+        // Raw text, never markup: a `<style>` block is CSS, a script's text is skipped.
+        if matches!(tag.as_str(), "script" | "style" | "textarea" | "title" | "xmp") {
+            let end = find_ignore_case(bytes, format!("</{tag}").as_bytes(), at).unwrap_or(length);
+            if tag == "style" {
+                for (offset, url, _) in css_references(html.get(at..end).unwrap_or("")) {
+                    found.push(Reference {
+                        offset: at + offset,
+                        url,
+                        what: "<style> url()".to_string(),
+                    });
+                }
+            }
+            at = end;
+        }
+    }
+    (found, base)
+}
+
+/// The position of byte `offset` of `source`, whose line ends are at `newlines`.
+fn position_at(source: &str, newlines: &[usize], offset: usize, count: u32) -> RefPosition {
+    let line = newlines.partition_point(|&newline| newline < offset);
+    let start = line
+        .checked_sub(1)
+        .and_then(|before| newlines.get(before))
+        .map_or(0, |newline| newline + 1);
+    let end = newlines.get(line).copied().unwrap_or(source.len());
+    let column = source.get(start..offset).map_or(0, |text| text.chars().count()) + 1;
+    let length = source
+        .get(start..end)
+        .map_or(0, |text| text.trim_end_matches('\r').chars().count());
+    RefPosition {
+        line: u32::try_from(line + 1).unwrap_or(u32::MAX),
+        column: u32::try_from(column).unwrap_or(u32::MAX),
+        count,
+        long_line: length > LONG_LINE_CHARS,
+    }
+}
+
+/// For each of `targets` (absolute URLs) that the file `source` at `url` references: where the
+/// first reference is (line and column of its URL text) and how many there are. URLs are resolved
+/// against `<base href>` and the page (HTML) or the stylesheet's own URL (CSS) and compared
+/// [`normalized`]. Keys of the result: [`url_key`] of the targets.
+pub fn locate(source: &str, url: &str, kind: SourceKind, targets: &[String]) -> BTreeMap<String, Located> {
+    let Ok(page) = url::Url::parse(url.trim()) else {
+        return BTreeMap::new();
+    };
+    let (mut references, base) = match kind {
+        SourceKind::Html => html_references(source),
+        SourceKind::Css => (
+            css_references(source)
+                .into_iter()
+                .map(|(offset, url, what)| Reference {
+                    offset,
+                    url,
+                    what: what.to_string(),
+                })
+                .collect(),
+            None,
+        ),
+    };
+    references.sort_by_key(|reference| reference.offset);
+    let base = base.and_then(|href| page.join(&href).ok()).unwrap_or(page);
+    let wanted: HashSet<String> = targets.iter().map(|target| url_key(target)).collect();
+    let mut found: BTreeMap<String, (usize, String, u32)> = BTreeMap::new();
+    for reference in references {
+        let written = reference.url.trim();
+        if written.is_empty() {
+            continue;
+        }
+        let Ok(resolved) = base.join(written) else {
+            continue;
+        };
+        let key = normalized(&resolved);
+        if wanted.contains(&key) {
+            found.entry(key).or_insert((reference.offset, reference.what, 0)).2 += 1;
+        }
+    }
+    if found.is_empty() {
+        return BTreeMap::new();
+    }
+    let newlines: Vec<usize> = source
+        .bytes()
+        .enumerate()
+        .filter(|(_, byte)| *byte == b'\n')
+        .map(|(at, _)| at)
+        .collect();
+    found
+        .into_iter()
+        .map(|(key, (offset, what, count))| {
+            let position = position_at(source, &newlines, offset, count);
+            (key, Located { position, what })
+        })
         .collect()
 }
 
@@ -367,7 +761,7 @@ fn build_client(settings: &SourceSettings) -> Result<Client, String> {
         .map_err(|error| format!("The HTTP client could not be created: {error}"))
 }
 
-/// Fetches and reads one source page of the site.
+/// Fetches and reads one source page of the site: an HTML page or a stylesheet.
 fn fetch_page(
     client: &Client,
     settings: &SourceSettings,
@@ -414,20 +808,28 @@ fn fetch_page(
     if status >= 300 {
         return not_fetched(format!("The page answered {status}."));
     }
-    let html = response
+    let content_type = response
         .headers()
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| {
-            let value = value.to_ascii_lowercase();
-            value.contains("html")
-        });
-    if !html {
-        return not_fetched("The page is not HTML.".to_string());
-    }
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
     let final_url = response.url().to_string();
+    let kind = if content_type.contains("css") {
+        SourceKind::Css
+    } else if content_type.contains("html") {
+        SourceKind::Html
+    } else if is_stylesheet(&final_url) {
+        SourceKind::Css
+    } else {
+        return not_fetched("The page is neither HTML nor a stylesheet.".to_string());
+    };
+    let limit = match kind {
+        SourceKind::Html => MAX_PAGE_BYTES,
+        SourceKind::Css => MAX_STYLESHEET_BYTES,
+    };
     let mut body = Vec::new();
-    let mut reader = response.take(MAX_PAGE_BYTES as u64);
+    let mut reader = response.take(limit as u64);
     let mut buffer = [0u8; 32 * 1024];
     while !cancel.load(Ordering::SeqCst) {
         match reader.read(&mut buffer) {
@@ -438,8 +840,25 @@ fn fetch_page(
         }
     }
     let text = String::from_utf8_lossy(&body);
-    PageTexts::Fetched {
-        texts: link_texts(&text, &final_url, targets),
+    // An editor counts no column for a byte order mark.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    let located = locate(text, &final_url, kind, targets);
+    match kind {
+        SourceKind::Html => {
+            let mut texts = link_texts(text, &final_url, targets);
+            // A reference the link texts do not cover (an inline style, a `<style>` block,
+            // `<object data>`, …) is named by what it is.
+            for (key, found) in &located {
+                texts.entry(key.clone()).or_insert_with(|| found.what.clone());
+            }
+            PageTexts::Fetched {
+                texts,
+                positions: located.into_iter().map(|(key, found)| (key, found.position)).collect(),
+            }
+        }
+        SourceKind::Css => PageTexts::Css {
+            positions: located.into_iter().map(|(key, found)| (key, found.position)).collect(),
+        },
     }
 }
 
@@ -618,6 +1037,165 @@ mod tests {
         assert!(first.ends_with('…'));
         assert_eq!(found[1].as_deref(), Some("Region"));
         assert_eq!(texts("<p>no links</p>", "not a url", &["https://x.example/"]), [None]);
+    }
+
+    /// `(line, column, count, long line)` of each target in `source`, `None` where it has none.
+    fn positions(source: &str, url: &str, kind: SourceKind, targets: &[&str]) -> Vec<Option<(u32, u32, u32, bool)>> {
+        let targets: Vec<String> = targets.iter().map(|t| t.to_string()).collect();
+        let found = locate(source, url, kind, &targets);
+        targets
+            .iter()
+            .map(|target| {
+                found.get(&url_key(target)).map(|found| {
+                    (
+                        found.position.line,
+                        found.position.column,
+                        found.position.count,
+                        found.position.long_line,
+                    )
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn references_are_located_in_the_attributes_of_an_html_page() {
+        let html = "<!DOCTYPE html>\n<html><head>\n<link rel=\"stylesheet\" href=\"../css/site.css\">\n<!-- <a href=\"/gone\">commented out</a> -->\n<script>var u = \"/gone\"; document.write('<a href=\"/gone\">');</script>\n</head><body>\n<p><a class=x HREF='/gone?a=1&amp;b=2'>Gone</a>\n<img alt=\"\" src = /img/missing.png>\n<video poster=\"/v/poster.jpg\" src=\"/v/clip.mp4\"></video><object data=\"/doc.pdf\"></object>\n<img srcset=\"/i/small.png 1x,\n  /i/big%20one.png 2x\">\n<p>Ünïcödé text <a href=\"/caf&#233;\">café</a></p>\n</body></html>";
+        assert_eq!(
+            positions(
+                html,
+                "https://site.example/blog/post/",
+                SourceKind::Html,
+                &[
+                    "https://site.example/blog/css/site.css",
+                    "https://site.example/gone?a=1&b=2",
+                    "https://site.example/img/missing.png",
+                    "https://site.example/v/poster.jpg",
+                    "https://site.example/v/clip.mp4",
+                    "https://site.example/doc.pdf",
+                    "https://site.example/i/big one.png",
+                    "https://site.example/café",
+                    "https://site.example/gone",
+                    "https://site.example/nowhere",
+                ],
+            ),
+            [
+                Some((3, 30, 1, false)),
+                // Entities decoded before the URL is resolved; the column is the raw text's.
+                Some((7, 21, 1, false)),
+                // An unquoted value after spaces around `=`.
+                Some((8, 19, 1, false)),
+                Some((9, 16, 1, false)),
+                Some((9, 36, 1, false)),
+                Some((9, 71, 1, false)),
+                // The second item of a srcset, on the next line.
+                Some((11, 3, 1, false)),
+                // Columns count characters, not bytes.
+                Some((12, 26, 1, false)),
+                // Only in a comment and in a script: no position.
+                None,
+                None,
+            ]
+        );
+    }
+
+    #[test]
+    fn the_base_element_inline_styles_and_style_blocks_are_honoured() {
+        let html = "<head><base href=\"https://cdn.site.example/root/\">\n<style>\n/* url(gone.png) */\n.hero { background: url( \"img/hero.webp\" ) }\n</style></head>\n<div style=\"background-image: url(&quot;img/tile.png&quot;)\">x</div>\n<a href=\"page\">Page</a> <a href=\"page\">Again</a>\n<a href=\"page#top\">Third</a>";
+        let targets = [
+            "https://cdn.site.example/root/img/hero.webp",
+            "https://cdn.site.example/root/img/tile.png",
+            "https://cdn.site.example/root/page",
+            "https://cdn.site.example/root/gone.png",
+            "https://site.example/page",
+        ];
+        assert_eq!(
+            positions(html, "https://site.example/other/", SourceKind::Html, &targets),
+            [
+                Some((4, 27, 1, false)),
+                // `&quot;` around the URL in a style attribute.
+                Some((6, 41, 1, false)),
+                // Several references: the first, and how many.
+                Some((7, 10, 3, false)),
+                None,
+                None,
+            ]
+        );
+        let targets: Vec<String> = targets.iter().map(|t| t.to_string()).collect();
+        let found = locate(html, "https://site.example/other/", SourceKind::Html, &targets);
+        assert_eq!(found[&url_key(&targets[0])].what, "<style> url()");
+        assert_eq!(found[&url_key(&targets[1])].what, "<div style> url()");
+        assert_eq!(found[&url_key(&targets[2])].what, "<a href>");
+    }
+
+    #[test]
+    fn references_are_located_in_a_stylesheet() {
+        let css = "@import \"base.css\";\n@import url(print.css) print;\n/* .old { background: url(../img/gone.png) } */\n.a { background: url(../img/bg.png) no-repeat; }\n.b { background: url( '../img/bg.png' ); }\n@font-face { src: url(\"../fonts/My Font.woff2\") format(\"woff2\"), url(  ../fonts/x.woff  ); }\n.c::after { content: \"url(../img/fake.png)\"; }\n.d { mask: myurl(../img/fake.png); }";
+        assert_eq!(
+            positions(
+                css,
+                "https://site.example/assets/css/page-styles.css",
+                SourceKind::Css,
+                &[
+                    "https://site.example/assets/css/base.css",
+                    "https://site.example/assets/css/print.css",
+                    "https://site.example/assets/img/bg.png",
+                    "https://site.example/assets/fonts/My%20Font.woff2",
+                    "https://site.example/assets/fonts/x.woff",
+                    "https://site.example/assets/img/gone.png",
+                    "https://site.example/assets/img/fake.png",
+                    "https://site.example/assets/img/missing.png",
+                ],
+            ),
+            [
+                Some((1, 10, 1, false)),
+                Some((2, 13, 1, false)),
+                // Unquoted and quoted, with spaces inside the parentheses: two references.
+                Some((4, 22, 2, false)),
+                Some((6, 24, 1, false)),
+                Some((6, 72, 1, false)),
+                // In a comment, in a string, in another function: none.
+                None,
+                None,
+                None,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_minified_file_gives_the_column_on_its_one_long_line() {
+        let mut css = String::new();
+        for n in 0..400 {
+            css.push_str(&format!(".r{n}{{color:#{n:03}}}"));
+        }
+        let column = css.chars().count() + 1 + ".x{background:url(".len();
+        css.push_str(".x{background:url(../img/missing.png)}");
+        assert!(css.len() > LONG_LINE_CHARS);
+        let found = positions(
+            &css,
+            "https://site.example/css/style.min.css",
+            SourceKind::Css,
+            &["https://site.example/img/missing.png"],
+        );
+        assert_eq!(found, [Some((1, column as u32, 1, true))]);
+        let position = RefPosition {
+            line: 1,
+            column: column as u32,
+            count: 1,
+            long_line: true,
+        };
+        assert_eq!(position.suffix(), format!(":1:{column}"));
+        // A short line: the line alone.
+        assert_eq!(
+            positions(
+                ".a{}\r\n.b{background:url(x.png)}",
+                "https://site.example/s.css",
+                SourceKind::Css,
+                &["https://site.example/x.png"]
+            ),
+            [Some((2, 19, 1, false))]
+        );
+        assert!(locate("", "not a url", SourceKind::Css, &["https://x.example/".to_string()]).is_empty());
     }
 
     #[test]

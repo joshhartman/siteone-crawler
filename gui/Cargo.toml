@@ -32,7 +32,6 @@ keyring = "4.2"
 dirs = "6"
 open = "5"
 chrono = "0.4"
-shlex = "2"
 url = "2"
 # The external link check (backend/link_check.rs). Only features the crawler already enables on
 # these crates (reqwest: default + blocking + rustls; rustls: ring), so building both together
@@ -60,3 +59,5 @@ tempfile = "3"
 # The regex engine of the crawler's `--ignore-regex` (same spec as the crawler's), for the tests of
 # the action-link patterns.
 fancy-regex = "0.18"
+# An independent POSIX splitter, to cross-check the exported Bash quoting.
+shlex = "2"

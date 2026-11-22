@@ -38,7 +38,7 @@ use super::{CheckStatus, RunAction, RunView, padded};
 use crate::model::coverage::{self, Gap, GapInput};
 use crate::model::link_check::{LinkResult, Outcome, OutcomeCounts, classify_status};
 use crate::model::link_report::group_by_page;
-use crate::model::link_text::{LinkTexts, TextLookup};
+use crate::model::link_text::{LinkTexts, RefPosition, TextLookup};
 use crate::model::results::{ResultData, ResultLoad};
 use crate::model::retry::RetryState;
 use crate::model::run_state::{StatusClass, UrlRow};
@@ -696,10 +696,12 @@ pub struct ShownRow {
     pub title: Option<String>,
     pub final_url: Option<String>,
     /// The link text on the page it was found on, or what became of it ("not found on the page",
-    /// "source not fetched", "CSS url()"); empty when unknown.
+    /// "source not fetched", "in a stylesheet"); empty when unknown.
     pub link_text: String,
     /// Every page it was found on (empty when unknown).
     pub sources: Vec<String>,
+    /// For each of `sources`, where it references the URL (`:1929`, `:1:20345`), or empty.
+    pub positions: Vec<String>,
     /// A checked external link (not a crawled URL).
     pub checked: bool,
 }
@@ -708,6 +710,25 @@ impl ShownRow {
     /// The first page it was found on.
     pub fn found_on(&self) -> Option<&str> {
         self.sources.first().map(String::as_str)
+    }
+
+    /// Every page it was found on, each with where it references the URL (`…/style.css:1929`).
+    pub fn found_on_with_positions(&self) -> Vec<String> {
+        self.sources
+            .iter()
+            .enumerate()
+            .map(|(at, source)| format!("{source}{}", self.positions.get(at).map_or("", String::as_str)))
+            .collect()
+    }
+
+    /// Where `page` (one of `sources`, a trailing `/` aside) references the URL, or empty.
+    pub fn position_on(&self, page: &str) -> &str {
+        let key = page.trim().trim_end_matches('/');
+        self.sources
+            .iter()
+            .position(|source| source.trim().trim_end_matches('/') == key)
+            .and_then(|at| self.positions.get(at))
+            .map_or("", String::as_str)
     }
 }
 
@@ -893,7 +914,7 @@ impl BrokenUi {
             .rows()
             .iter()
             .filter_map(|row| context.item(*row))
-            .map(|item| shown_row(&item, item.link_text(texts)))
+            .map(|item| shown_row(&item, item.link_text(texts), texts))
             .collect()
     }
 
@@ -922,7 +943,7 @@ impl BrokenUi {
                 PageRow::Page(at) => groups.push((self.pages.page(*at).map(str::to_string), Vec::new())),
                 PageRow::Link(row, at) => {
                     if let (Some(item), Some((_, rows))) = (context.item(*row), groups.last_mut()) {
-                        rows.push(shown_row(&item, page_text(texts, &item, self.pages.page(*at))));
+                        rows.push(shown_row(&item, page_text(texts, &item, self.pages.page(*at)), texts));
                     }
                 }
             }
@@ -932,7 +953,8 @@ impl BrokenUi {
 }
 
 /// What Copy list and the tests see of a row.
-fn shown_row(item: &Item<'_>, link_text: TextLookup<'_>) -> ShownRow {
+fn shown_row(item: &Item<'_>, link_text: TextLookup<'_>, texts: &LinkTexts) -> ShownRow {
+    let sources = item.sources();
     ShownRow {
         status: item.status_text(),
         code: item.status(),
@@ -944,9 +966,28 @@ fn shown_row(item: &Item<'_>, link_text: TextLookup<'_>) -> ShownRow {
             Item::Crawled { .. } => None,
         },
         link_text: link_text.text().to_string(),
-        sources: item.sources().iter().map(|source| source.to_string()).collect(),
+        positions: sources
+            .iter()
+            .map(|source| {
+                texts
+                    .position(item.url(), source)
+                    .map(RefPosition::suffix)
+                    .unwrap_or_default()
+            })
+            .collect(),
+        sources: sources.iter().map(|source| source.to_string()).collect(),
         checked: matches!(item, Item::Link(_)),
     }
+}
+
+/// The item's own spelling of `page` (the group shows the page as first met; the item's spelling
+/// is the key of its texts).
+fn own_source<'b>(item: &'b Item<'_>, page: &'b str) -> &'b str {
+    let key = page.trim().trim_end_matches('/');
+    item.sources()
+        .into_iter()
+        .find(|source| source.trim().trim_end_matches('/') == key)
+        .unwrap_or(page)
 }
 
 /// The link text of `item` on `page` (on any page it was found on when the page is not known).
@@ -954,15 +995,7 @@ fn page_text<'t>(texts: &'t LinkTexts, item: &Item<'_>, page: Option<&str>) -> T
     let Some(page) = page else {
         return item.link_text(texts);
     };
-    // The group shows the page as first met; the item's own spelling is the key of its texts.
-    let key = page.trim().trim_end_matches('/');
-    let sources = item.sources();
-    let source = sources
-        .iter()
-        .copied()
-        .find(|source| source.trim().trim_end_matches('/') == key)
-        .unwrap_or(page);
-    texts.lookup(item.url(), &[source])
+    texts.lookup(item.url(), &[own_source(item, page)])
 }
 
 pub fn show(ui: &mut Ui, view: &RunView<'_>, broken: &mut BrokenUi, focus: bool, actions: &mut Vec<RunAction>) {
@@ -1095,13 +1128,10 @@ fn check_banner(ui: &mut Ui, view: &RunView<'_>, actions: &mut Vec<RunAction>) {
                 format::count(*done as u64),
                 format::count(*total as u64)
             );
+            // Stop check is the header's primary action while the check runs.
             let stop = widgets::banner(ui, Tone::Info, &message, |ui| {
-                let stop = ui
-                    .add(egui::Button::new("Stop check"))
-                    .accessible_name("Stop check")
-                    .clicked();
                 progress::spinner(ui, 16.0, theme::palette(ui).accent);
-                stop
+                false
             });
             if stop {
                 actions.push(RunAction::StopCheck);
@@ -1355,14 +1385,18 @@ fn filter_row(ui: &mut Ui, view: &RunView<'_>, broken: &mut BrokenUi, focus: boo
 }
 
 /// The *by page* rows as tab-separated text: one line per link and page, the page first (empty
-/// when it is not known).
+/// when it is not known) with where it references the link (`…/style.css:1929`).
 pub fn copy_text_by_page(groups: &[(Option<String>, Vec<ShownRow>)]) -> String {
     let mut text = String::from("Found on\tStatus\tWhere\tURL\tLink text\n");
     for (page, rows) in groups {
         for row in rows {
+            let found_on = page
+                .as_deref()
+                .map(|page| format!("{page}{}", row.position_on(page)))
+                .unwrap_or_default();
             text.push_str(&format!(
                 "{}\t{}\t{}\t{}\t{}\n",
-                page.as_deref().unwrap_or(""),
+                found_on,
                 row.status,
                 row.place.label(),
                 row.url,
@@ -1373,7 +1407,8 @@ pub fn copy_text_by_page(groups: &[(Option<String>, Vec<ShownRow>)]) -> String {
     text
 }
 
-/// The rows as tab-separated text; every page a link was found on, joined by ` | `.
+/// The rows as tab-separated text; every page a link was found on (with where it references the
+/// link: `…/style.css:1929`), joined by ` | `.
 pub fn copy_text(rows: &[ShownRow], all_external: bool) -> String {
     let mut text = String::from(if all_external {
         "Status\tWhere\tURL\tLink text\tFound on\tTitle\tFinal URL\n"
@@ -1387,7 +1422,7 @@ pub fn copy_text(rows: &[ShownRow], all_external: bool) -> String {
             row.place.label(),
             row.url,
             row.link_text,
-            row.sources.join(" | ")
+            row.found_on_with_positions().join(" | ")
         ));
         if all_external {
             text.push_str(&format!(
@@ -1469,8 +1504,8 @@ fn broken_table(ui: &mut Ui, view: &RunView<'_>, broken: &mut BrokenUi, actions:
                 builder = builder
                     .column(Column::exact(second))
                     .column(Column::exact(110.0))
-                    .column(text_column(share(fixed, 0.38)))
-                    .column(text_column(share(fixed, 0.27)))
+                    .column(text_column(share(fixed, 0.36)))
+                    .column(text_column(share(fixed, 0.25)))
                     .column(Column::remainder().at_least(90.0).clip(true));
                 match scope {
                     Scope::RetryQueue => &[
@@ -1594,7 +1629,8 @@ fn finish_clicks(
 }
 
 /// The *by page* layout: a heading row per page (the page, the number of links on it), under it
-/// the links found on that page — Status, Kind, Where, URL and the link text on that page. The
+/// the links found on that page — Status, Kind, Where, URL, the line where that page references
+/// the link and the link text on that page. The
 /// checkboxes, the row menu, the sort (within each page) and the filter work as by link.
 fn page_table(ui: &mut Ui, view: &RunView<'_>, broken: &mut BrokenUi, actions: &mut Vec<RunAction>) {
     // Turned on in this frame's toolbar, after the sync: bring the layout up to date first.
@@ -1632,7 +1668,7 @@ fn page_table(ui: &mut Ui, view: &RunView<'_>, broken: &mut BrokenUi, actions: &
             let sorted = |key: BrokenSort| (broken.sort == key).then_some(broken.ascending);
             let across = ui.max_rect().x_range();
             let check_width = if selectable { 28.0 } else { 0.0 };
-            let fixed = check_width + 140.0 + 70.0 + 110.0;
+            let fixed = check_width + 140.0 + 70.0 + 110.0 + LINE_WIDTH;
             let url_width = ((ui.available_width() - fixed).max(420.0) * 0.6).max(110.0);
             let mut builder = TableBuilder::new(ui)
                 .id_salt("run-broken-by-page-table")
@@ -1647,6 +1683,7 @@ fn page_table(ui: &mut Ui, view: &RunView<'_>, broken: &mut BrokenUi, actions: &
                 .column(Column::exact(70.0))
                 .column(Column::exact(110.0))
                 .column(Column::exact(url_width).clip(true))
+                .column(Column::exact(LINE_WIDTH).clip(true))
                 .column(Column::remainder().at_least(90.0).clip(true))
                 .min_scrolled_height(0.0)
                 .auto_shrink([false, false])
@@ -1659,16 +1696,21 @@ fn page_table(ui: &mut Ui, view: &RunView<'_>, broken: &mut BrokenUi, actions: &
                         });
                     }
                     for (label, key) in [
-                        ("Status", BrokenSort::Status),
-                        ("Kind", BrokenSort::Kind),
-                        ("Where", BrokenSort::Where),
-                        ("URL", BrokenSort::Url),
-                        ("Link text", BrokenSort::LinkText),
+                        ("Status", Some(BrokenSort::Status)),
+                        ("Kind", Some(BrokenSort::Kind)),
+                        ("Where", Some(BrokenSort::Where)),
+                        ("URL", Some(BrokenSort::Url)),
+                        // Where the page references the link (not sorted on).
+                        ("Line", None),
+                        ("Link text", Some(BrokenSort::LinkText)),
                     ] {
-                        header.col(|ui| {
-                            if sort_header(ui, label, sorted(key), false).clicked() {
-                                sort_click = Some(key);
+                        header.col(|ui| match key {
+                            Some(key) => {
+                                if sort_header(ui, label, sorted(key), false).clicked() {
+                                    sort_click = Some(key);
+                                }
                             }
+                            None => crate::ui::widgets::table::header_label(ui, label),
                         });
                     }
                 })
@@ -1730,6 +1772,11 @@ fn page_table(ui: &mut Ui, view: &RunView<'_>, broken: &mut BrokenUi, actions: &
                                     ui.label(RichText::new(place.label()).color(color));
                                 });
                                 row.col(|ui| url_cell(ui, &item));
+                                row.col(|ui| {
+                                    let position = page
+                                        .and_then(|page| view.links.texts.position(item.url(), own_source(&item, page)));
+                                    line_cell(ui, position);
+                                });
                                 row.col(|ui| {
                                     let text = page_text(view.links.texts, &item, page);
                                     link_text_cell(ui, view, text, page.is_some() || !item.sources().is_empty())
@@ -1915,7 +1962,16 @@ fn link_text_cell(ui: &mut Ui, view: &RunView<'_>, lookup: TextLookup<'_>, has_s
             "not found on the page",
             "The page it was found on does not reference this URL now: it changed, or a script builds the link.",
         ),
-        TextLookup::Stylesheet => weak(ui, "CSS url()", "Referenced by url() in a stylesheet."),
+        TextLookup::Stylesheet => weak(
+            ui,
+            "in a stylesheet",
+            "Referenced by url() or @import in a stylesheet: a stylesheet has no link text. Found on gives the line.",
+        ),
+        TextLookup::NotInStylesheet => weak(
+            ui,
+            "not found in the stylesheet",
+            "The stylesheet it was found on does not reference this URL now: it changed, or a script builds the URL.",
+        ),
         TextLookup::NotFetched(reason) => weak(ui, "source not fetched", reason),
         TextLookup::Unknown if !has_source => {
             ui.label(widgets::weak(ui, "—"));
@@ -1934,20 +1990,25 @@ fn link_text_cell(ui: &mut Ui, view: &RunView<'_>, lookup: TextLookup<'_>, has_s
 }
 
 fn found_on_cell(ui: &mut Ui, view: &RunView<'_>, item: &Item<'_>, result_ready: bool) {
-    let p = theme::palette(ui);
     let sources = item.sources();
     match sources.first() {
         Some(source) => {
-            if is_stylesheet(source) {
+            let texts = view.links.texts;
+            let position = texts.position(item.url(), source);
+            // With a position, the cell ends with `.css:1929`: the chip would only take its room.
+            if is_stylesheet(source) && position.is_none() {
                 widgets::chip(ui, "CSS", Tone::Accent)
                     .on_hover_text("Referenced from a stylesheet (e.g. a background image)");
             }
             if sources.len() > 1 {
                 // The chip first: the URL is cut at the column's edge.
-                widgets::chip(ui, format!("+{} more", sources.len() - 1), Tone::Neutral)
-                    .on_hover_text(sources.join("\n"));
+                let all: Vec<String> = sources
+                    .iter()
+                    .map(|source| texts.found_on_with_position(item.url(), source))
+                    .collect();
+                widgets::chip(ui, format!("+{} more", sources.len() - 1), Tone::Neutral).on_hover_text(all.join("\n"));
             }
-            middle_cell(ui, source, p.text, None);
+            source_cell(ui, source, position);
         }
         None if view.live => {
             ui.label(widgets::weak(ui, "available when the crawl finishes"));
@@ -1959,6 +2020,58 @@ fn found_on_cell(ui: &mut Ui, view: &RunView<'_>, item: &Item<'_>, result_ready:
         None => {
             ui.label(widgets::weak(ui, "not reported by the crawler"))
                 .on_hover_text("The crawler records the referring page for 404 responses only.");
+        }
+    }
+}
+
+/// The width of the *Line* column of the by-page layout.
+const LINE_WIDTH: f32 = 84.0;
+
+/// Where a page references a link, in words, for a tooltip.
+fn position_tip(position: &RefPosition) -> String {
+    format!(
+        "Referenced at {} in the file as fetched after the crawl.",
+        position.describe()
+    )
+}
+
+/// A page a link was found on, cut in the middle to the cell's width — never its position
+/// (`:1929`), which is the point of it; the full page and the position in words in the tooltip.
+/// Opening the page opens it without the position.
+fn source_cell(ui: &mut Ui, source: &str, position: Option<&RefPosition>) {
+    let p = theme::palette(ui);
+    let Some(position) = position else {
+        middle_cell(ui, source, p.text, None);
+        return;
+    };
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let suffix = position.suffix();
+    let suffix_width = ui
+        .painter()
+        .layout_no_wrap(suffix.clone(), font.clone(), p.text)
+        .size()
+        .x;
+    let shown = middle_truncate(ui, source, &font, (ui.available_width() - suffix_width - 2.0).max(0.0));
+    let mut job = egui::text::LayoutJob::default();
+    job.append(&shown, 0.0, egui::TextFormat::simple(font.clone(), p.text));
+    job.append(&suffix, 0.0, egui::TextFormat::simple(font, p.accent));
+    ui.add(egui::Label::new(job).extend())
+        .on_hover_text(format!("{source}{suffix}\n{}", position_tip(position)));
+}
+
+/// The *Line* cell of the by-page layout: `1929`, or `1:20345` on a long line.
+fn line_cell(ui: &mut Ui, position: Option<&RefPosition>) {
+    let p = theme::palette(ui);
+    match position {
+        Some(position) => {
+            let line = position.suffix();
+            ui.label(RichText::new(line.trim_start_matches(':')).color(p.accent))
+                .on_hover_text(position_tip(position));
+        }
+        None => {
+            ui.label(widgets::weak(ui, "—")).on_hover_text(
+                "No position: the page was not read, or it does not reference this URL now (it changed, or a script builds the link).",
+            );
         }
     }
 }
@@ -2196,11 +2309,13 @@ mod tests {
                 "https://site.example/a".to_string(),
                 "https://site.example/b".to_string(),
             ],
+            positions: vec![":212".to_string(), String::new()],
             checked: true,
         }];
+        // Each page with where it references the link, when it is known.
         assert_eq!(
             copy_text(&rows, false),
-            "Status\tWhere\tURL\tLink text\tFound on\nRefused 403\tExternal\thttps://refused.example/\tOur partner\thttps://site.example/a | https://site.example/b\n"
+            "Status\tWhere\tURL\tLink text\tFound on\nRefused 403\tExternal\thttps://refused.example/\tOur partner\thttps://site.example/a:212 | https://site.example/b\n"
         );
         assert!(copy_text(&rows, true).contains("\tForbidden\t\n"));
     }
@@ -2458,13 +2573,14 @@ mod tests {
                 title: None,
                 final_url: None,
                 link_text: "Gone".to_string(),
-                sources: vec!["https://site.example/b".to_string()],
+                sources: vec!["https://site.example/b/".to_string()],
+                positions: vec![":1:20345".to_string()],
                 checked: false,
             }],
         )];
         assert_eq!(
             copy_text_by_page(&groups),
-            "Found on\tStatus\tWhere\tURL\tLink text\nhttps://site.example/b\t404\tInternal page\thttps://site.example/gone\tGone\n"
+            "Found on\tStatus\tWhere\tURL\tLink text\nhttps://site.example/b:1:20345\t404\tInternal page\thttps://site.example/gone\tGone\n"
         );
     }
 }

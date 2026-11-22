@@ -9,7 +9,7 @@ use eframe::egui;
 use siteone_crawler_gui::app::{App, AppDeps};
 use siteone_crawler_gui::model::paths::AppPaths;
 use siteone_crawler_gui::model::schema::OptionSchema;
-use siteone_crawler_gui::model::secrets::KeyringStore;
+use siteone_crawler_gui::model::secrets::{self, KeyringStore};
 
 const TITLE: &str = "SiteOne Crawler";
 
@@ -36,7 +36,8 @@ fn main() -> ExitCode {
     }
 
     let schema = OptionSchema::load();
-    let deps = AppDeps::load(paths, schema, Box::new(KeyringStore));
+    let store = KeyringStore::new(secrets::service_name(paths.override_root()));
+    let deps = AppDeps::load(paths, schema, Box::new(store));
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_title(TITLE)

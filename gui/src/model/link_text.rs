@@ -5,7 +5,9 @@
 //!
 //! Texts are stored per source page: a page that was fetched has the texts of every target the run
 //! knows (its internal 404s and its external links) that the page references; a target it does not
-//! reference is "not found on the page".
+//! reference is "not found on the page". Next to each text, where the reference is in the file as
+//! fetched ([`RefPosition`]: line, column, how many references): the place to go and fix. A
+//! stylesheet that was fetched has positions only (a `url()` or `@import` has no link text).
 
 use std::collections::BTreeMap;
 use std::io;
@@ -21,16 +23,88 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// At most this many source pages of a run are fetched.
 pub const MAX_SOURCE_PAGES: usize = 200;
 
+/// A reference whose line is longer than this many characters (a minified file) is shown with its
+/// column.
+pub const LONG_LINE_CHARS: usize = 500;
+
+/// Where a source page references a target, in the file as fetched after the crawl: the first
+/// reference's line and column (1-based, in characters; the column is where the URL text starts),
+/// and how many references to the target the page has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RefPosition {
+    pub line: u32,
+    pub column: u32,
+    /// References to the target on the page (at least 1).
+    #[serde(default = "one")]
+    pub count: u32,
+    /// The first reference's line is longer than [`LONG_LINE_CHARS`] (a minified file): its
+    /// column is shown too.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub long_line: bool,
+}
+
+fn one() -> u32 {
+    1
+}
+
+impl RefPosition {
+    /// The suffix after the page's URL: `:1929`, or `:1:20345` on a long line.
+    pub fn suffix(&self) -> String {
+        if self.long_line {
+            format!(":{}:{}", self.line, self.column)
+        } else {
+            format!(":{}", self.line)
+        }
+    }
+
+    /// In words: "line 1929" or "line 1, column 20345", with "(and 2 more)" for further references.
+    pub fn describe(&self) -> String {
+        let mut text = if self.long_line {
+            format!("line {}, column {}", self.line, self.column)
+        } else {
+            format!("line {}", self.line)
+        };
+        if self.count > 1 {
+            text.push_str(&format!(" (and {} more)", self.count - 1));
+        }
+        text
+    }
+}
+
 /// What became of a source page.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "camelCase")]
 pub enum PageTexts {
-    /// Fetched and read: target key ([`url_key`]) → link text.
-    Fetched { texts: BTreeMap<String, String> },
-    /// A stylesheet: not fetched; the link is a `url()` in it.
+    /// An HTML page, fetched and read: target key ([`url_key`]) → link text, and → where the page
+    /// references it (absent in the files of earlier versions).
+    Fetched {
+        texts: BTreeMap<String, String>,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        positions: BTreeMap<String, RefPosition>,
+    },
+    /// A stylesheet, fetched and read: target key → where a `url()` or `@import` references it.
+    Css { positions: BTreeMap<String, RefPosition> },
+    /// A stylesheet that was not fetched (the files of earlier versions): the link is a `url()`
+    /// in it.
     Stylesheet,
     /// Not fetched, and why.
     NotFetched { reason: String },
+}
+
+impl PageTexts {
+    /// An HTML page that was read: its texts, no positions.
+    pub fn texts(texts: BTreeMap<String, String>) -> Self {
+        PageTexts::Fetched {
+            texts,
+            positions: BTreeMap::new(),
+        }
+    }
+
+    /// Whether the page was fetched and read (an HTML page or a stylesheet).
+    pub fn is_read(&self) -> bool {
+        matches!(self, PageTexts::Fetched { .. } | PageTexts::Css { .. })
+    }
 }
 
 /// The link texts of a run, by source page URL.
@@ -48,8 +122,10 @@ pub enum TextLookup<'a> {
     Text(&'a str),
     /// The page was read but does not reference the URL (it changed, or a script builds the link).
     NotFound,
-    /// Found in a stylesheet.
+    /// Referenced by a stylesheet (a `url()` or `@import`: no link text).
     Stylesheet,
+    /// The stylesheet was read but does not reference the URL.
+    NotInStylesheet,
     /// The page was not fetched (the reason).
     NotFetched(&'a str),
     /// No source page, or not looked at yet.
@@ -62,7 +138,8 @@ impl TextLookup<'_> {
         match self {
             TextLookup::Text(text) => text,
             TextLookup::NotFound => "not found on the page",
-            TextLookup::Stylesheet => "CSS url()",
+            TextLookup::Stylesheet => "in a stylesheet",
+            TextLookup::NotInStylesheet => "not found in the stylesheet",
             TextLookup::NotFetched(_) => "source not fetched",
             TextLookup::Unknown => "",
         }
@@ -89,10 +166,12 @@ impl LinkTexts {
         let mut first = None;
         for source in sources {
             let found = match self.pages.get(*source) {
-                Some(PageTexts::Fetched { texts }) => match texts.get(&key) {
+                Some(PageTexts::Fetched { texts, .. }) => match texts.get(&key) {
                     Some(text) => return TextLookup::Text(text),
                     None => TextLookup::NotFound,
                 },
+                Some(PageTexts::Css { positions }) if positions.contains_key(&key) => return TextLookup::Stylesheet,
+                Some(PageTexts::Css { .. }) => TextLookup::NotInStylesheet,
                 Some(PageTexts::Stylesheet) => TextLookup::Stylesheet,
                 Some(PageTexts::NotFetched { reason }) => TextLookup::NotFetched(reason),
                 None => TextLookup::Unknown,
@@ -101,9 +180,28 @@ impl LinkTexts {
         }
         first.unwrap_or(TextLookup::Unknown)
     }
+
+    /// Where the page `source` references `target` (`None` when the page was not read or has no
+    /// reference to it).
+    pub fn position(&self, target: &str, source: &str) -> Option<&RefPosition> {
+        match self.pages.get(source)? {
+            PageTexts::Fetched { positions, .. } | PageTexts::Css { positions } => positions.get(&url_key(target)),
+            PageTexts::Stylesheet | PageTexts::NotFetched { .. } => None,
+        }
+    }
+
+    /// `source` with the position of its reference to `target` (`…/style.css:1929`), else
+    /// `source` alone.
+    pub fn found_on_with_position(&self, target: &str, source: &str) -> String {
+        match self.position(target, source) {
+            Some(position) => format!("{source}{}", position.suffix()),
+            None => source.to_string(),
+        }
+    }
 }
 
-/// Whether a source "page" is a stylesheet (its path ends with `.css`): not fetched.
+/// Whether a source "page" is a stylesheet (its path ends with `.css`): read as CSS when its
+/// answer does not say it is HTML.
 pub fn is_stylesheet(url: &str) -> bool {
     url::Url::parse(url.trim())
         .map(|parsed| parsed.path().to_ascii_lowercase().ends_with(".css"))
@@ -197,11 +295,33 @@ mod tests {
             "https://site.example/a".to_string(),
             PageTexts::Fetched {
                 texts: BTreeMap::from([(url_key("https://dead.example/"), "Dead link".to_string())]),
+                positions: BTreeMap::from([(
+                    url_key("https://dead.example/"),
+                    RefPosition {
+                        line: 12,
+                        column: 9,
+                        count: 3,
+                        long_line: false,
+                    },
+                )]),
             },
         );
+        texts
+            .pages
+            .insert("https://site.example/b".to_string(), PageTexts::texts(BTreeMap::new()));
         texts.pages.insert(
-            "https://site.example/b".to_string(),
-            PageTexts::Fetched { texts: BTreeMap::new() },
+            "https://site.example/new.css".to_string(),
+            PageTexts::Css {
+                positions: BTreeMap::from([(
+                    url_key("https://site.example/font.woff2"),
+                    RefPosition {
+                        line: 1,
+                        column: 20345,
+                        count: 1,
+                        long_line: true,
+                    },
+                )]),
+            },
         );
         texts.pages.insert(
             "https://site.example/c".to_string(),
@@ -237,10 +357,80 @@ mod tests {
             TextLookup::Unknown
         );
         assert_eq!(lookup("https://x.example/", &[]), TextLookup::Unknown);
+        // A stylesheet that was read: its references have no text, only a position.
+        assert_eq!(
+            lookup("https://site.example/font.woff2", &["https://site.example/new.css"]),
+            TextLookup::Stylesheet
+        );
+        assert_eq!(
+            lookup("https://site.example/other.png", &["https://site.example/new.css"]),
+            TextLookup::NotInStylesheet
+        );
+        // Positions: per page, shown after the page's URL.
+        assert_eq!(
+            texts.found_on_with_position("https://dead.example", "https://site.example/a"),
+            "https://site.example/a:12"
+        );
+        assert_eq!(
+            texts.found_on_with_position("https://site.example/font.woff2", "https://site.example/new.css"),
+            "https://site.example/new.css:1:20345"
+        );
+        assert_eq!(
+            texts.found_on_with_position("https://dead.example", "https://site.example/b"),
+            "https://site.example/b"
+        );
+        let first = texts
+            .position("https://dead.example", "https://site.example/a")
+            .expect("position");
+        assert_eq!(first.describe(), "line 12 (and 2 more)");
+        assert_eq!(
+            texts
+                .position("https://site.example/font.woff2", "https://site.example/new.css")
+                .map(RefPosition::describe)
+                .as_deref(),
+            Some("line 1, column 20345")
+        );
 
         let tmp = tempfile::tempdir().expect("temp dir");
         texts.cut = 3;
         texts.write(tmp.path()).expect("written");
         assert_eq!(LinkTexts::read(tmp.path()).expect("read"), Some(texts));
+    }
+
+    #[test]
+    fn a_file_of_an_earlier_version_still_loads() {
+        // As written before positions were kept: no `positions`, stylesheets not fetched.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        std::fs::write(
+            LinkTexts::path(tmp.path()),
+            r#"{
+  "pages": {
+    "https://site.example/a": { "state": "fetched", "texts": { "https://dead.example": "Dead link" } },
+    "https://site.example/s.css": { "state": "stylesheet" },
+    "https://site.example/c": { "state": "notFetched", "reason": "The page answered 404." }
+  },
+  "cut": 0,
+  "schemaVersion": 1
+}
+"#,
+        )
+        .expect("written");
+        let texts = LinkTexts::read(tmp.path()).expect("read").expect("a file");
+        assert_eq!(
+            texts.lookup("https://dead.example/", &["https://site.example/a"]),
+            TextLookup::Text("Dead link")
+        );
+        assert_eq!(texts.position("https://dead.example/", "https://site.example/a"), None);
+        assert_eq!(
+            texts.lookup("https://site.example/x.png", &["https://site.example/s.css"]),
+            TextLookup::Stylesheet
+        );
+        // A page without positions is written as before (no empty `positions`).
+        texts.write(tmp.path()).expect("written");
+        let written = std::fs::read_to_string(LinkTexts::path(tmp.path())).expect("read");
+        assert!(!written.contains("positions"), "{written}");
+        // A position without `count` and `longLine` reads as one reference on a short line.
+        let position: RefPosition = serde_json::from_str(r#"{"line":4,"column":2}"#).expect("parsed");
+        assert_eq!((position.count, position.long_line), (1, false));
     }
 }

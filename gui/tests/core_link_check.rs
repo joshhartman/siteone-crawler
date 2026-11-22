@@ -1,14 +1,15 @@
 //! The external link check and the link texts against a local HTTP server (`link_server`): one
 //! request per checked link and nothing the page references, the classification of every kind of
-//! answer, limits, politeness, cancelling — and the source pages of link texts fetched once, with
-//! the site's credentials sent only to the site. No network: everything listens on 127.0.0.1 / ::1.
+//! answer, limits, politeness, cancelling — and the source pages of link texts (HTML pages and
+//! stylesheets) fetched once, with the site's credentials sent only to the site, and the position
+//! of each reference read from them. No network: everything listens on 127.0.0.1 / ::1.
 
 mod link_server;
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use link_server::{BIG_BODY, LinkServer};
+use link_server::{BIG_BODY, LinkServer, minified_stylesheet};
 use siteone_crawler_gui::backend::link_check::{self, CheckMsg, CheckSettings};
 use siteone_crawler_gui::backend::link_text::{self, SourceSettings, TextMsg};
 use siteone_crawler_gui::model::config::{CrawlConfig, Value};
@@ -312,7 +313,7 @@ fn source_pages_are_fetched_once_with_the_sites_credentials_only_on_the_site() {
         }
     }
     assert_eq!(found.len(), 4);
-    let PageTexts::Fetched { texts } = &found[&server.url("/src/a")] else {
+    let PageTexts::Fetched { texts, .. } = &found[&server.url("/src/a")] else {
         panic!("{:?}", found[&server.url("/src/a")]);
     };
     assert_eq!(
@@ -326,7 +327,7 @@ fn source_pages_are_fetched_once_with_the_sites_credentials_only_on_the_site() {
         Some("[image: Partner logo]")
     );
     assert_eq!(texts.get(&url_key(&server.url("/gone"))), None);
-    assert!(matches!(&found[&server.url("/src/b")], PageTexts::Fetched { texts } if texts.is_empty()));
+    assert!(matches!(&found[&server.url("/src/b")], PageTexts::Fetched { texts, .. } if texts.is_empty()));
     assert!(matches!(
         &found[&server.url("/src/redirect")],
         PageTexts::NotFetched { .. }
@@ -346,4 +347,81 @@ fn source_pages_are_fetched_once_with_the_sites_credentials_only_on_the_site() {
     for path in ["/src/a", "/src/b", "/src/redirect"] {
         assert_eq!(server.count(path), 1, "{path}: {paths:?}");
     }
+}
+
+/// Fetches `pages` through the real fetch and returns what became of each.
+fn fetch_texts(server: &LinkServer, pages: &[String], targets: Vec<String>) -> HashMap<String, PageTexts> {
+    let schema = OptionSchema::load();
+    let site = server.url("/");
+    let mut settings = SourceSettings::from_config(&CrawlConfig::new(&site), &schema, &site, None);
+    settings.gap = Duration::from_millis(20);
+    let handle = link_text::start(pages.to_vec(), targets, settings, || {}).expect("started");
+    let mut found = HashMap::new();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match handle.try_next() {
+            Some(TextMsg::Page(page, texts)) => {
+                found.insert(page, texts);
+            }
+            Some(TextMsg::Finished) => return found,
+            None => {
+                assert!(Instant::now() < deadline, "the fetch did not end");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+}
+
+#[test]
+fn stylesheets_are_fetched_and_every_reference_is_located_in_the_file() {
+    let server = LinkServer::start();
+    let pages = vec![
+        server.url("/src/css/page-styles.css"),
+        server.url("/src/css/style.min.css"),
+        server.url("/src/a"),
+    ];
+    let font = server.url("/src/fonts/missing.woff2");
+    let image = server.url("/src/img/missing.png");
+    let background = server.url("/img/missing-bg.png");
+    let broken_page = server.url("/404");
+    let found = fetch_texts(
+        &server,
+        &pages,
+        vec![font.clone(), image.clone(), background.clone(), broken_page.clone()],
+    );
+    let position = |page: &str, target: &str| match &found[&server.url(page)] {
+        PageTexts::Css { positions } | PageTexts::Fetched { positions, .. } => positions
+            .get(&url_key(target))
+            .map(|position| (position.line, position.column, position.count, position.long_line)),
+        other => panic!("{page}: {other:?}"),
+    };
+    // A stylesheet: `url()` resolved against the stylesheet's own URL; the first reference and
+    // how many there are.
+    assert!(matches!(
+        &found[&server.url("/src/css/page-styles.css")],
+        PageTexts::Css { .. }
+    ));
+    assert_eq!(position("/src/css/page-styles.css", &font), Some((4, 46, 1, false)));
+    assert_eq!(position("/src/css/page-styles.css", &image), Some((6, 25, 2, false)));
+    assert_eq!(position("/src/css/page-styles.css", &broken_page), None);
+    // A minified stylesheet: line 1 and the column.
+    let column = minified_stylesheet().len() as u32 - "/img/missing-bg.png)}".len() as u32 + 1;
+    assert_eq!(
+        position("/src/css/style.min.css", &background),
+        Some((1, column, 1, true))
+    );
+    // An HTML page: the position next to its link text.
+    assert_eq!(position("/src/a", &broken_page), Some((1, 80, 1, false)));
+    let PageTexts::Fetched { texts, .. } = &found[&server.url("/src/a")] else {
+        panic!("{:?}", found[&server.url("/src/a")]);
+    };
+    assert_eq!(
+        texts.get(&url_key(&broken_page)).map(String::as_str),
+        Some("Broken page")
+    );
+    // Each source once; nothing the stylesheets reference is requested.
+    for page in ["/src/css/page-styles.css", "/src/css/style.min.css", "/src/a"] {
+        assert_eq!(server.count(page), 1, "{page}");
+    }
+    assert_eq!(server.requests().len(), 3, "{:?}", server.counts());
 }

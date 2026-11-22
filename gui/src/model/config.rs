@@ -509,44 +509,504 @@ pub fn parse_config_file(text: &str) -> Vec<String> {
 /// Splits a pasted command line into arguments with the quoting rules of `shell` — the shells the
 /// app exports for ([`command_line`]). Nothing is evaluated.
 ///
-/// - [`Shell::Posix`]: POSIX shell rules (`shlex`); `\` before a line break continues the line
-///   (outside single quotes).
+/// - [`Shell::Posix`]: Bash's rules for the arguments of a command ([`split_bash`]).
 /// - [`Shell::PowerShell`]: PowerShell's rules for the arguments of a program ([`split_powershell`]).
 pub fn split_command_line(text: &str, shell: Shell) -> Result<Vec<String>, String> {
     let text = text.replace("\r\n", "\n");
     match shell {
-        Shell::Posix => shlex::split(&join_posix_continuations(&text))
-            .ok_or_else(|| "The command line has an unclosed quote or a trailing backslash.".to_string()),
+        Shell::Posix => split_bash(&text),
         Shell::PowerShell => split_powershell(&text),
     }
 }
 
-/// Removes each `\` + line break outside single quotes: a POSIX shell's line continuation, which
-/// `shlex` does not join.
-fn join_posix_continuations(text: &str) -> String {
-    let mut joined = String::with_capacity(text.len());
-    let (mut single, mut double) = (false, false);
-    let mut chars = text.chars();
-    while let Some(c) = chars.next() {
+/// How a pasted command line reads ([`read_command_line`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandLineReading {
+    /// PowerShell and Bash read the same arguments.
+    Same(Vec<String>),
+    /// Only `shell` can read it; the other shell's reason is `other_error`.
+    Only {
+        shell: Shell,
+        argv: Vec<String>,
+        other_error: String,
+    },
+    /// Both read it, differently, and the text shows it is written for `shell` (`hint`); the other
+    /// shell would read `other`.
+    Detected {
+        shell: Shell,
+        argv: Vec<String>,
+        hint: &'static str,
+        other: Vec<String>,
+    },
+    /// Both read it, differently, and the text does not show which shell it is for: no hint, or
+    /// hints of both (`hints`).
+    Ambiguous {
+        powershell: Vec<String>,
+        bash: Vec<String>,
+        hints: Vec<ShellHint>,
+    },
+    /// Neither reads it: the error of the more plausible shell (by the hints; PowerShell without
+    /// one), then the other's.
+    Invalid {
+        shell: Shell,
+        error: String,
+        other_error: String,
+    },
+}
+
+/// A sign in a command line of the shell it is written for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShellHint {
+    pub shell: Shell,
+    pub what: &'static str,
+}
+
+/// Reads a pasted command line with both shells' rules ([`split_command_line`]) and tells which
+/// reading applies. It never picks one of two different readings without a hint in the text, and
+/// a hint never outweighs a hint of the other shell.
+pub fn read_command_line(text: &str) -> CommandLineReading {
+    let powershell = split_command_line(text, Shell::PowerShell);
+    let bash = split_command_line(text, Shell::Posix);
+    let hints = shell_hints(&text.replace("\r\n", "\n"));
+    let hint_of = |shell: Shell| hints.iter().find(|hint| hint.shell == shell).map(|hint| hint.what);
+    let pointed = match (hint_of(Shell::PowerShell), hint_of(Shell::Posix)) {
+        (Some(hint), None) => Some((Shell::PowerShell, hint)),
+        (None, Some(hint)) => Some((Shell::Posix, hint)),
+        _ => None,
+    };
+    match (powershell, bash) {
+        (Ok(powershell), Ok(bash)) if powershell == bash => CommandLineReading::Same(powershell),
+        (Ok(powershell), Ok(bash)) => match pointed {
+            Some((Shell::PowerShell, hint)) => CommandLineReading::Detected {
+                shell: Shell::PowerShell,
+                argv: powershell,
+                hint,
+                other: bash,
+            },
+            Some((Shell::Posix, hint)) => CommandLineReading::Detected {
+                shell: Shell::Posix,
+                argv: bash,
+                hint,
+                other: powershell,
+            },
+            None => CommandLineReading::Ambiguous {
+                powershell,
+                bash,
+                hints,
+            },
+        },
+        (Ok(argv), Err(other_error)) => CommandLineReading::Only {
+            shell: Shell::PowerShell,
+            argv,
+            other_error,
+        },
+        (Err(other_error), Ok(argv)) => CommandLineReading::Only {
+            shell: Shell::Posix,
+            argv,
+            other_error,
+        },
+        (Err(powershell), Err(bash)) => match pointed {
+            Some((Shell::Posix, _)) => CommandLineReading::Invalid {
+                shell: Shell::Posix,
+                error: bash,
+                other_error: powershell,
+            },
+            _ => CommandLineReading::Invalid {
+                shell: Shell::PowerShell,
+                error: powershell,
+                other_error: bash,
+            },
+        },
+    }
+}
+
+/// The signs in `text` (line breaks as `\n`) of the shell it is written for, each once: constructs
+/// one shell writes and the other reads differently.
+///
+/// PowerShell: a backslash before a letter, digit, `.`, `_` or `-` outside quotes (a path, which
+/// Bash would take as an escape), a doubled single quote inside single quotes, a backtick before a
+/// line break or inside double quotes, the call operator `&` before the program. Bash: a backslash
+/// before a line break, `'\''`, `\"` `\$` `\\` inside double quotes, `$'…'`, an argument that goes
+/// on after the quoted string it starts with (PowerShell would make two of it).
+fn shell_hints(text: &str) -> Vec<ShellHint> {
+    const PS_PATH: &str = "a backslash in a path, as in C:\\…";
+    const PS_DOUBLED: &str = "a doubled apostrophe in single quotes, as in 'it''s'";
+    const PS_CONTINUATION: &str = "a line ending in a backtick";
+    const PS_ESCAPE: &str = "a backtick escape in double quotes";
+    const PS_CALL: &str = "the call operator & before the program";
+    const BASH_CONTINUATION: &str = "a line ending in a backslash";
+    const BASH_APOSTROPHE: &str = "an apostrophe written as '\\''";
+    const BASH_ESCAPE: &str = "a backslash escape in double quotes, as in \\\"";
+    const BASH_ANSI_C: &str = "a $'…' string";
+    const BASH_ADJACENT: &str = "an argument that goes on after its closing quote";
+    let mut hints: Vec<ShellHint> = Vec::new();
+    let mut hint = |shell: Shell, what: &'static str| {
+        if !hints.iter().any(|hint| hint.what == what) {
+            hints.push(ShellHint { shell, what });
+        }
+    };
+    let chars: Vec<char> = text.chars().collect();
+    let first = text.trim_start();
+    if first.starts_with('&') && first[1..].starts_with(char::is_whitespace) {
+        hint(Shell::PowerShell, PS_CALL);
+    }
+    if text.contains(r"'\''") {
+        hint(Shell::Posix, BASH_APOSTROPHE);
+    }
+
+    // As Bash reads the quotes.
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        i += 1;
         match c {
-            '\'' if !double => single = !single,
-            '"' if !single => double = !double,
-            '\\' if !single => {
-                match chars.next() {
-                    Some('\n') => {}
-                    Some(next) => {
-                        joined.push(c);
-                        joined.push(next);
+            '\\' => {
+                match chars.get(i) {
+                    Some('\n') => hint(Shell::Posix, BASH_CONTINUATION),
+                    Some(&next) if next.is_alphanumeric() || matches!(next, '.' | '_' | '-') => {
+                        hint(Shell::PowerShell, PS_PATH)
                     }
-                    None => joined.push(c),
+                    _ => {}
                 }
-                continue;
+                i += 1;
+            }
+            '$' if chars.get(i) == Some(&'\'') => {
+                hint(Shell::Posix, BASH_ANSI_C);
+                i += 1;
+                while i < chars.len() {
+                    i += 1;
+                    match chars[i - 1] {
+                        '\\' => i += 1,
+                        '\'' => break,
+                        _ => {}
+                    }
+                }
+            }
+            '\'' => {
+                while i < chars.len() && chars[i] != '\'' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            '"' => {
+                while i < chars.len() {
+                    i += 1;
+                    match chars[i - 1] {
+                        '\\' => {
+                            if chars.get(i).is_some_and(|next| matches!(next, '"' | '$' | '\\')) {
+                                hint(Shell::Posix, BASH_ESCAPE);
+                            }
+                            i += 1;
+                        }
+                        '"' => break,
+                        _ => {}
+                    }
+                }
             }
             _ => {}
         }
-        joined.push(c);
     }
-    joined
+
+    // As PowerShell reads the quotes.
+    let mut i = 0;
+    let mut at_start = true;
+    while i < chars.len() {
+        let c = chars[i];
+        i += 1;
+        let starts_arg = at_start;
+        at_start = c.is_whitespace();
+        if c == '`' {
+            if chars.get(i) == Some(&'\n') {
+                hint(Shell::PowerShell, PS_CONTINUATION);
+            }
+            i += 1;
+            continue;
+        }
+        // `\'` is Bash's escaped apostrophe (in `'\''`), not the start of a string: no PowerShell
+        // command line has it, and the `''` after it in `'\'''` is no doubled quote.
+        if c == '\'' && i >= 2 && chars[i - 2] == '\\' {
+            continue;
+        }
+        let single = is_ps_single_quote(c);
+        if !single && !is_ps_double_quote(c) {
+            continue;
+        }
+        let closes = |q: char| {
+            if single {
+                is_ps_single_quote(q)
+            } else {
+                is_ps_double_quote(q)
+            }
+        };
+        while i < chars.len() {
+            let q = chars[i];
+            i += 1;
+            if !single && q == '`' {
+                if i < chars.len() {
+                    hint(Shell::PowerShell, PS_ESCAPE);
+                }
+                i += 1;
+            } else if closes(q) {
+                if chars.get(i).copied().is_some_and(closes) {
+                    if single {
+                        hint(Shell::PowerShell, PS_DOUBLED);
+                    }
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+        if starts_arg && chars.get(i).is_some_and(|next| !next.is_whitespace()) {
+            hint(Shell::Posix, BASH_ADJACENT);
+        }
+    }
+    hints
+}
+
+/// What follows a `$` that Bash would expand: a variable or special parameter, `${…}`, `$(…)`,
+/// `$[…]`, and outside double quotes `$"…"` (a translated string).
+fn starts_bash_expansion(next: Option<&char>, in_double_quotes: bool) -> bool {
+    next.is_some_and(|&c| c.is_ascii_alphanumeric() || "_{([@*#?-$!".contains(c) || (c == '"' && !in_double_quotes))
+}
+
+/// Whether a `!` before `next` starts a history reference in an interactive Bash.
+fn starts_bash_history(next: Option<&char>, in_double_quotes: bool) -> bool {
+    next.is_some_and(|&c| !(c.is_whitespace() || c == '=' || c == '(' || (c == '"' && in_double_quotes)))
+}
+
+/// Splits a command line the way Bash reads the arguments of a command: blanks (space, tab)
+/// separate arguments and adjacent parts form one; `'…'` is literal; `"…"` takes `\` only before
+/// `$`, `` ` ``, `"`, `\` and a line break; `$'…'` takes the C escapes (`\n`, `\t`, `\'`, `\xHH`,
+/// `\u…`, …); outside quotes `\` escapes the next character, and before a line break it continues
+/// the line; a line break without one ends the command; `#` at the start of an argument begins a
+/// comment.
+///
+/// Whatever an import cannot read as Bash would pass it is refused with the reason, never guessed:
+/// a variable, expansion or command substitution (`$name`, `${…}`, `$(…)`, `` `…` ``), an unquoted
+/// `;`, `|`, `&`, `<`, `>`, `(`, `)`, `{`, `}`, a `~` at the start of an argument, a `!` that a
+/// terminal's Bash reads as a history reference, a second command, and a `$'…'` that decodes to a
+/// NUL or to text that is not UTF-8. Glob characters (`*`, `?`, `[`) are taken as written: a pattern
+/// that matches no file is passed so, and an option argument (`--name=…`) names none.
+fn split_bash(text: &str) -> Result<Vec<String>, String> {
+    const UNCLOSED: &str = "The command line has an unclosed quote.";
+    const EXPANSION: &str = "The command line uses a Bash variable, expansion or command substitution ($…, `…`), which an import cannot evaluate. Replace it with its value.";
+    const HISTORY: &str = "The command line has a ! that Bash in a terminal reads as a history reference. Put the argument in single quotes.";
+    const TILDE: &str = "The command line has an argument that starts with ~, which Bash replaces with a home folder. Write the full path.";
+    const NEW_COMMAND: &str = "The command line goes on after a line break without a backslash (\\) at the end of the line. Bash would run that line as a separate command: end the line with a backslash or join the lines.";
+    let special = |c: char| {
+        format!(
+            "The command line has an unquoted {c}, which Bash reads as part of the command, not of an argument. Put the argument in single quotes."
+        )
+    };
+    let blank = |c: char| matches!(c, ' ' | '\t' | '\n');
+    let chars: Vec<char> = text.chars().collect();
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut in_arg = false;
+    // A line break ended the command: only blank lines and comments may follow.
+    let mut ended = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        i += 1;
+        let at_start = !in_arg;
+        if ended && !blank(c) && c != '#' {
+            return Err(NEW_COMMAND.to_string());
+        }
+        match c {
+            c if blank(c) => {
+                if in_arg {
+                    args.push(std::mem::take(&mut current));
+                    in_arg = false;
+                }
+                if c == '\n' && !args.is_empty() {
+                    ended = true;
+                }
+            }
+            '#' if at_start => {
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+            }
+            '\\' => match chars.get(i) {
+                Some('\n') => {
+                    i += 1;
+                    if chars[i..].iter().all(|&c| blank(c)) {
+                        return Err("The command line ends with a line continuation (\\).".to_string());
+                    }
+                }
+                Some(&next) => {
+                    current.push(next);
+                    in_arg = true;
+                    i += 1;
+                }
+                None => return Err("The command line ends with a backslash.".to_string()),
+            },
+            '\'' => {
+                in_arg = true;
+                loop {
+                    match chars.get(i) {
+                        None => return Err(UNCLOSED.to_string()),
+                        Some('\'') => {
+                            i += 1;
+                            break;
+                        }
+                        Some(&other) => {
+                            current.push(other);
+                            i += 1;
+                        }
+                    }
+                }
+            }
+            '"' => {
+                in_arg = true;
+                loop {
+                    match chars.get(i) {
+                        None => return Err(UNCLOSED.to_string()),
+                        Some('\\') => match chars.get(i + 1) {
+                            Some(&next) if matches!(next, '$' | '`' | '"' | '\\') => {
+                                current.push(next);
+                                i += 2;
+                            }
+                            Some('\n') => i += 2,
+                            // Kept with its backslash; `\!` is no history reference either.
+                            Some(&next) => {
+                                current.push('\\');
+                                current.push(next);
+                                i += 2;
+                            }
+                            None => return Err(UNCLOSED.to_string()),
+                        },
+                        Some('"') => {
+                            i += 1;
+                            break;
+                        }
+                        Some('$') if starts_bash_expansion(chars.get(i + 1), true) => {
+                            return Err(EXPANSION.to_string());
+                        }
+                        Some('`') => return Err(EXPANSION.to_string()),
+                        Some('!') if starts_bash_history(chars.get(i + 1), true) => return Err(HISTORY.to_string()),
+                        Some(&other) => {
+                            current.push(other);
+                            i += 1;
+                        }
+                    }
+                }
+            }
+            '$' if chars.get(i) == Some(&'\'') => {
+                i += 1;
+                current.push_str(&bash_ansi_c(&chars, &mut i)?);
+                in_arg = true;
+            }
+            '$' if starts_bash_expansion(chars.get(i), false) => return Err(EXPANSION.to_string()),
+            '`' => return Err(EXPANSION.to_string()),
+            ';' | '|' | '&' | '<' | '>' | '(' | ')' | '{' | '}' => return Err(special(c)),
+            '~' if at_start => return Err(TILDE.to_string()),
+            '!' if starts_bash_history(chars.get(i), false) => return Err(HISTORY.to_string()),
+            other => {
+                current.push(other);
+                in_arg = true;
+            }
+        }
+    }
+    if in_arg {
+        args.push(current);
+    }
+    Ok(args)
+}
+
+/// Decodes the body of a Bash `$'…'` string from `chars[*i..]` (after the opening quote) up to and
+/// including its closing quote, as Bash does in a UTF-8 locale.
+fn bash_ansi_c(chars: &[char], i: &mut usize) -> Result<String, String> {
+    const NUL: &str = "The command line has a $'…' string with a NUL character, which cannot be passed to a program.";
+    let digits = |i: &mut usize, radix: u32, max: usize| {
+        let mut value = 0u32;
+        let mut count = 0;
+        while count < max
+            && let Some(digit) = chars.get(*i).and_then(|c| c.to_digit(radix))
+        {
+            value = value * radix + digit;
+            *i += 1;
+            count += 1;
+        }
+        (count > 0).then_some(value)
+    };
+    let mut bytes: Vec<u8> = Vec::new();
+    let push_char = |bytes: &mut Vec<u8>, c: char| bytes.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes());
+    loop {
+        let Some(&c) = chars.get(*i) else {
+            return Err("The command line has an unclosed quote.".to_string());
+        };
+        *i += 1;
+        match c {
+            '\'' => break,
+            '\\' => {
+                let Some(&next) = chars.get(*i) else {
+                    return Err("The command line has an unclosed quote.".to_string());
+                };
+                *i += 1;
+                let simple = match next {
+                    'a' => Some('\u{7}'),
+                    'b' => Some('\u{8}'),
+                    'e' | 'E' => Some('\u{1b}'),
+                    'f' => Some('\u{c}'),
+                    'n' => Some('\n'),
+                    'r' => Some('\r'),
+                    't' => Some('\t'),
+                    'v' => Some('\u{b}'),
+                    '\\' | '\'' | '"' | '?' => Some(next),
+                    _ => None,
+                };
+                if let Some(simple) = simple {
+                    push_char(&mut bytes, simple);
+                    continue;
+                }
+                match next {
+                    '0'..='7' => {
+                        *i -= 1;
+                        let value = digits(i, 8, 3).unwrap_or(0);
+                        bytes.push((value & 0xff) as u8);
+                    }
+                    'x' => match digits(i, 16, 2) {
+                        Some(value) => bytes.push(value as u8),
+                        None => bytes.extend_from_slice(b"\\x"),
+                    },
+                    'u' | 'U' => match digits(i, 16, if next == 'u' { 4 } else { 8 }) {
+                        Some(value) => match char::from_u32(value) {
+                            Some(c) => push_char(&mut bytes, c),
+                            None => {
+                                return Err(
+                                    "The command line has a $'…' string with an invalid \\u escape.".to_string()
+                                );
+                            }
+                        },
+                        None => {
+                            bytes.push(b'\\');
+                            push_char(&mut bytes, next);
+                        }
+                    },
+                    'c' => match chars.get(*i) {
+                        Some(&control) if control.is_ascii() => {
+                            *i += 1;
+                            bytes.push(if control == '?' { 0x7f } else { control as u8 & 0x1f });
+                        }
+                        _ => bytes.extend_from_slice(b"\\c"),
+                    },
+                    other => {
+                        bytes.push(b'\\');
+                        push_char(&mut bytes, other);
+                    }
+                }
+            }
+            other => push_char(&mut bytes, other),
+        }
+    }
+    if bytes.contains(&0) {
+        return Err(NUL.to_string());
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| "The command line has a $'…' string whose bytes are not UTF-8 text.".to_string())
 }
 
 /// PowerShell's single quotes: `'` and the typographic ones it takes as well.
@@ -564,64 +1024,159 @@ fn starts_ps_expansion(next: Option<&char>) -> bool {
     next.is_some_and(|c| c.is_alphanumeric() || matches!(c, '_' | '{' | '(' | '$' | '?' | '^' | ':'))
 }
 
-/// Splits a command line the way PowerShell reads the arguments of a program: whitespace separates
-/// arguments and adjacent parts form one; `'…'` is literal, a doubled single quote inside it is one;
-/// `"…"` takes the backtick escapes (`` `n ``, `` `t ``, `` `" ``, …) and a doubled `"`; outside
-/// quotes a backtick takes the next character literally, and before a line break it continues the
-/// line; `#` at the start of an argument begins a comment. A variable or expression (`$name`,
-/// `$(…)`) outside single quotes is refused: an import cannot know its value.
+/// PowerShell's dashes, which begin a parameter token: `-` and the typographic ones it takes as well.
+fn is_ps_dash(c: char) -> bool {
+    matches!(c, '-' | '\u{2013}' | '\u{2014}' | '\u{2015}')
+}
+
+/// Splits a command line the way PowerShell (7.3 or later, which passes each argument to a program
+/// as it is) reads the arguments of a program: whitespace separates arguments and adjacent parts
+/// form one, but an argument that starts with a quoted string ends with it; `'…'` is literal, a
+/// doubled single quote inside it is one; `"…"` takes the backtick escapes (`` `n ``, `` `t ``,
+/// `` `" ``, …) and a doubled `"`; outside quotes a backtick escapes the next character the same
+/// way, and before a line break it continues the line; a line break without one ends the command;
+/// `#` at the start of an argument begins a comment, as does `<#…#>`.
+///
+/// Whatever an import cannot read as PowerShell would pass it is refused with the reason, never
+/// guessed: a variable or expression (`$name`, `$(…)`, `@…`), an unquoted `;`, `|`, `&`, `(`, `)`,
+/// `{`, `}`, a redirection, a comma that makes a list, a parameter-like argument PowerShell splits
+/// (`-t=5.5` → `-t=5` `.5`), `--%`, a second command, and the escapes a program cannot get (`` `0 ``)
+/// or that PowerShell 5.1 and 7 read differently (`` `e ``, `` `u{…} ``). Verified against the real
+/// shells by `tests/core_powershell.rs`.
 fn split_powershell(text: &str) -> Result<Vec<String>, String> {
     const UNCLOSED: &str = "The command line has an unclosed quote.";
     const EXPANSION: &str = "The command line uses a PowerShell variable or expression ($…), which an import cannot evaluate. Replace it with its value.";
-    let escape = |c: char| match c {
-        '0' => '\0',
-        'a' => '\u{7}',
-        'b' => '\u{8}',
-        'e' => '\u{1b}',
-        'f' => '\u{c}',
-        'n' => '\n',
-        'r' => '\r',
-        't' => '\t',
-        'v' => '\u{b}',
-        other => other,
+    const NEW_COMMAND: &str = "The command line goes on after a line break without a backtick (`) at the end of the line. PowerShell would run that line as a separate command: end the line with a backtick or join the lines.";
+    const COMMA: &str = "The command line has an unquoted comma next to a space, a quote or another comma: PowerShell makes it a list, which Windows PowerShell 5.1 and PowerShell 7 pass differently. Put the argument in single quotes.";
+    const NUL: &str = "The command line has a `0 escape (a NUL character), which cannot be passed to a program.";
+    const VERSIONED: &str = "The command line has a `e or `u{…} escape, which Windows PowerShell 5.1 and PowerShell 7 read differently. Write the character itself.";
+    let special = |c: char| {
+        format!(
+            "The command line has an unquoted {c}, which PowerShell reads as part of the command, not of an argument. Put the argument in single quotes."
+        )
     };
+    let split = |start: &str, c: char| {
+        format!(
+            "PowerShell would split the unquoted argument at “{start}{c}”: in an argument that starts with a single dash, a dot, a bracket or a backtick starts a new argument. Put the argument in single quotes."
+        )
+    };
+    let escape = |c: char| match c {
+        '0' => Err(NUL.to_string()),
+        'e' | 'u' => Err(VERSIONED.to_string()),
+        'a' => Ok('\u{7}'),
+        'b' => Ok('\u{8}'),
+        'f' => Ok('\u{c}'),
+        'n' => Ok('\n'),
+        'r' => Ok('\r'),
+        't' => Ok('\t'),
+        'v' => Ok('\u{b}'),
+        other => Ok(other),
+    };
+    let is_newline = |c: char| matches!(c, '\n' | '\r');
+    let is_quote = |c: char| is_ps_single_quote(c) || is_ps_double_quote(c);
     let chars: Vec<char> = text.chars().collect();
     let mut args = Vec::new();
     let mut current = String::new();
     let mut in_arg = false;
+    // The argument began with a quoted string: it ends with it.
+    let mut quoted_start = false;
+    // Inside the name of a parameter-like argument (`-name`, up to a `:`), where PowerShell splits
+    // at `.` and `[`.
+    let mut param_name = false;
+    // The last character of the argument was an unquoted, unescaped one.
+    let mut last_plain = false;
+    // A line break ended the command: only blank lines and comments may follow.
+    let mut ended = false;
     let mut i = 0;
     while i < chars.len() {
         let c = chars[i];
         i += 1;
+        if quoted_start && !c.is_whitespace() {
+            // `'a'b` is two arguments.
+            args.push(std::mem::take(&mut current));
+            in_arg = false;
+        }
+        quoted_start = false;
+        let at_start = !in_arg;
+        if ended && !c.is_whitespace() && c != '#' && !(c == '<' && chars.get(i) == Some(&'#')) {
+            return Err(NEW_COMMAND.to_string());
+        }
+        if at_start {
+            param_name = is_ps_dash(c)
+                && chars.get(i).is_some_and(|&next| {
+                    !(is_ps_dash(next)
+                        || next.is_ascii_digit()
+                        || next == '.'
+                        || next.is_whitespace()
+                        || is_quote(next))
+                });
+            last_plain = false;
+        }
         match c {
-            ' ' | '\t' | '\n' => {
+            c if c.is_whitespace() => {
                 if in_arg {
                     args.push(std::mem::take(&mut current));
                     in_arg = false;
                 }
+                if is_newline(c) && !args.is_empty() {
+                    ended = true;
+                }
             }
-            '#' if !in_arg => {
-                while i < chars.len() && chars[i] != '\n' {
+            '#' if at_start => {
+                while i < chars.len() && !is_newline(chars[i]) {
                     i += 1;
                 }
             }
+            '<' if at_start && chars.get(i) == Some(&'#') => {
+                let close = (i + 1..chars.len().saturating_sub(1)).find(|&at| chars[at] == '#' && chars[at + 1] == '>');
+                match close {
+                    Some(at) => i = at + 2,
+                    None => return Err("The command line has an unclosed <# comment.".to_string()),
+                }
+            }
+            '`' if param_name => return Err(split(&current, c)),
+            // Between arguments, a line continuation; inside one, an escaped line break is part of it.
             '`' => match chars.get(i) {
-                Some('\n') => {
+                Some(&next) if is_newline(next) && !in_arg => {
                     i += 1;
-                    if in_arg {
-                        args.push(std::mem::take(&mut current));
-                        in_arg = false;
+                    if chars[i..].iter().all(|c| c.is_whitespace()) {
+                        return Err("The command line ends with a line continuation (`).".to_string());
                     }
                 }
                 Some(&next) => {
-                    current.push(next);
+                    current.push(escape(next)?);
                     in_arg = true;
+                    last_plain = false;
                     i += 1;
                 }
                 None => return Err("The command line ends with a backtick.".to_string()),
             },
             '$' if starts_ps_expansion(chars.get(i)) => return Err(EXPANSION.to_string()),
+            '@' if at_start => return Err(special(c)),
+            ';' | '|' | '(' | ')' | '{' | '}' => return Err(special(c)),
+            // The call operator before the program.
+            '&' if at_start && args.is_empty() && chars.get(i).is_some_and(|c| c.is_whitespace()) => {
+                args.push(c.to_string());
+            }
+            '&' => return Err(special(c)),
+            '>' | '<' if at_start => return Err(special(c)),
+            c if at_start && (c.is_ascii_digit() || c == '*') && chars.get(i) == Some(&'>') => {
+                return Err(special('>'));
+            }
+            ',' => {
+                let next_plain = chars
+                    .get(i)
+                    .is_some_and(|&next| !(next.is_whitespace() || is_quote(next) || matches!(next, ',' | '`')));
+                if param_name || !last_plain || !next_plain {
+                    return Err(COMMA.to_string());
+                }
+                current.push(c);
+            }
+            '.' | '[' if param_name => return Err(split(&current, c)),
             c if is_ps_single_quote(c) => {
+                quoted_start = at_start;
+                param_name = false;
+                last_plain = false;
                 in_arg = true;
                 loop {
                     match chars.get(i) {
@@ -643,13 +1198,16 @@ fn split_powershell(text: &str) -> Result<Vec<String>, String> {
                 }
             }
             c if is_ps_double_quote(c) => {
+                quoted_start = at_start;
+                param_name = false;
+                last_plain = false;
                 in_arg = true;
                 loop {
                     match chars.get(i) {
                         None => return Err(UNCLOSED.to_string()),
                         Some('`') => match chars.get(i + 1) {
                             Some(&next) => {
-                                current.push(escape(next));
+                                current.push(escape(next)?);
                                 i += 2;
                             }
                             None => return Err(UNCLOSED.to_string()),
@@ -672,13 +1230,20 @@ fn split_powershell(text: &str) -> Result<Vec<String>, String> {
                 }
             }
             other => {
+                if other == ':' {
+                    param_name = false;
+                }
                 current.push(other);
                 in_arg = true;
+                last_plain = true;
             }
         }
     }
     if in_arg {
         args.push(current);
+    }
+    if args.iter().any(|arg| arg == "--%") {
+        return Err("The command line uses --% (stop parsing), which an import does not read.".to_string());
     }
     Ok(args)
 }
@@ -852,6 +1417,24 @@ pub enum Shell {
     Posix,
 }
 
+impl Shell {
+    /// The name the app shows: "PowerShell" or "Bash".
+    pub fn label(self) -> &'static str {
+        match self {
+            Shell::PowerShell => "PowerShell",
+            Shell::Posix => "Bash",
+        }
+    }
+
+    /// The other shell.
+    pub fn other(self) -> Shell {
+        match self {
+            Shell::PowerShell => Shell::Posix,
+            Shell::Posix => Shell::PowerShell,
+        }
+    }
+}
+
 /// A command line for `shell`: `program` and `argv`, each quoted where needed. A quoted program
 /// is called with `&` in PowerShell.
 pub fn command_line(program: &str, argv: &[String], shell: Shell) -> String {
@@ -884,10 +1467,18 @@ pub fn quote_posix(arg: &str) -> Cow<'_, str> {
 }
 
 /// Quotes an argument for PowerShell: unchanged when it holds only safe characters, else in single
-/// quotes, where every single quote — PowerShell also takes the typographic ones — is doubled.
+/// quotes, where every single quote — PowerShell also takes the typographic ones — is doubled. An
+/// argument that starts with a single `-` is a parameter token PowerShell would split
+/// (`-t=5.5` → `-t=5` `.5`): it is quoted too.
+///
+/// The command is for PowerShell 7.3 or later, which passes each argument to a program as it is
+/// (verified by `tests/core_powershell.rs`). Windows PowerShell 5.1 passes some values differently:
+/// [`powershell_legacy_hazards`]. No quoting passes the argument `--%` (PowerShell drops it); the
+/// app's argv never holds it.
 pub fn quote_powershell(arg: &str) -> Cow<'_, str> {
     let safe = |c: char| c.is_ascii_alphanumeric() || "-_./:=\\".contains(c);
-    if !arg.is_empty() && arg.chars().all(safe) {
+    let parameter = arg.starts_with('-') && !arg.starts_with("--");
+    if !arg.is_empty() && !parameter && arg.chars().all(safe) {
         return Cow::Borrowed(arg);
     }
     let mut quoted = String::with_capacity(arg.len() + 2);
@@ -900,6 +1491,26 @@ pub fn quote_powershell(arg: &str) -> Cow<'_, str> {
     }
     quoted.push('\'');
     Cow::Owned(quoted)
+}
+
+/// The arguments of `argv` (the option name, or the whole argument) that the legacy argument passing
+/// of Windows PowerShell 5.1 (and of PowerShell 7 with `$PSNativeCommandArgumentPassing = 'Legacy'`)
+/// would pass to a program differently from the exported command line: an empty argument (dropped),
+/// one with a `"` (taken as quoting), and — 5.1 — one with whitespace that ends with `\` (which then
+/// escapes the closing quote). No quoting is right for both kinds of passing; the export is for
+/// PowerShell 7.3 or later, and the app says so when this is not empty. Verified against the real
+/// shells by `tests/core_powershell.rs`.
+pub fn powershell_legacy_hazards(argv: &[String]) -> Vec<String> {
+    let mut names: Vec<String> = argv
+        .iter()
+        .filter(|arg| arg.is_empty() || arg.contains('"') || (arg.contains(char::is_whitespace) && arg.ends_with('\\')))
+        .map(|arg| match arg.split_once('=') {
+            Some((name, _)) if name.starts_with("--") => name.trim_end_matches(':').to_string(),
+            _ => arg.to_string(),
+        })
+        .collect();
+    names.dedup();
+    names
 }
 
 /// A config file for the CLI's `--config-file`.
@@ -1552,6 +2163,22 @@ mod tests {
         assert_eq!(quote_powershell("a,b"), "'a,b'");
         assert_eq!(quote_powershell(""), "''");
         assert_eq!(quote_posix(""), "''");
+        // A parameter token PowerShell would split; `--name=…` is not one.
+        assert_eq!(quote_powershell("-t=5.5"), "'-t=5.5'");
+        assert_eq!(
+            quote_powershell("--url=https://example.com/"),
+            "--url=https://example.com/"
+        );
+        // What Windows PowerShell 5.1 passes differently.
+        let hazards = powershell_legacy_hazards(&[
+            "--user-agent=say \"hi\"".to_string(),
+            "--header:=X-A: \"a\"".to_string(),
+            "--header:=X-B: b".to_string(),
+            r"--offline-export-dir=C:\My Exports\".to_string(),
+            r"--output-html-report=C:\Exports\".to_string(),
+            String::new(),
+        ]);
+        assert_eq!(hazards, ["--user-agent", "--header", "--offline-export-dir", ""]);
     }
 
     #[test]
@@ -1604,6 +2231,354 @@ mod tests {
         }
         assert!(split("--a=b`").is_err());
         assert!(split("\"open").is_err());
+    }
+
+    /// Hand-written Bash, read as Bash reads it — without evaluating anything.
+    #[test]
+    fn bash_command_lines_follow_bash_quoting() {
+        let split = |text: &str| split_command_line(text, Shell::Posix);
+        let accepted: &[(&str, &[&str])] = &[
+            (
+                r#"siteone-crawler --a='x y' --b="p q" --c=r\ s 'a'b"c"d"#,
+                &["siteone-crawler", "--a=x y", "--b=p q", "--c=r s", "abcd"],
+            ),
+            (
+                r#""a\zb" "a\$b" "a\\b" "a\"b" "a\`b" 'a\b' a\b"#,
+                &[r"a\zb", "a$b", r"a\b", "a\"b", "a`b", r"a\b", "ab"],
+            ),
+            ("a \\\n  b ab\\\ncd \"x\\\ny\"", &["a", "b", "abcd", "xy"]),
+            ("a 'multi\nline'", &["a", "multi\nline"]),
+            ("siteone-crawler --a=1 # comment\n", &["siteone-crawler", "--a=1"]),
+            (
+                "\n# comment\n  siteone-crawler a#b\n\n# end\n",
+                &["siteone-crawler", "a#b"],
+            ),
+            (r#""a$ b" --a=$ 5$ "$""#, &["a$ b", "--a=$", "5$", "$"]),
+            (
+                r"$'a\tb\x41\u00e9\'c\\' $'\xc3\xa9' $'\101\cA\q'",
+                &["a\tbA\u{e9}'c\\", "\u{e9}", "A\u{1}\\q"],
+            ),
+            (r#""Hi!" --a=b! 'x!y' "!" "a!""#, &["Hi!", "--a=b!", "x!y", "!", "a!"]),
+            (
+                "--url=https://example.com/?a=1 --a=~/x --b=*.pdf [x]",
+                &["--url=https://example.com/?a=1", "--a=~/x", "--b=*.pdf", "[x]"],
+            ),
+            ("a\u{a0}b \u{201c}c d\u{201d}", &["a\u{a0}b", "\u{201c}c", "d\u{201d}"]),
+        ];
+        for (text, expected) in accepted {
+            assert_eq!(
+                split(text).unwrap_or_else(|error| panic!("{text:?}: {error}")),
+                *expected,
+                "{text:?}"
+            );
+        }
+        for refused in [
+            "--url=$URL",
+            "\"$HOME\"",
+            "\"${x}\"",
+            "--a=$(x)",
+            "$1",
+            "$\"x\"",
+            "--a=`x`",
+            "\"a`b`\"",
+            "a;b",
+            "a|b",
+            "--url=https://example.com/?a=1&b=2",
+            "a>b",
+            "<b",
+            "(a)",
+            "--a={x,y}",
+            "~/x",
+            "--a=!x",
+            "\"!x\"",
+            "a\n b",
+            "a \\\n",
+            "a\\",
+            "'open",
+            "\"open",
+            "$'open",
+            r"$'\x00'",
+            r"$'\xff'",
+            r"$'\ud800'",
+        ] {
+            assert!(split(refused).is_err(), "{refused:?}: {:?}", split(refused));
+        }
+        let error = split("--a=1\n--b=2").expect_err("a second command");
+        assert!(error.contains("backslash"), "{error}");
+    }
+
+    fn strings(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| item.to_string()).collect()
+    }
+
+    /// Each sign of a shell, found in a command line.
+    #[test]
+    fn the_signs_of_each_shell_are_found() {
+        let shells = |text: &str| -> Vec<Shell> { shell_hints(text).iter().map(|hint| hint.shell).collect() };
+        for text in [
+            r"siteone-crawler --offline-export-dir=C:\Exports\site",
+            r"siteone-crawler --a=\\server\share",
+            "siteone-crawler '--user-agent=Sam''s site'",
+            "siteone-crawler '--user-agent=it\u{2019}\u{2019}s'",
+            "siteone-crawler --a=1 `\n  --b=2",
+            "& 'C:\\Program Files\\siteone-crawler.exe' --a=1",
+            "siteone-crawler \"--user-agent=say `\"hi`\"\"",
+        ] {
+            assert_eq!(shells(text), [Shell::PowerShell], "{text}");
+        }
+        for text in [
+            "siteone-crawler --a=1 \\\n  --b=2",
+            r"siteone-crawler '--user-agent=it'\''s me'",
+            r#"siteone-crawler "--user-agent=say \"hi\"""#,
+            r#"siteone-crawler "--a=cost \$5" "--b=C:\\x""#,
+            r"siteone-crawler --a=$'x\ty'",
+            "siteone-crawler 'a'b",
+        ] {
+            assert!(
+                !shells(text).is_empty() && shells(text).iter().all(|shell| *shell == Shell::Posix),
+                "{text}: {:?}",
+                shell_hints(text)
+            );
+        }
+        // Neither: what both read alike, or differently without a sign.
+        for text in [
+            "siteone-crawler --url=https://example.com/ --workers=4",
+            "siteone-crawler '--a=x y' \"--b=C:\\My Exports\\site\" 'C:\\x'",
+            r"siteone-crawler --a=x\ y",
+        ] {
+            assert!(shell_hints(text).is_empty(), "{text}: {:?}", shell_hints(text));
+        }
+    }
+
+    /// Every outcome of reading a command line with both shells.
+    #[test]
+    fn the_shell_of_a_pasted_command_line_is_detected() {
+        use CommandLineReading::*;
+        let read = read_command_line;
+        // Both read the same arguments: no shell is named.
+        assert_eq!(
+            read("siteone-crawler --url=https://example.com/ --user-agent='a b' \"--x=y z\""),
+            Same(strings(&[
+                "siteone-crawler",
+                "--url=https://example.com/",
+                "--user-agent=a b",
+                "--x=y z"
+            ]))
+        );
+        // Only one shell reads it.
+        match read("& 'C:\\x\\siteone-crawler.exe' --a=1 `\n  --b=\"a`tb\"") {
+            Only {
+                shell: Shell::PowerShell,
+                argv,
+                other_error,
+            } => {
+                assert_eq!(argv, strings(&["&", r"C:\x\siteone-crawler.exe", "--a=1", "--b=a\tb"]));
+                assert!(other_error.contains("&"), "{other_error}");
+            }
+            other => panic!("{other:?}"),
+        }
+        match read("siteone-crawler '--user-agent=it'\\''s me' \\\n  --b=\"cost \\$5\"") {
+            Only {
+                shell: Shell::Posix,
+                argv,
+                ..
+            } => assert_eq!(
+                argv,
+                strings(&["siteone-crawler", "--user-agent=it's me", "--b=cost $5"])
+            ),
+            other => panic!("{other:?}"),
+        }
+        // Both read it, differently: the signs decide.
+        assert_eq!(
+            read(r"siteone-crawler --offline-export-dir=C:\Exports\site"),
+            Detected {
+                shell: Shell::PowerShell,
+                argv: strings(&["siteone-crawler", r"--offline-export-dir=C:\Exports\site"]),
+                hint: "a backslash in a path, as in C:\\…",
+                other: strings(&["siteone-crawler", "--offline-export-dir=C:Exportssite"]),
+            }
+        );
+        match read("siteone-crawler '--user-agent=Sam''s site'") {
+            Detected {
+                shell: Shell::PowerShell,
+                argv,
+                other,
+                ..
+            } => {
+                assert_eq!(argv[1], "--user-agent=Sam's site");
+                assert_eq!(other[1], "--user-agent=Sams site");
+            }
+            other => panic!("{other:?}"),
+        }
+        for (text, bash, powershell) in [
+            (
+                r#"siteone-crawler "--user-agent=say \"hi\"""#,
+                &["siteone-crawler", "--user-agent=say \"hi\""][..],
+                &["siteone-crawler", r"--user-agent=say \", r"hi\"][..],
+            ),
+            (
+                r#"siteone-crawler "--a=C:\\x""#,
+                &["siteone-crawler", r"--a=C:\x"],
+                &["siteone-crawler", r"--a=C:\\x"],
+            ),
+            (
+                r"siteone-crawler --a=$'x\ty'",
+                &["siteone-crawler", "--a=x\ty"],
+                &["siteone-crawler", r"--a=$x\ty"],
+            ),
+        ] {
+            match read(text) {
+                Detected {
+                    shell: Shell::Posix,
+                    argv,
+                    other,
+                    ..
+                } => {
+                    assert_eq!(argv, strings(bash), "{text}");
+                    assert_eq!(other, strings(powershell), "{text}");
+                }
+                other => panic!("{text}: {other:?}"),
+            }
+        }
+        // Different readings without a sign: the user chooses.
+        assert_eq!(
+            read(r"siteone-crawler --user-agent=a\ b"),
+            Ambiguous {
+                powershell: strings(&["siteone-crawler", r"--user-agent=a\", "b"]),
+                bash: strings(&["siteone-crawler", "--user-agent=a b"]),
+                hints: Vec::new(),
+            }
+        );
+        // Signs of both: no guess either.
+        match read(r#"siteone-crawler --offline-export-dir=C:\Exports\site "--a=C:\\x""#) {
+            Ambiguous { hints, .. } => {
+                let mut shells: Vec<Shell> = hints.iter().map(|hint| hint.shell).collect();
+                shells.dedup();
+                assert_eq!(shells, [Shell::PowerShell, Shell::Posix], "{hints:?}");
+            }
+            other => panic!("{other:?}"),
+        }
+        // Neither reads it: the error of the more plausible shell first.
+        match read("siteone-crawler 'open") {
+            Invalid {
+                shell: Shell::PowerShell,
+                error,
+                other_error,
+            } => {
+                assert!(error.contains("unclosed quote"), "{error}");
+                assert!(other_error.contains("unclosed quote"), "{other_error}");
+            }
+            other => panic!("{other:?}"),
+        }
+        match read("siteone-crawler --a=$'x' \"open") {
+            Invalid {
+                shell: Shell::Posix, ..
+            } => {}
+            other => panic!("{other:?}"),
+        }
+        match read("siteone-crawler --a=$x") {
+            Invalid {
+                shell: Shell::PowerShell,
+                error,
+                other_error,
+            } => {
+                assert!(error.contains("PowerShell variable"), "{error}");
+                assert!(other_error.contains("Bash variable"), "{other_error}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// What the app exports for either shell is read back as that shell (or both read it alike),
+    /// with its argv.
+    #[test]
+    fn exported_command_lines_are_read_as_their_shell() {
+        let values = [
+            r"C:\Exports\site",
+            r"C:\My Exports\site",
+            r"\\server\share\dir\",
+            r"C:\Exports\",
+            "Sam's site",
+            "it\u{2019}s \u{2018}typographic\u{2019} \u{201a}low\u{201b}",
+            "two  spaces and\ttab",
+            "\"double\" quotes",
+            "say \"hi\"",
+            "`backtick` and `n",
+            "$literal $HOME ${x} $(y) cost: 5$",
+            "line\nbreak",
+            "#not-a-comment",
+            "",
+            "  leading and trailing  ",
+            "a=b,c;d|e&f<g>h(i){j}[k]@l%m^n!o~p*q?r",
+            "\u{fc}n\u{ef}c\u{f8}d\u{e9} \u{2013} \u{201c}quoted\u{201d} \u{201e}low\u{201c}",
+            r"trailing backslash\",
+            "'",
+            "''",
+            "\"",
+            "-t=5.5",
+            "https://example.com/?a=1&b=2#frag",
+        ];
+        let mut cases: Vec<Vec<String>> = Vec::new();
+        for value in values {
+            cases.push(vec![format!("--user-agent={value}")]);
+            cases.push(vec![format!("--header:=X-Test: {value}")]);
+            cases.push(vec![value.to_string()]);
+        }
+        let schema = schema();
+        let mut config = CrawlConfig::new("https://example.com/?a=1&b=2");
+        for (name, value) in [
+            ("--offline-export-dir", Value::Text(r"C:\My Exports\site".to_string())),
+            (
+                "--output-html-report",
+                Value::Text(r"C:\Exports\report.html".to_string()),
+            ),
+            ("--user-agent", Value::Text("Sam's \"bot\" $x `y".to_string())),
+            ("--header", texts(&["X-A: a, b", "X-B: it\u{2019}s"])),
+            ("--workers", Value::Text("3".to_string())),
+        ] {
+            config.set(&schema, name, value).expect(name);
+        }
+        cases.push(config.to_preview_argv(&schema, &SecretValues::default(), false));
+        let mut failures = Vec::new();
+        for argv in &cases {
+            for shell in [Shell::PowerShell, Shell::Posix] {
+                for program in [PROGRAM_NAME, r"C:\Program Files\SiteOne Crawler\siteone-crawler.exe"] {
+                    let line = command_line(program, argv, shell);
+                    let continuation = match shell {
+                        Shell::PowerShell => " `\n  ",
+                        Shell::Posix => " \\\n  ",
+                    };
+                    let quote = |arg: &str| match shell {
+                        Shell::PowerShell => quote_powershell(arg).into_owned(),
+                        Shell::Posix => quote_posix(arg).into_owned(),
+                    };
+                    let multiline = std::iter::once(program)
+                        .chain(argv.iter().map(String::as_str))
+                        .map(quote)
+                        .collect::<Vec<_>>()
+                        .join(continuation);
+                    for line in [line, multiline] {
+                        let got = match read_command_line(&line) {
+                            CommandLineReading::Same(got) => got,
+                            CommandLineReading::Only { shell: read, argv, .. }
+                            | CommandLineReading::Detected { shell: read, argv, .. }
+                                if read == shell =>
+                            {
+                                argv
+                            }
+                            other => {
+                                failures.push(format!("{shell:?}: {line}\n    {other:?}"));
+                                continue;
+                            }
+                        };
+                        if got[got.len() - argv.len()..] != argv[..] {
+                            failures.push(format!("{shell:?}: {line}\n    read {got:?}"));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     /// What the app exports for a shell, pasted back with that shell's rules, gives back the argv —

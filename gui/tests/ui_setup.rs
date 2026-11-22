@@ -1,7 +1,8 @@
 //! Interaction tests of the Setup page (GUI-SPEC §8): typing a URL enables Start; a preset changes
 //! the form and the command preview; searching filters the option list; changing and resetting an
 //! option adds and removes it in the preview; an invalid configuration shows the CLI's error on
-//! Start; profiles save and load; a missing crawler and a failing start are reported.
+//! Start; profiles save and load; a pasted command line is read with the shell it shows (or the
+//! user chooses); a missing crawler and a failing start are reported.
 
 mod ui_common;
 
@@ -345,24 +346,52 @@ fn a_profile_saves_and_loads_with_its_secrets() {
     assert!(!app.is_modified());
 }
 
-#[test]
-fn a_pasted_command_line_is_imported_and_unknown_options_are_listed() {
-    let env = Env::new();
-    let mut harness = harness(env.app(), LARGE, egui::Theme::Light);
-    settle(&mut harness);
-    click(&mut harness, "More profile actions");
-    settle(&mut harness);
+/// Opens the paste dialog and types `text` into it.
+fn paste_command_line(harness: &mut egui_kittest::Harness<'_, App>, text: &str) {
+    click(harness, "More profile actions");
+    settle(harness);
     harness.get_by_label("Paste command line…").click();
-    settle(&mut harness);
+    settle(harness);
     harness
         .get_by_role_and_label(Role::MultilineTextInput, "Command line")
         .focus();
     harness.run();
     harness
         .get_by_role_and_label(Role::MultilineTextInput, "Command line")
+        .type_text(text);
+    harness.run();
+}
+
+fn is_disabled(harness: &egui_kittest::Harness<'_, App>, label: &str) -> bool {
+    harness
+        .get_by_role_and_label(Role::Button, label)
+        .accesskit_node()
+        .is_disabled()
+}
+
+fn toasts(app: &App) -> Vec<String> {
+    app.toasts.items().iter().map(|toast| toast.text.clone()).collect()
+}
+
+#[test]
+fn a_pasted_command_line_is_imported_and_unknown_options_are_listed() {
+    let env = Env::new();
+    let mut harness = harness(env.app(), LARGE, egui::Theme::Light);
+    settle(&mut harness);
+    paste_command_line(&mut harness, "");
+    assert!(is_disabled(&harness, "Import"), "nothing to import yet");
+    harness
+        .get_by_role_and_label(Role::MultilineTextInput, "Command line")
         .type_text("siteone-crawler --url=https://example.cz/ --workers=4 --bogus=1");
     harness.run();
-    click(&mut harness, "Import as PowerShell");
+    // Both shells read it alike: no shell is named.
+    assert!(shows_text(&harness, "PowerShell and Bash read this the same way."));
+    assert!(
+        harness
+            .query_by_role_and_label(Role::Button, "Import as Bash")
+            .is_none()
+    );
+    click(&mut harness, "Import");
     settle(&mut harness);
     let app = harness.state();
     assert_eq!(app.session.config.url, "https://example.cz/");
@@ -376,6 +405,92 @@ fn a_pasted_command_line_is_imported_and_unknown_options_are_listed() {
         "{:?}",
         dialog.details
     );
+    assert!(dialog.message.contains("from the command line."), "{}", dialog.message);
+}
+
+#[test]
+fn a_pasted_command_line_names_the_shell_it_is_read_as_and_offers_the_other() {
+    let line = r"siteone-crawler --url=https://example.com/ --offline-export-dir=C:\Exports\site";
+    // Import: the detected reading, PowerShell (a backslash in a path).
+    let env = Env::new();
+    let mut harness = harness_for(&env);
+    paste_command_line(&mut harness, line);
+    assert!(shows_text(&harness, "Read as PowerShell (a backslash in a path"));
+    assert!(shows_text(
+        &harness,
+        "Bash would read “--offline-export-dir=C:Exportssite” instead."
+    ));
+    click(&mut harness, "Import");
+    settle(&mut harness);
+    let app = harness.state();
+    assert_eq!(
+        app.session.config.values.get("--offline-export-dir"),
+        Some(&Value::Text(r"C:\Exports\site".to_string()))
+    );
+    assert!(
+        toasts(app).iter().any(|text| text.contains("read as PowerShell")),
+        "{:?}",
+        toasts(app)
+    );
+
+    // The other reading, in one click.
+    let env = Env::new();
+    let mut harness = harness_for(&env);
+    paste_command_line(&mut harness, line);
+    click(&mut harness, "Import as Bash instead");
+    settle(&mut harness);
+    let app = harness.state();
+    assert_eq!(
+        app.session.config.values.get("--offline-export-dir"),
+        Some(&Value::Text("C:Exportssite".to_string()))
+    );
+    assert!(
+        toasts(app).iter().any(|text| text.contains("read as Bash")),
+        "{:?}",
+        toasts(app)
+    );
+}
+
+fn harness_for(env: &Env) -> egui_kittest::Harness<'static, App> {
+    let mut harness = harness(env.app(), LARGE, egui::Theme::Light);
+    settle(&mut harness);
+    harness
+}
+
+#[test]
+fn a_pasted_command_line_both_shells_read_differently_without_a_sign_asks() {
+    let env = Env::new();
+    let mut harness = harness_for(&env);
+    paste_command_line(
+        &mut harness,
+        r"siteone-crawler --url=https://example.com/ --user-agent=a\ b",
+    );
+    assert!(shows_text(&harness, "Which shell is it for?"));
+    assert!(shows_text(
+        &harness,
+        "PowerShell: “--user-agent=a\\”; Bash: “--user-agent=a b”"
+    ));
+    // No reading is preselected: there is no Import button, only the two choices.
+    assert!(harness.query_by_role_and_label(Role::Button, "Import").is_none());
+    click(&mut harness, "Import as Bash");
+    settle(&mut harness);
+    let app = harness.state();
+    assert_eq!(
+        app.session.config.values.get("--user-agent"),
+        Some(&Value::Text("a b".to_string()))
+    );
+    assert!(app.dialog.is_none(), "{:?}", app.dialog.as_ref().map(|d| &d.title));
+
+    // A command neither shell reads: the error, and Import stays off.
+    let env = Env::new();
+    let mut harness = harness_for(&env);
+    paste_command_line(&mut harness, "siteone-crawler --url=$url");
+    assert!(shows_text(
+        &harness,
+        "As PowerShell: The command line uses a PowerShell variable"
+    ));
+    assert!(shows_text(&harness, "As Bash: The command line uses a Bash variable"));
+    assert!(is_disabled(&harness, "Import"));
 }
 
 #[test]

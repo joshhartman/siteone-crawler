@@ -136,6 +136,16 @@ impl Drop for LinkServer {
     }
 }
 
+/// `/src/css/page-styles.css`: a missing font on line 4, a missing image twice (lines 6 and 8).
+pub const STYLESHEET: &str = "body { margin: 0; }\n\n/* Fonts */\n@font-face { font-family: Example; src: url(\"../fonts/missing.woff2\") format(\"woff2\"); }\n\n.hero { background: url(../img/missing.png) no-repeat; }\n.card { color: #333; }\n.hero-small { background: url( '../img/missing.png' ); }\n";
+
+/// `/src/css/style.min.css`: one long line; `url(/img/missing-bg.png)` at the end.
+pub fn minified_stylesheet() -> String {
+    let mut css: String = (0..300).map(|n| format!(".r{n}{{color:#{n:03}}}")).collect();
+    css.push_str(".x{background:url(/img/missing-bg.png)}");
+    css
+}
+
 fn page(title: &str, body: &str) -> String {
     format!("<!DOCTYPE html><html><head><title>{title}</title></head><body>{body}</body></html>")
 }
@@ -232,6 +242,19 @@ fn serve(mut stream: TcpStream, shared: &Shared) {
             respond(&mut stream, "200 OK", &html, page("Source A", &body).as_bytes());
         }
         "/src/b" => respond(&mut stream, "200 OK", &html, page("Source B", "<p>No links here.</p>").as_bytes()),
+        // Stylesheets of a site, for the positions of `url()` references.
+        "/src/css/page-styles.css" => respond(
+            &mut stream,
+            "200 OK",
+            &[("Content-Type", "text/css; charset=utf-8")],
+            STYLESHEET.as_bytes(),
+        ),
+        "/src/css/style.min.css" => respond(
+            &mut stream,
+            "200 OK",
+            &[("Content-Type", "text/css")],
+            minified_stylesheet().as_bytes(),
+        ),
         // `/redirect-to?<absolute URL>`: a redirect to anywhere.
         "/redirect-to" => {
             let location = path.split_once('?').map_or("", |(_, query)| query).to_string();

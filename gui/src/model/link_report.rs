@@ -1,6 +1,7 @@
 //! The link report of a run (GUI-SPEC §4.10): the app's own report of the run's links —
 //! `<run>/link-report.html` — with what the crawler's reports do not have: the external link check,
-//! link texts and the newest answers of retries. One self-contained HTML file: no script, no external resource, light
+//! link texts with where each page references the link (`…/style.css:1929`) and the newest answers
+//! of retries. One self-contained HTML file: no script, no external resource, light
 //! and dark by `prefers-color-scheme`, printable.
 //!
 //! This module renders a [`LinkReport`] that the app has gathered from the run's state. Every value
@@ -9,6 +10,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+use super::link_text::RefPosition;
 use super::storage;
 
 pub const REPORT_FILE: &str = "link-report.html";
@@ -24,6 +26,20 @@ pub struct ReportRow {
     pub link_text: String,
     /// Every page it was found on.
     pub found_on: Vec<String>,
+    /// For each of `found_on`, where it references the URL (when the page was read and does).
+    pub positions: Vec<Option<RefPosition>>,
+}
+
+impl ReportRow {
+    /// Where `page` (one of `found_on`, a trailing `/` aside) references the URL.
+    pub fn position_on(&self, page: &str) -> Option<&RefPosition> {
+        let key = page.trim().trim_end_matches('/');
+        let at = self
+            .found_on
+            .iter()
+            .position(|found| found.trim().trim_end_matches('/') == key)?;
+        self.positions.get(at)?.as_ref()
+    }
 }
 
 /// A table of the report.
@@ -208,7 +224,18 @@ fn group_html(html: &mut String, group: &ReportGroup) {
     html.push_str(COLUMNS);
     html.push_str("<thead><tr><th>Status</th><th>URL</th><th>Title or kind</th><th>Link text</th><th>Found on</th></tr></thead>\n<tbody>\n");
     for row in &group.rows {
-        let found_on: Vec<String> = row.found_on.iter().map(|page| link(page)).collect();
+        let found_on: Vec<String> = row
+            .found_on
+            .iter()
+            .enumerate()
+            .map(|(at, page)| {
+                format!(
+                    "{}{}",
+                    link(page),
+                    position_html(row.positions.get(at).copied().flatten())
+                )
+            })
+            .collect();
         html.push_str(&format!(
             "<tr><td class=\"status\">{}</td><td class=\"url\">{}</td><td>{}</td><td>{}</td><td class=\"url\">{}</td></tr>\n",
             escape(&row.status),
@@ -235,20 +262,51 @@ fn page_html(html: &mut String, group: &PageGroup<ReportRow>) {
     if group.page.is_none() {
         html.push_str("<p class=\"note\">The crawler reports the page a link was found on only for a 404, and only the first such page.</p>\n");
     }
-    html.push_str("<table>\n<colgroup><col class=\"c-status\"><col class=\"c-url-wide\"><col class=\"c-title-wide\"><col></colgroup>\n");
+    html.push_str("<table>\n<colgroup><col class=\"c-status\"><col class=\"c-url-wide\"><col class=\"c-title-wide\"><col class=\"c-line\"><col></colgroup>\n");
     html.push_str(
-        "<thead><tr><th>Status</th><th>URL</th><th>Title or kind</th><th>Link text</th></tr></thead>\n<tbody>\n",
+        "<thead><tr><th>Status</th><th>URL</th><th>Title or kind</th><th>Line</th><th>Link text</th></tr></thead>\n<tbody>\n",
     );
     for row in &group.items {
+        // Where this page references the link.
+        let line = match group.page.as_deref().and_then(|page| row.position_on(page)) {
+            Some(position) => format!(
+                "{}{}",
+                escape(position.suffix().trim_start_matches(':')),
+                more_html(position)
+            ),
+            None => String::new(),
+        };
         html.push_str(&format!(
-            "<tr><td class=\"status\">{}</td><td class=\"url\">{}</td><td>{}</td><td>{}</td></tr>\n",
+            "<tr><td class=\"status\">{}</td><td class=\"url\">{}</td><td>{}</td><td class=\"line\">{}</td><td>{}</td></tr>\n",
             escape(&row.status),
             link(&row.url),
             escape(&row.title_or_kind),
+            line,
             escape(&row.link_text)
         ));
     }
     html.push_str("</tbody>\n</table>\n");
+}
+
+/// Where a page references a link, after the page's link: `:1929`, with "(and 2 more)".
+fn position_html(position: Option<RefPosition>) -> String {
+    match position {
+        Some(position) => format!(
+            "<span class=\"pos\">{}</span>{}",
+            escape(&position.suffix()),
+            more_html(&position)
+        ),
+        None => String::new(),
+    }
+}
+
+/// " (and 2 more)" for a page that references a link more than once.
+fn more_html(position: &RefPosition) -> String {
+    if position.count > 1 {
+        format!(" <span class=\"more\">(and {} more)</span>", position.count - 1)
+    } else {
+        String::new()
+    }
 }
 
 /// Escapes text for HTML content and attribute values.
@@ -297,6 +355,9 @@ table { width: 100%; border-collapse: collapse; table-layout: fixed; }
 .c-title, .c-text { width: 15%; }
 .c-url-wide { width: 48%; }
 .c-title-wide { width: 18%; }
+.c-line { width: 110px; }
+.pos { font-weight: 600; white-space: nowrap; }
+.more { color: var(--weak); white-space: nowrap; }
 h3 { font-size: 14px; margin: 18px 0 6px; font-weight: 600; overflow-wrap: anywhere; }
 .facts { table-layout: auto; margin-bottom: 8px; }
 .facts th { width: 150px; background: none; vertical-align: top; }
@@ -342,6 +403,15 @@ mod tests {
                             "javascript:alert('x')".to_string(),
                             "https://site.example/a?x=1&y=2".to_string(),
                         ],
+                        positions: vec![
+                            None,
+                            Some(RefPosition {
+                                line: 1929,
+                                column: 22,
+                                count: 3,
+                                long_line: false,
+                            }),
+                        ],
                     }],
                     ..ReportGroup::default()
                 },
@@ -374,6 +444,12 @@ mod tests {
                     title_or_kind: "Page".to_string(),
                     link_text: "<i>Gone</i>".to_string(),
                     found_on: vec!["https://site.example/a?x=1&y=2".to_string()],
+                    positions: vec![Some(RefPosition {
+                        line: 1,
+                        column: 20345,
+                        count: 1,
+                        long_line: true,
+                    })],
                 }],
             }],
         }
@@ -421,6 +497,14 @@ mod tests {
             "<h3><a href=\"https://site.example/a?x=1&amp;y=2\">https://site.example/a?x=1&amp;y=2</a> <span class=\"n\">1</span></h3>"
         ));
         assert!(html.contains("&lt;i&gt;Gone&lt;/i&gt;") && !html.contains("<i>Gone"));
+        // Where each page references the link: after the page in Found on (the link opens the
+        // page without it), and as the Line of a link under its page (line and column on a long
+        // line).
+        assert!(html.contains(
+            "<a href=\"https://site.example/a?x=1&amp;y=2\">https://site.example/a?x=1&amp;y=2</a><span class=\"pos\">:1929</span> <span class=\"more\">(and 2 more)</span>"
+        ));
+        assert!(html.contains("<td class=\"line\">1:20345</td>"), "{html}");
+        assert!(html.contains("<th>Line</th>"));
         // Nothing broken: no section, and an empty gap list says so.
         let quiet = LinkReport {
             site: "https://site.example/".to_string(),

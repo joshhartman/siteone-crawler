@@ -12,6 +12,7 @@ use crate::backend::shell;
 use crate::model::coverage::{self, CrawlScope, Gap, GapInput};
 use crate::model::link_check::{Outcome, OutcomeCounts, RunLinks};
 use crate::model::link_report::{LinkReport, ReportGroup, ReportRow, group_by_page};
+use crate::model::link_text::RefPosition;
 use crate::model::run_state::RunState;
 use crate::ui::run::broken::{self, Where};
 use crate::ui::widgets::format;
@@ -26,6 +27,10 @@ struct Source<'a> {
 fn gather(source: &Source<'_>) -> LinkReport {
     let site_host = broken::site_host(&source.site);
     let texts = &source.links.texts;
+    // Where each page a link was found on references it.
+    let positions = |url: &str, pages: &[&str]| -> Vec<Option<RefPosition>> {
+        pages.iter().map(|page| texts.position(url, page).copied()).collect()
+    };
     let found_on: HashMap<&str, &str> = source
         .links
         .internal
@@ -43,6 +48,7 @@ fn gather(source: &Source<'_>) -> LinkReport {
             url: url.to_string(),
             title_or_kind: kind.to_string(),
             link_text: texts.lookup(url, &pages).text().to_string(),
+            positions: positions(url, &pages),
             found_on: sources,
         }
     };
@@ -53,6 +59,7 @@ fn gather(source: &Source<'_>) -> LinkReport {
             url: link.url.clone(),
             title_or_kind: link.title.clone().unwrap_or_default(),
             link_text: texts.lookup(&link.url, &pages).text().to_string(),
+            positions: positions(&link.url, &pages),
             found_on: link.sources.clone(),
         }
     };

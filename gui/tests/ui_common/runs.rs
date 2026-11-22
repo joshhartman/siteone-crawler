@@ -16,7 +16,7 @@ use siteone_crawler_gui::model::console::Stream;
 use siteone_crawler_gui::model::events;
 use siteone_crawler_gui::model::history::{RecordedOutcome, RunRecord, RunSummary};
 use siteone_crawler_gui::model::link_check::{CheckReport, Failure, LinkList, LinkResult, Outcome};
-use siteone_crawler_gui::model::link_text::{LinkTexts, PageTexts, url_key};
+use siteone_crawler_gui::model::link_text::{LinkTexts, PageTexts, RefPosition, url_key};
 use siteone_crawler_gui::model::paths::{create_run_dir, run_id_base};
 use siteone_crawler_gui::model::run_plan::{RunPaths, build_plan};
 
@@ -718,20 +718,39 @@ fn title_case(host: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Link texts for the 404 of the fixture and for most of the links of `list` (one not found).
+/// A position of a reference: `line`, `column`, `count`; a long line past column 500.
+pub fn position(line: u32, column: u32, count: u32) -> RefPosition {
+    RefPosition {
+        line,
+        column,
+        count,
+        long_line: column > 500,
+    }
+}
+
+/// Link texts for the 404 of the fixture (line 212, twice on its page) and for most of the links
+/// of `list` (one not found; some with the position of the link on a minified page).
 pub fn link_texts(list: &LinkList) -> LinkTexts {
     let mut texts = LinkTexts::default();
-    let mut add = |page: &str, target: &str, text: &str| {
-        if let PageTexts::Fetched { texts } = texts
+    let mut add = |page: &str, target: &str, text: &str, at: Option<RefPosition>| {
+        if let PageTexts::Fetched { texts, positions } = texts
             .pages
             .entry(page.to_string())
-            .or_insert_with(|| PageTexts::Fetched { texts: BTreeMap::new() })
+            .or_insert_with(|| PageTexts::texts(BTreeMap::new()))
             && !text.is_empty()
         {
             texts.insert(url_key(target), text.to_string());
+            if let Some(at) = at {
+                positions.insert(url_key(target), at);
+            }
         }
     };
-    add(FIXTURE_404_SOURCE, FIXTURE_404, "Content type analysis");
+    add(
+        FIXTURE_404_SOURCE,
+        FIXTURE_404,
+        "Content type analysis",
+        Some(position(212, 17, 2)),
+    );
     for (index, link) in list.links.iter().enumerate() {
         let Some(source) = link.sources.first() else { continue };
         let text = match index % 6 {
@@ -748,9 +767,54 @@ pub fn link_texts(list: &LinkList) -> LinkTexts {
             4 => String::new(),
             _ => "Join the community".to_string(),
         };
-        add(source, &link.url, &text);
+        let at = match index % 6 {
+            1 => Some(position(1, 20_345 + index as u32, 1)),
+            4 => None,
+            _ => Some(position(40 + index as u32 * 3, 9, 1)),
+        };
+        add(source, &link.url, &text, at);
     }
     texts
+}
+
+/// The fixture's result JSON with one more row in its `404` table: the missing hero image, found
+/// on the site's stylesheet.
+pub fn fixture_with_a_stylesheet_404() -> String {
+    // The row of the `404` table (the fixture's line ends depend on the checkout).
+    let table_row = FIXTURE
+        .find("\"statusCode\": \"404\",")
+        .expect("the fixture's 404 table");
+    let end = FIXTURE[table_row..].find('}').expect("the end of the row") + table_row + 1;
+    let row = format!(r#", {{"sourceUqId": "{STYLESHEET}", "statusCode": "404", "url": "{HERO_IMAGE}"}}"#);
+    format!("{}{row}{}", &FIXTURE[..end], &FIXTURE[end..])
+}
+
+/// The site's stylesheet (crawled) and the missing image it references.
+pub const STYLESHEET: &str = "https://crawler.siteone.io/_astro/index.B2x8m7jK.css";
+pub const HERO_IMAGE: &str = "https://crawler.siteone.io/images/hero-background.webp";
+
+/// A finished crawl whose two 404s were found on a page and on a stylesheet, with the link texts
+/// read after the crawl (`link-texts.json`): the page's link at line 212 (twice), the
+/// stylesheet's `url()` at line 1929.
+pub fn finished_with_positions(app: &mut App) -> Control {
+    let control = finished_with(app, 73, &fixture_with_a_stylesheet_404());
+    let mut texts = LinkTexts::default();
+    texts.pages.insert(
+        FIXTURE_404_SOURCE.to_string(),
+        PageTexts::Fetched {
+            texts: BTreeMap::from([(url_key(FIXTURE_404), "Content type analysis".to_string())]),
+            positions: BTreeMap::from([(url_key(FIXTURE_404), position(212, 17, 2))]),
+        },
+    );
+    texts.pages.insert(
+        STYLESHEET.to_string(),
+        PageTexts::Css {
+            positions: BTreeMap::from([(url_key(HERO_IMAGE), position(1929, 22, 1))]),
+        },
+    );
+    let run_dir = app.current_run.as_ref().expect("run").plan.run_dir.clone();
+    texts.write(&run_dir).expect("link-texts.json");
+    control
 }
 
 /// The current run's external links as if a check ran: `done` of them checked; with `running`
