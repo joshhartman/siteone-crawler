@@ -29,7 +29,8 @@ static HTML_EXT_REGEX: Lazy<Regex> = Lazy::new(|| {
 /// `<a href>` and `<area href>` (an image-map link, reported as `<a href>` too), never another tag
 /// whose name starts with `a` (`<abbr>`, `<article>`, `<audio>`, …).
 static RE_A_HREF: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"(?is)<(?:a|area)\s(?:[^>]*\s)?href=(?:["']([^"'#][^"']*)["']|([^\s>"'#][^\s>"']*))[^>]*>"#).unwrap()
+    Regex::new(r#"(?is)<(?:a|area)\s(?:[^>]*\s)?href\s*=\s*(?:["']([^"'#][^"']*)["']|([^\s>"'#][^\s>"']*))[^>]*>"#)
+        .unwrap()
 });
 
 static RE_ESCAPED_HREF: Lazy<Regex> =
@@ -40,7 +41,7 @@ static RE_FONT_URL: Lazy<Regex> = Lazy::new(|| {
 });
 
 static RE_FONT_LINK: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"(?is)<link\s+[^>]*href=(?:["']([^"']+\.(?:eot|ttf|woff2|woff|otf)[^"']*)["']|([^\s>"']+\.(?:eot|ttf|woff2|woff|otf)[^\s>"']*))[^>]*>"#).unwrap()
+    Regex::new(r#"(?is)<link\s+[^>]*href\s*=\s*(?:["']([^"']+\.(?:eot|ttf|woff2|woff|otf)[^"']*)["']|([^\s>"']+\.(?:eot|ttf|woff2|woff|otf)[^\s>"']*))[^>]*>"#).unwrap()
 });
 
 /// `<img>` and `<source>` tags: 1 = tag name, 2 = attributes. Their image attributes, lazy-loading
@@ -69,12 +70,14 @@ const IMAGE_URL_ATTRIBUTES: &[&str] = &["src", "data-src", "data-lazy-src", "dat
 const IMAGE_SRCSET_ATTRIBUTES: &[&str] = &["srcset", "data-srcset", "data-lazy-srcset"];
 
 static RE_INPUT_SRC: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"(?is)<input\s+[^>]*?src=(?:["']([^"']+\.[a-z0-9]{1,10})["']|([^\s>"']+\.[a-z0-9]{1,10}))[^>]*>"#)
-        .unwrap()
+    Regex::new(
+        r#"(?is)<input\s+[^>]*?src\s*=\s*(?:["']([^"']+\.[a-z0-9]{1,10})["']|([^\s>"']+\.[a-z0-9]{1,10}))[^>]*>"#,
+    )
+    .unwrap()
 });
 
 static RE_LINK_IMAGE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"(?is)<link\s+[^>]*?href=(?:["']([^"']+\.(?:png|gif|jpg|jpeg|webp|avif|tif|bmp|svg|ico)(?:\?[^"']*)?)["']|([^\s>"']+\.(?:png|gif|jpg|jpeg|webp|avif|tif|bmp|svg|ico)(?:\?[^\s>"']*)?))[^>]*>"#).unwrap()
+    Regex::new(r#"(?is)<link\s+[^>]*?href\s*=\s*(?:["']([^"']+\.(?:png|gif|jpg|jpeg|webp|avif|tif|bmp|svg|ico)(?:\?[^"']*)?)["']|([^\s>"']+\.(?:png|gif|jpg|jpeg|webp|avif|tif|bmp|svg|ico)(?:\?[^\s>"']*)?))[^>]*>"#).unwrap()
 });
 
 static RE_CSS_URL_IMAGE: Lazy<Regex> = Lazy::new(|| {
@@ -82,19 +85,19 @@ static RE_CSS_URL_IMAGE: Lazy<Regex> = Lazy::new(|| {
 });
 
 static RE_IMAGESRCSET: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r#"(?is)<[a-z]+[^>]+imagesrcset=["']([^"']+)["']"#).unwrap());
+    Lazy::new(|| Regex::new(r#"(?is)<[a-z]+[^>]+imagesrcset\s*=\s*["']([^"']+)["']"#).unwrap());
 
 static RE_AUDIO_SRC: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r#"(?is)<audio\s+[^>]*?src=(?:["']([^"']+)["']|([^\s>"']+))[^>]*>"#).unwrap());
+    Lazy::new(|| Regex::new(r#"(?is)<audio\s+[^>]*?src\s*=\s*(?:["']([^"']+)["']|([^\s>"']+))[^>]*>"#).unwrap());
 
 static RE_VIDEO_SRC: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r#"(?is)<video\s+[^>]*?src=(?:["']([^"']+)["']|([^\s>"']+))[^>]*>"#).unwrap());
+    Lazy::new(|| Regex::new(r#"(?is)<video\s+[^>]*?src\s*=\s*(?:["']([^"']+)["']|([^\s>"']+))[^>]*>"#).unwrap());
 
 static RE_SCRIPT_SRC: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r#"(?is)<script\s+[^>]*?src=(?:["']([^"']+)["']|([^\s>"']+))[^>]*>"#).unwrap());
+    Lazy::new(|| Regex::new(r#"(?is)<script\s+[^>]*?src\s*=\s*(?:["']([^"']+)["']|([^\s>"']+))[^>]*>"#).unwrap());
 
 static RE_LINK_JS: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"(?is)<link\s+[^>]*href=(?:["']([^"']+\.(?:json|js)(?:\?[^"']*)?)["']|([^\s>"']+\.(?:json|js)(?:\?[^\s>"']*)?))[^>]*>"#).unwrap()
+    Regex::new(r#"(?is)<link\s+[^>]*href\s*=\s*(?:["']([^"']+\.(?:json|js)(?:\?[^"']*)?)["']|([^\s>"']+\.(?:json|js)(?:\?[^\s>"']*)?))[^>]*>"#).unwrap()
 });
 
 static RE_DOT_SRC: Lazy<Regex> = Lazy::new(|| Regex::new(r#"(?is)\.src\s*=\s*["']([^"']+)["']"#).unwrap());
@@ -103,7 +106,9 @@ static RE_NEXTJS_CHUNKS: Lazy<Regex> =
     Lazy::new(|| Regex::new(r#"(?is):([a-z0-9/._\-\[\]]+chunks[a-z0-9/._\-\[\]]+\.js)"#).unwrap());
 
 static RE_LINK_STYLESHEET: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r#"(?is)<link\s+[^>]*?href=["']([^"']+)["'][^>]*>"#).unwrap());
+    Lazy::new(|| Regex::new(r#"(?is)<link\s+[^>]*?href\s*=\s*["']([^"']+)["'][^>]*>"#).unwrap());
+
+static RE_REL_ATTR: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)rel\s*=").unwrap());
 
 static RE_FILE_EXTENSION: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\.[a-z0-9]{1,10}(\?.*)?$").unwrap());
 
@@ -418,7 +423,7 @@ impl HtmlProcessor {
             if let Some(href) = caps.get(1) {
                 // Only include if no rel= attribute or rel="stylesheet"
                 let full_lower = full_match.to_lowercase();
-                if !full_lower.contains("rel=") || full_lower.contains("stylesheet") {
+                if !RE_REL_ATTR.is_match(&full_lower) || full_lower.contains("stylesheet") {
                     stylesheet_urls.push(Hit::new(href, None));
                 }
             }
@@ -1584,6 +1589,47 @@ mod tests {
         // The whitespace around the URL is not part of it: the offset is where the URL starts
         assert_eq!(found(&urls, "/x").offset, html.find("/x"));
         assert_eq!(found(&urls, "/b.png").text.as_deref(), Some("Pic"));
+    }
+
+    #[test]
+    fn attributes_with_whitespace_around_the_equals_sign_are_found() {
+        let html = concat!(
+            "<html><head><link rel = \"stylesheet\" href = \"/s.css\">",
+            "<link rel = \"preconnect\" href = \"https://cdn.example.com/\">",
+            "<link rel=\"icon\" href =\"/favicon.ico\"><link rel=\"preload\" href= \"/f.woff2\">",
+            "<link rel=\"modulepreload\" href\t=\t\"/m.js\">",
+            "<link rel=\"preload\" as=\"image\" imagesrcset = \"/hero.jpg 1x\">",
+            "<script src = '/app.js'></script></head>\n",
+            "<body><a href = \"/page\">x</a><map><area href = /area shape=rect></map><a href =\n\"/nl\">nl</a>",
+            "<img src = \"/i.png\"><input type=\"image\" src = \"/btn.png\">",
+            "<audio src = \"/a.mp3\"></audio><video src = \"/v.mp4\"></video></body></html>",
+        );
+        let source = ParsedUrl::parse("https://example.com/", None);
+        let urls = link_details_processor().find_urls(html, &source).unwrap();
+        let mut found_urls: Vec<&str> = urls.get_urls().values().map(|u| u.url.as_str()).collect();
+        found_urls.sort();
+        assert_eq!(
+            found_urls,
+            [
+                "/a.mp3",
+                "/app.js",
+                "/area",
+                "/btn.png",
+                "/f.woff2",
+                "/favicon.ico",
+                "/hero.jpg",
+                "/i.png",
+                "/m.js",
+                "/nl",
+                "/page",
+                "/s.css",
+                "/v.mp4"
+            ],
+            "a preconnect link is not a stylesheet, also with spaces around its rel"
+        );
+        for url in found_urls {
+            assert_eq!(found(&urls, url).offset, html.find(url), "{url}");
+        }
     }
 
     #[test]
