@@ -101,34 +101,46 @@ crawler as it is. Each entry says what the GUI does instead today.
     a race that could queue a URL twice, and the `<a href>` pattern matching other tags whose
     name starts with "a".
 
-17. **Link defects left in the crawler** (seen while fixing 16, not fixed):
+17. **Link defects left in the crawler** (seen while fixing 16 and 18, not fixed). All but the
+    last concern the offline and Markdown exports:
     - `utils::is_href_for_requestable_resource` and `RE_NON_HTTP_SCHEME` in the HTML processor
       still accept letters and digits only in a scheme; they are used by the offline export,
       which may rewrite an `android-app://` link as a file.
-    - `base_processor::convert_url_to_relative` does not trim whitespace, so the offline and
-      Markdown exports may not match `href=" /x"` with the crawled `/x` (not verified).
-    - `url(" /x.png")` with whitespace inside the quotes in an inline `<style>` is not found.
-    - `href = "…"` with spaces around `=` is not found.
+    - `base_processor::convert_url_to_relative` does not trim whitespace, so the exports may not
+      match `href=" /x"` with the crawled `/x` (not verified).
+    - `RE_CSS_URL_OFFLINE` cannot start a URL with whitespace, so `url(" /x.png")` and
+      `url("/x.png ")` are crawled but stay absolute paths in the exported files (seen in an
+      export, for inline `<style>`, `style=` and an external stylesheet).
+    - A stylesheet `url()` target without a file extension is stored and linked with an `.html`
+      extension (`url(/img/pattern)` becomes `img/pattern.html`): the link resolves, the file
+      name is wrong. `offline_url_converter` guesses an image extension only for `src`/`srcset`.
     - The `queue + visited` limit checks are not atomic, so the URL limits are approximate.
 
-18. **Broken links the crawler does not report** (read in the code, not tested by a crawl):
-    - *Non-breaking space around a URL.* `Crawler` trims all Unicode whitespace from a found URL
-      before queueing it (`found_url.url.trim()`), so a literal U+00A0 before `/x` is removed and
-      `/x` is requested. A browser strips only ASCII whitespace and control characters, keeps the
-      non-breaking space and requests `%C2%A0/x`, which fails. Trimming ASCII whitespace only, as
-      `found_url::normalize_url` and the HTML processor do, would report it.
-    - *Mistyped scheme.* `found_urls::is_url_valid_for_crawling` drops every link whose scheme is
-      not http(s), so `htp://example.com/` is skipped silently like `mailto:` and `tel:`, although
-      a visitor who clicks it gets an error. Reporting it needs a list of known schemes (`mailto:`,
-      `tel:`, `sms:`, `javascript:`, `data:`, `blob:`, `ftp:`, app schemes with a hyphen, `+` or
-      `.`); a link with any other scheme would be recorded as skipped with its own reason, which
-      the Link checker could list as broken.
-    - *A stylesheet `url()` without a known extension.* The CSS processor keeps a `url()` only
-      when it ends in an image, font or `.css` extension (`RE_IS_IMAGE`, `RE_IS_FONT`,
-      `RE_IS_CSS` in `css_processor.rs`), so `url(bg/pattern)`, `url(/img?id=3)` or a `.mp4`,
-      `.cur` or `.jxl` file is never requested and a missing one is not reported (seen in a crawl
-      of a local test site). A `url()` in a stylesheet is always a file the browser loads, so
-      every one that is not `data:` or a `#fragment` could be requested.
+    *Done:* `href = "…"` with whitespace around `=` is found (links, scripts, stylesheets,
+    fonts, media, `imagesrcset`); `url(" /x.png")` in an inline `<style>` was already found
+    since 16.
+
+18. **Broken links the crawler did not report.** *Done in the crawler; the second one also in
+    the GUI.*
+    - *Non-breaking space around a URL.* A found URL is trimmed of ASCII whitespace only, as a
+      browser does, so `href="\u{a0}/x"` is requested as `/%C2%A0/x` (404) and no longer as `/x`.
+    - *Mistyped scheme.* A link whose scheme is one edit away from `http` or `https` (one
+      character missing, added, wrong, or two swapped: `htp`, `ttp`, `hhtp`, `htps`, `httsp`, …)
+      is never requested and is recorded in the skipped URLs with the reason "Mistyped scheme",
+      with its page and source attribute, and in the `links` table. Every other non-http scheme
+      (`mailto:`, `tel:`, app schemes) is skipped silently as before. Only in HTML attributes and
+      stylesheet `url()`, not in script text.
+      *In the GUI:* these links are broken rows of the Link checker (status "Mistyped scheme",
+      internal or external by the host as written), in its counts, by-page view, Copy list and the
+      link report; they cannot be retried and are not listed under *Not checked*.
+    - *A stylesheet `url()` without a known extension.* Every `url()` of a stylesheet is
+      requested (`url(bg/pattern)`, `url(/img?id=3)`, `x.cur`), except `data:`, `#fragment`,
+      other schemes, the invalid `url(var(--x))` and the `url()` of an `@namespace` rule; one
+      without an image, font or `.css` extension counts as an image for `--disable-images`.
+      *Left:* in HTML (inline `<style>`, `style=`) only a `url()` with an image, font or `.css`
+      extension is requested, because the same pattern also matches script and text there
+      (`new URL(location.href)`); telling the two apart needs the style blocks to be cut out of
+      the page first.
 
 ## Requests
 
@@ -177,9 +189,14 @@ crawler as it is. Each entry says what the GUI does instead today.
 
 ## Project
 
-11. **Tests on Windows.** 98 crawler tests pass `--config-file=/dev/null`, which does not exist
-   on Windows, so root `cargo test` fails there (it passes on Linux CI). An empty temporary
-   file would make them portable.
+11. **Tests on Windows.** *Done:* the tests that keep a config file out of a run pass `NUL` on
+   Windows and `/dev/null` elsewhere, so root `cargo test` runs there.
+   *Left:* two tests (`brotli_response_keeps_content_encoding_and_passes_the_brotli_check`,
+   `http_cache_hit_keeps_content_encoding_and_decoded_size`) fail on a machine whose security
+   software rewrites HTTP responses to a browser-like User-Agent (it removes `Content-Encoding`
+   and `Content-Length`, also on 127.0.0.1); a non-browser `--user-agent` in those two tests
+   would make them independent of it. `cargo clippy --tests -- -D warnings` reports about 24
+   errors in test code (not part of CI's checks).
 
 12. **`wizard::presets` is private.** `pub mod presets;` would let the GUI import the presets.
    *Today:* the GUI compiles `src/wizard/presets.rs` by path.
