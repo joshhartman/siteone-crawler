@@ -426,7 +426,10 @@ impl Crawler {
         let mut order = self.queue_order.lock().unwrap_or_else(|e| e.into_inner());
         while !order.is_empty() {
             let Some(key) = order.pop_front() else { break };
-            if let Some((_, entry)) = self.queue.remove(&key) {
+            // Move the URL from the queue to visited while its queue shard is locked, so a worker
+            // adding it (`add_url_to_queue_static`) always finds it in one of the two
+            if let dashmap::mapref::entry::Entry::Occupied(queued) = self.queue.entry(key.clone()) {
+                let entry = queued.get().clone();
                 // Add to visited table
                 self.visited.insert(
                     key.clone(),
@@ -437,6 +440,7 @@ impl Crawler {
                         source_attr: entry.source_attr,
                     },
                 );
+                queued.remove();
                 return Some(entry);
             }
         }
@@ -1057,10 +1061,13 @@ impl Crawler {
             _ => Vec::new(),
         };
 
+        // <base href> only changes how the found URLs resolve: they were found on this page
+        let source_url_uq_id = Self::compute_url_uq_id(url);
         for found_urls in found_urls_list {
             Self::add_suitable_urls_to_queue(
                 &found_urls,
                 source_url,
+                &source_url_uq_id,
                 options,
                 queue,
                 queue_order,
@@ -1081,11 +1088,13 @@ impl Crawler {
         }
     }
 
-    /// Add suitable found URLs to the queue after filtering
+    /// Add suitable found URLs to the queue after filtering. They resolve against `source_url` (the
+    /// page, or its `<base href>`) and are recorded as found on the page `source_url_uq_id`.
     #[allow(clippy::too_many_arguments)]
     fn add_suitable_urls_to_queue(
         found_urls: &FoundUrls,
         source_url: &ParsedUrl,
+        source_url_uq_id: &str,
         options: &Arc<CoreOptions>,
         queue: &Arc<DashMap<String, QueueEntry>>,
         queue_order: &Arc<Mutex<VecDeque<String>>>,
@@ -1103,8 +1112,6 @@ impl Crawler {
         compiled_include_regex: &[FilterRegex],
         compiled_ignore_regex: &[FilterRegex],
     ) {
-        let source_url_uq_id = Self::compute_url_uq_id(source_url);
-
         for found_url in found_urls.get_urls().values() {
             if terminated.load(Ordering::SeqCst) {
                 return;
@@ -1171,7 +1178,7 @@ impl Crawler {
                         SkippedEntry {
                             url: parsed_url_for_queue.get_full_url(true, false),
                             reason: SkippedReason::NotAllowedHost,
-                            source_uq_id: source_url_uq_id.clone(),
+                            source_uq_id: source_url_uq_id.to_string(),
                             source_attr: found_url.source as i32,
                         },
                     );
@@ -1193,7 +1200,7 @@ impl Crawler {
                             SkippedEntry {
                                 url: parsed_url_for_queue.get_full_url(true, false),
                                 reason: SkippedReason::RobotsTxt,
-                                source_uq_id: source_url_uq_id.clone(),
+                                source_uq_id: source_url_uq_id.to_string(),
                                 source_attr: found_url.source as i32,
                             },
                         );
@@ -1249,7 +1256,7 @@ impl Crawler {
             if suitable {
                 Self::add_url_to_queue_static(
                     &parsed_url_for_queue,
-                    Some(&source_url_uq_id),
+                    Some(source_url_uq_id),
                     found_url.source as i32,
                     queue,
                     queue_order,
@@ -1312,8 +1319,22 @@ impl Crawler {
             source_attr,
         };
 
-        queue.insert(url_key.clone(), entry);
-        if let Ok(mut order) = queue_order.lock() {
+        // Insert only a URL that is neither queued nor visited, atomically: two workers may both have
+        // found it unknown, and the first one must stay its source. The queue's shard stays locked
+        // while `visited` is checked, so `take_next_from_queue` (which moves a URL into `visited`
+        // under the same lock) cannot slip in between. The lock is released before `queue_order`.
+        let inserted = match queue.entry(url_key.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(_) => false,
+            dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                if visited.contains_key(&url_key) {
+                    false
+                } else {
+                    vacant.insert(entry);
+                    true
+                }
+            }
+        };
+        if inserted && let Ok(mut order) = queue_order.lock() {
             order.push_back(url_key);
         }
     }
@@ -2592,6 +2613,230 @@ mod tests {
             11,
             "pages always use the body length"
         );
+    }
+
+    // =========================================================================
+    // Source of found URLs (<base href>) and the queue's insert-if-absent
+    // =========================================================================
+
+    fn test_crawler(url: &str) -> Crawler {
+        use crate::content_processor::base_processor::ProcessorConfig;
+        use crate::content_processor::html_processor::HtmlProcessor;
+        use crate::engine::http_client::HttpClient;
+        use crate::output::json_output::JsonOutput;
+        use crate::output::output::CrawlerInfo;
+        use crate::result::storage::memory_storage::MemoryStorage;
+
+        let options = crate::options::core_options::parse_argv(&[
+            "siteone-crawler".to_string(),
+            format!("--url={url}"),
+            format!("--config-file={}", if cfg!(windows) { "NUL" } else { "/dev/null" }),
+            "--http-cache-dir=".to_string(),
+            "--ignore-robots-txt".to_string(),
+        ])
+        .unwrap();
+        let mut cpm = ContentProcessorManager::new();
+        cpm.register_processor(Box::new(HtmlProcessor::new(ProcessorConfig::new(ParsedUrl::parse(
+            url, None,
+        )))))
+        .unwrap();
+        let info = crate::info::Info::new(
+            "SiteOne Crawler".to_string(),
+            "test".to_string(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            url.to_string(),
+        );
+        let status = Status::new(
+            Box::new(MemoryStorage::new(false)),
+            false,
+            info,
+            std::time::Instant::now(),
+        );
+        Crawler::new(
+            Arc::new(options),
+            Arc::new(HttpClient::new(None, None, None, false, None, false)),
+            cpm,
+            AnalysisManager::new(),
+            Box::new(JsonOutput::new(CrawlerInfo::default(), vec![], true, false, None, 0)),
+            status,
+        )
+        .unwrap()
+    }
+
+    /// Runs the URL discovery of the crawl loop on `html`, as fetched from `page_url`.
+    fn discover_urls(crawler: &Crawler, page_url: &str, html: &str) {
+        Crawler::parse_content_and_fill_url_queue(
+            html,
+            ContentTypeId::Html,
+            &ParsedUrl::parse(page_url, None),
+            &crawler.options,
+            &crawler.content_processor_manager,
+            &crawler.queue,
+            &crawler.queue_order,
+            &crawler.visited,
+            &crawler.skipped,
+            &crawler.initial_parsed_url,
+            &crawler.non200_basenames_to_occurrences,
+            &crawler.robots_txt_cache,
+            &crawler.loaded_robots_txt_count,
+            &crawler.resolve_cache,
+            &crawler.http_client,
+            &crawler.output,
+            &crawler.status,
+            &crawler.terminated,
+            &crawler.compiled_include_regex,
+            &crawler.compiled_ignore_regex,
+        );
+    }
+
+    fn queued(crawler: &Crawler, url: &str) -> Option<QueueEntry> {
+        let key = Crawler::compute_url_key(&ParsedUrl::parse(url, None));
+        crawler.queue.get(&key).map(|entry| entry.value().clone())
+    }
+
+    fn uq_id(url: &str) -> String {
+        Crawler::compute_url_uq_id(&ParsedUrl::parse(url, None))
+    }
+
+    #[test]
+    fn base_href_resolves_links_but_the_page_stays_their_source() {
+        let crawler = test_crawler("https://example.com/");
+
+        // <base href> to another directory of the same host
+        let page = "https://example.com/blog/post.html";
+        discover_urls(
+            &crawler,
+            page,
+            r#"<html><head><base href="/assets/"></head><body><a href="missing.html">m</a></body></html>"#,
+        );
+        assert!(queued(&crawler, "https://example.com/blog/missing.html").is_none());
+        let entry = queued(&crawler, "https://example.com/assets/missing.html").expect("resolved against the base");
+        assert_eq!(entry.source_uq_id, uq_id(page), "the page, not the base URL");
+
+        // <base href> to another host: the link is skipped (not allowed host), found on the page
+        let page = "https://example.com/news/";
+        discover_urls(
+            &crawler,
+            page,
+            r#"<html><head><base href="https://cdn.example.net/dir/"></head><body><a href="other.html">o</a></body></html>"#,
+        );
+        let skipped_key = Crawler::compute_url_key(&ParsedUrl::parse("https://cdn.example.net/dir/other.html", None));
+        let skipped = crawler.skipped.get(&skipped_key).expect("skipped as not allowed host");
+        assert_eq!(skipped.source_uq_id, uq_id(page), "the page, not the base URL");
+        assert_eq!(skipped.source_attr, UrlSource::AHref as i32);
+    }
+
+    /// Both finders checked that the URL was neither queued nor visited before either inserted it,
+    /// the interleaving that made the second one overwrite the first one's entry.
+    #[test]
+    fn a_url_found_twice_is_queued_once_and_keeps_its_first_finder() {
+        let crawler = test_crawler("https://example.com/");
+        let url = ParsedUrl::parse("https://example.com/new.html", None);
+        let suitable = || {
+            Crawler::is_url_suitable_for_queue_static(
+                &url,
+                &crawler.queue,
+                &crawler.visited,
+                &crawler.options,
+                &crawler.compiled_include_regex,
+                &crawler.compiled_ignore_regex,
+            )
+        };
+        assert!(suitable() && suitable(), "both finders see an unknown URL");
+        let add = |source: &str| {
+            Crawler::add_url_to_queue_static(
+                &url,
+                Some(source),
+                UrlSource::AHref as i32,
+                &crawler.queue,
+                &crawler.queue_order,
+                &crawler.visited,
+                &crawler.options,
+                &crawler.terminated,
+            )
+        };
+        add("1111aaaa");
+        add("2222bbbb");
+
+        let key = Crawler::compute_url_key(&url);
+        let order = crawler.queue_order.lock().unwrap();
+        assert_eq!(order.iter().filter(|k| **k == key).count(), 1, "queued once");
+        drop(order);
+        assert_eq!(
+            queued(&crawler, "https://example.com/new.html").unwrap().source_uq_id,
+            "1111aaaa"
+        );
+
+        // A finder that checked before the URL was taken from the queue never queues it again.
+        let taken = crawler.take_next_from_queue().expect("the queued URL");
+        assert_eq!(taken.source_uq_id, "1111aaaa");
+        add("3333cccc");
+        assert!(crawler.take_next_from_queue().is_none(), "visited, so not queued again");
+        assert_eq!(crawler.visited.get(&key).unwrap().source_uq_id, "1111aaaa");
+    }
+
+    /// Many finders discover the same new URLs at once while the crawl loop takes URLs from the
+    /// queue: every URL must be taken exactly once.
+    #[test]
+    fn concurrent_finders_never_get_a_url_processed_twice() {
+        const FINDERS: usize = 16;
+        const URLS: usize = 400;
+        for _round in 0..5 {
+            let crawler = test_crawler("https://example.com/");
+            let urls: Vec<ParsedUrl> = (0..URLS)
+                .map(|n| ParsedUrl::parse(&format!("https://example.com/p{n}.html"), None))
+                .collect();
+            let start = std::sync::Barrier::new(FINDERS + 1);
+            let finders_done = AtomicUsize::new(0);
+            let mut taken: HashMap<String, usize> = HashMap::new();
+            std::thread::scope(|scope| {
+                for finder in 0..FINDERS {
+                    let (crawler, urls, start, finders_done) = (&crawler, &urls, &start, &finders_done);
+                    scope.spawn(move || {
+                        let source = format!("{finder:08x}");
+                        start.wait();
+                        for url in urls {
+                            if Crawler::is_url_suitable_for_queue_static(
+                                url,
+                                &crawler.queue,
+                                &crawler.visited,
+                                &crawler.options,
+                                &crawler.compiled_include_regex,
+                                &crawler.compiled_ignore_regex,
+                            ) {
+                                std::thread::yield_now();
+                                Crawler::add_url_to_queue_static(
+                                    url,
+                                    Some(&source),
+                                    UrlSource::AHref as i32,
+                                    &crawler.queue,
+                                    &crawler.queue_order,
+                                    &crawler.visited,
+                                    &crawler.options,
+                                    &crawler.terminated,
+                                );
+                            }
+                        }
+                        finders_done.fetch_add(1, Ordering::SeqCst);
+                    });
+                }
+                start.wait();
+                loop {
+                    let all_done = finders_done.load(Ordering::SeqCst) == FINDERS;
+                    match crawler.take_next_from_queue() {
+                        Some(entry) => *taken.entry(entry.url).or_default() += 1,
+                        None if all_done => break,
+                        None => std::thread::yield_now(),
+                    }
+                }
+            });
+            let twice: Vec<_> = taken.iter().filter(|(_, n)| **n > 1).collect();
+            assert!(twice.is_empty(), "taken more than once: {twice:?}");
+            assert_eq!(taken.len(), URLS, "every URL is taken");
+        }
     }
 
     #[test]

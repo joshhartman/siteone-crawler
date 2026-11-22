@@ -9,8 +9,12 @@ use regex::Regex;
 
 use super::found_url::{FoundUrl, UrlSource};
 
-/// Regex for detecting non-http scheme URLs (mailto:, javascript:, data:, tel:, etc.)
-static NON_HTTP_SCHEME_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)^[a-z]+:[a-z0-9]").unwrap());
+/// Regex for detecting a URL with a scheme (RFC 3986: `ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`
+/// followed by `:`), e.g. mailto:, javascript:, data:, tel:+1…, android-app://, web+app:
+static SCHEME_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^[a-zA-Z][a-zA-Z0-9+.\-]*:").unwrap());
+
+/// Regex for the http(s) schemes, in any letter case
+static HTTP_SCHEME_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)^https?:").unwrap());
 
 /// Collection of found URLs, deduplicated by MD5 hash of URL
 #[derive(Debug, Clone)]
@@ -73,7 +77,7 @@ fn is_url_valid_for_crawling(url: &str) -> bool {
     if url.starts_with('#') {
         return false;
     }
-    if NON_HTTP_SCHEME_RE.is_match(url) {
+    if SCHEME_RE.is_match(url) && !HTTP_SCHEME_RE.is_match(url) {
         return false;
     }
     if url.to_lowercase().starts_with("file://") {
@@ -114,5 +118,41 @@ mod tests {
         assert!(!is_url_valid_for_crawling("javascript:void(0)"));
         assert!(!is_url_valid_for_crawling("data:text/html,test"));
         assert!(!is_url_valid_for_crawling("file:///etc/passwd"));
+    }
+
+    #[test]
+    fn non_http_schemes_follow_rfc_3986_scheme_syntax() {
+        // scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ), whatever follows the colon
+        for url in [
+            "android-app://com.example/https/example.com/x",
+            "ms-windows-store://pdp/?productid=X",
+            "fb-messenger://share?link=x",
+            "web+app:thing",
+            "x.y-z+1:anything",
+            "tel:+15551234567",
+            "whatsapp://send?text=hi",
+            "sms:?body=x",
+            "MAILTO:a@b.c",
+            // An RFC 3986 scheme, as browsers read them too: never a relative path (not crawled today).
+            "localhost:8080/x",
+            "C:/x",
+        ] {
+            assert!(!is_url_valid_for_crawling(url), "{url}");
+        }
+        for url in [
+            "http://example.com/x",
+            "https://example.com/x",
+            "HTTPS://EXAMPLE.COM/x",
+            "Http://example.com/x",
+            "//cdn.example.com/x",
+            "/a:b",
+            "./a:b",
+            "a/b:c",
+            "?q=a:b",
+            "page.html?x=a:b",
+            "1:x",
+        ] {
+            assert!(is_url_valid_for_crawling(url), "{url}");
+        }
     }
 }

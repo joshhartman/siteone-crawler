@@ -26,8 +26,11 @@ static HTML_EXT_REGEX: Lazy<Regex> = Lazy::new(|| {
     Regex::new(&pattern).unwrap()
 });
 
-static RE_A_HREF: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r#"(?is)<a[^>]*\shref=(?:["']([^"'#][^"']*)["']|([^\s>"'#][^\s>"']*))[^>]*>"#).unwrap());
+/// `<a href>` and `<area href>` (an image-map link, reported as `<a href>` too), never another tag
+/// whose name starts with `a` (`<abbr>`, `<article>`, `<audio>`, …).
+static RE_A_HREF: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(?is)<(?:a|area)\s(?:[^>]*\s)?href=(?:["']([^"'#][^"']*)["']|([^\s>"'#][^\s>"']*))[^>]*>"#).unwrap()
+});
 
 static RE_ESCAPED_HREF: Lazy<Regex> =
     Lazy::new(|| Regex::new(r#"(?i)href\\["'][:=]\\["'](https?://[^"'\\]+)\\["']"#).unwrap());
@@ -177,7 +180,8 @@ impl HtmlProcessor {
         let mut urls: Vec<String> = Vec::new();
         for caps in RE_A_HREF.captures_iter(html) {
             if let Some(m) = caps.get(1).or_else(|| caps.get(2)) {
-                urls.push(m.as_str().to_string());
+                // Without the whitespace around it, which the depth and file filters below must not see
+                urls.push(m.as_str().trim_matches(|c: char| c.is_ascii_whitespace()).to_string());
             }
         }
 
@@ -1092,6 +1096,82 @@ mod tests {
         let source = ParsedUrl::parse("https://example.com/", None);
         let result = processor.find_urls(html, &source);
         assert!(result.is_some());
+    }
+
+    fn found_urls_by_source(processor: &HtmlProcessor, html: &str) -> Vec<(String, UrlSource)> {
+        let source = ParsedUrl::parse("https://example.com/dir/page.html", None);
+        let mut urls: Vec<(String, UrlSource)> = processor
+            .find_urls(html, &source)
+            .map(|found| found.get_urls().values().map(|u| (u.url.clone(), u.source)).collect())
+            .unwrap_or_default();
+        urls.sort_by(|a, b| a.0.cmp(&b.0));
+        urls
+    }
+
+    #[test]
+    fn url_attributes_surrounded_by_whitespace_are_found_without_it() {
+        let processor = HtmlProcessor::new(make_config());
+        let html = "<html><head>\
+            <link rel=\"stylesheet\" href=\" /s.css \">\
+            <script src=\"\t/a.js\n\"></script>\
+            </head><body>\
+            <a href=\" /x\">x</a>\
+            <a href='/y '>y</a>\
+            <a href=\" /inner space.html \">z</a>\
+            <img src=\" /i.png \" srcset=\" /small.jpg 1x, /large.jpg 2x \">\
+            <video src=\" /v.mp4\"></video>\
+            </body></html>";
+        let urls: Vec<String> = found_urls_by_source(&processor, html)
+            .into_iter()
+            .map(|(url, _)| url)
+            .collect();
+        assert_eq!(
+            urls,
+            [
+                "/a.js",
+                "/i.png",
+                "/inner%20space.html",
+                "/large.jpg",
+                "/s.css",
+                "/small.jpg",
+                "/v.mp4",
+                "/x",
+                "/y"
+            ]
+        );
+    }
+
+    #[test]
+    fn link_filters_judge_the_url_without_its_surrounding_whitespace() {
+        // With files disabled, `/doc.pdf ` is a file like `/doc.pdf` (the trailing space used to hide
+        // the extension, and the link was then requested as `/doc.pdf%20`).
+        let mut config = make_config();
+        config.files_enabled = false;
+        let processor = HtmlProcessor::new(config);
+        let html = r#"<a href="/doc.pdf ">doc</a><a href=" /page.html">page</a>"#;
+        assert_eq!(
+            found_urls_by_source(&processor, html),
+            [("/page.html".to_string(), UrlSource::AHref)]
+        );
+    }
+
+    #[test]
+    fn area_href_is_a_link_but_other_tags_starting_with_a_are_not() {
+        let processor = HtmlProcessor::new(make_config());
+        let html = r#"<map name="m"><area shape="rect" coords="0,0,1,1" href="/area-target.html"><AREA HREF="/area-upper.html"></map>
+            <a href="/plain.html">a</a><A class="c" HREF="/upper.html">A</A>
+            <abbr href="/abbr.html">abbr</abbr><article href="/article.html"></article>
+            <address href="/address.html"></address><aside data-x="1" href="/aside.html"></aside>
+            <audio controls href="/audio-href.mp3"></audio><applet href="/applet.html"></applet>"#;
+        assert_eq!(
+            found_urls_by_source(&processor, html),
+            [
+                ("/area-target.html".to_string(), UrlSource::AHref),
+                ("/area-upper.html".to_string(), UrlSource::AHref),
+                ("/plain.html".to_string(), UrlSource::AHref),
+                ("/upper.html".to_string(), UrlSource::AHref),
+            ]
+        );
     }
 
     #[test]

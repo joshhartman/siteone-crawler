@@ -64,7 +64,8 @@ impl ContentProcessor for CssProcessor {
         let mut url_texts: Vec<&str> = Vec::new();
         for caps in RE_CSS_URL.captures_iter(content) {
             if let Some(m) = caps.get(1) {
-                let url = m.as_str();
+                // `url( x )` and `url(" x ")`: the whitespace around the URL is not part of it
+                let url = m.as_str().trim_matches(|c: char| c.is_ascii_whitespace());
                 let is_image = RE_IS_IMAGE.is_match(url);
                 let is_font = RE_IS_FONT.is_match(url);
                 let is_css = RE_IS_CSS.is_match(url);
@@ -170,5 +171,18 @@ mod tests {
         let result = processor.find_urls(css, &source);
         // Should be None because images are disabled
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn css_urls_surrounded_by_whitespace_are_found_without_it() {
+        let processor = CssProcessor::new(make_config());
+        let css = r#"a { background: url( /img/a.png ); } b { background: url(" /img/b.png "); }
+            @font-face { src: url( '/fonts/c.woff2' ), url(	/fonts/d.woff
+            ); }"#;
+        let source = ParsedUrl::parse("https://example.com/style.css", None);
+        let found = processor.find_urls(css, &source).expect("urls found");
+        let mut urls: Vec<&str> = found.get_urls().values().map(|u| u.url.as_str()).collect();
+        urls.sort();
+        assert_eq!(urls, ["/fonts/c.woff2", "/fonts/d.woff", "/img/a.png", "/img/b.png"]);
     }
 }

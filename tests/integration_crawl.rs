@@ -8738,3 +8738,163 @@ fn ai_geo_proposes_no_sitemap_after_links_skipped_for_their_basename() {
     let xml = std::fs::read_to_string(kit.join("sitemap/sitemap.proposed.xml")).expect("the proposed sitemap");
     assert!(xml.contains("/catalog/child</loc>"), "{xml}");
 }
+
+// =========================================================================
+// URL discovery: what is requested, and which page a found URL is reported from
+// =========================================================================
+
+/// Five discovery defects on one site: whitespace around a URL attribute, `<base href>` naming the
+/// source of its links, the queue's check-then-insert race, `<area href>` and lookalike tags, and
+/// non-http schemes with `-`, `+`, `.` or digits.
+#[test]
+fn url_discovery_requests_the_right_urls_and_reports_the_page_they_were_found_on() {
+    let tmp = TempDir::new("url-discovery");
+    let site = tmp.path.join("site");
+    for dir in ["base-dir", "base-host", "race", "shared"] {
+        std::fs::create_dir_all(site.join(dir)).expect("site dir");
+    }
+    let page = |title: &str, body: &str| format!("<html><head><title>{title}</title></head><body>{body}</body></html>");
+    let race_links: String = (1..=20)
+        .map(|n| format!("<a href=\"/race/page-{n}.html\">race {n}</a>"))
+        .collect();
+    let index = page(
+        "Home",
+        &format!(
+            r#"<a href=" /space-target.html ">space</a><script src=" /app.js "></script>
+<a href="android-app://com.example/https/example.com/x">app</a>
+<a href="ms-windows-store://pdp/?productid=X">store</a>
+<a href="fb-messenger://share?link=x">messenger</a>
+<a href="web+app:thing">web+app</a>
+<a href="tel:+15551234567">tel</a>
+<a href="whatsapp://send?text=hi">whatsapp</a>
+<map name="m"><area shape="rect" coords="0,0,9,9" href="/area-target.html" alt="area">
+<area shape="rect" coords="9,9,19,19" href="http://area-external.invalid/x.html" alt="external area"></map>
+<abbr href="/abbr-target.html">abbr</abbr><article href="/article-target.html"></article>
+<address href="/address-target.html"></address>
+<a href="/base-dir/">base dir</a> <a href="/base-host/">base host</a> {race_links}"#
+        ),
+    );
+    std::fs::write(site.join("index.html"), index).expect("index.html");
+    for file in ["space-target.html", "area-target.html", "new.html"] {
+        std::fs::write(site.join(file), page(file, "<p>Target</p>")).expect("target page");
+    }
+    std::fs::write(site.join("app.js"), "console.log(1);").expect("app.js");
+    // <base href> to another directory: a 404 and a redirect resolved against it
+    std::fs::write(
+        site.join("base-dir/index.html"),
+        r#"<html><head><title>Base dir</title><base href="/elsewhere/"></head><body>
+<a href="missing.html">missing</a> <a href="old.html">old</a></body></html>"#,
+    )
+    .expect("base-dir");
+    // <base href> to another host: a link that is skipped (not allowed host)
+    std::fs::write(
+        site.join("base-host/index.html"),
+        r#"<html><head><title>Base host</title><base href="http://base-host.invalid/dir/"></head><body>
+<a href="other.html">other</a></body></html>"#,
+    )
+    .expect("base-host");
+    // Many pages, crawled by many workers, all linking to the same new URLs
+    let shared_links: String = (1..=20)
+        .map(|n| format!("<a href=\"/shared/s-{n}.html\">shared {n}</a>"))
+        .collect();
+    for n in 1..=20 {
+        std::fs::write(site.join(format!("race/page-{n}.html")), page("Race", &shared_links)).expect("race page");
+        std::fs::write(site.join(format!("shared/s-{n}.html")), page("Shared", "<p>Shared</p>")).expect("shared");
+    }
+    let server = RedirectServer::start(
+        &site,
+        vec![Redirect {
+            host: None,
+            path: Some("/elsewhere/old.html"),
+            location: "http://127.0.0.1:{port}/new.html",
+        }],
+    );
+    let base = format!("http://127.0.0.1:{}", server.port());
+    let events = tmp.path.join("events.ndjson");
+
+    let output = run_crawler(&[
+        &format!("--config-file={}", if cfg!(windows) { "NUL" } else { "/dev/null" }),
+        &format!("--url={base}/"),
+        "--output=json",
+        "--workers=10",
+        "--http-cache-dir=",
+        "--analyzer-filter-regex=/Page404|Redirects|SkippedUrls/",
+        &format!("--events-file={}", events.display()),
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("JSON output: {e}\nstderr: {}", String::from_utf8_lossy(&output.stderr)));
+
+    let requested: Vec<String> = std::fs::read_to_string(&events)
+        .expect("the event file")
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("one JSON event per line"))
+        .filter(|event| event["type"] == "url")
+        .map(|event| event["url"].as_str().unwrap_or_default().to_string())
+        .collect();
+    let was_requested = |path: &str| requested.iter().any(|url| *url == format!("{base}{path}"));
+
+    // 1. Whitespace around a URL attribute is not part of the URL
+    assert!(was_requested("/space-target.html"), "{requested:#?}");
+    assert!(was_requested("/app.js"), "{requested:#?}");
+    assert!(!requested.iter().any(|url| url.contains("%20")), "{requested:#?}");
+
+    // 2. <base href> resolves the links of base-dir/base-host, which stay their source
+    assert!(was_requested("/elsewhere/missing.html"), "{requested:#?}");
+    assert!(was_requested("/elsewhere/old.html"), "{requested:#?}");
+    let rows = |table: &str| json["tables"][table]["rows"].as_array().cloned().unwrap_or_default();
+    let row = |table: &str, url: &str| {
+        rows(table)
+            .into_iter()
+            .find(|row| row["url"].as_str() == Some(url))
+            .unwrap_or_else(|| panic!("{url} in the {table} table: {:#?}", json["tables"][table]))
+    };
+    let base_dir_page = format!("{base}/base-dir/");
+    assert_eq!(
+        row("404", &format!("{base}/elsewhere/missing.html"))["sourceUqId"],
+        base_dir_page
+    );
+    assert_eq!(
+        row("redirects", &format!("{base}/elsewhere/old.html"))["sourceUqId"],
+        base_dir_page
+    );
+    // (the skipped table shows a source on the crawled host without scheme and host)
+    let skipped = row("skipped", "http://base-host.invalid/dir/other.html");
+    assert_eq!(skipped["sourceUqId"], "/base-host/");
+
+    // 3. Every URL is requested once, however many pages and workers find it at the same time
+    let mut counts = std::collections::HashMap::new();
+    for url in &requested {
+        *counts.entry(url.as_str()).or_insert(0) += 1;
+    }
+    let twice: Vec<_> = counts.iter().filter(|(_, n)| **n > 1).collect();
+    assert!(twice.is_empty(), "requested more than once: {twice:?}");
+    assert!(
+        (1..=20).all(|n| was_requested(&format!("/shared/s-{n}.html"))),
+        "{requested:#?}"
+    );
+
+    // 4. <area href> is a link (labelled `<a href>`); <abbr>, <article>, <address> are not
+    assert!(was_requested("/area-target.html"), "{requested:#?}");
+    let area = row("skipped", "http://area-external.invalid/x.html");
+    assert_eq!(area["sourceAttr"], "<a href>");
+    assert_eq!(area["sourceUqId"], "/");
+    for path in ["/abbr-target.html", "/article-target.html", "/address-target.html"] {
+        assert!(!was_requested(path), "{path}: {requested:#?}");
+    }
+
+    // 5. Non-http schemes are never requested as relative paths
+    for scheme in [
+        "android-app",
+        "ms-windows-store",
+        "fb-messenger",
+        "web+app",
+        "tel:",
+        "whatsapp",
+    ] {
+        assert!(
+            !requested.iter().any(|url| url.contains(scheme)),
+            "{scheme}: {requested:#?}"
+        );
+    }
+}

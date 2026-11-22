@@ -120,6 +120,9 @@ impl std::fmt::Display for FoundUrl {
 /// Normalize URL and remove strange characters/behavior.
 /// Remove unwanted http(s)://SAME_DOMAIN:SAME_OPTIONAL_PORT prefix when it matches the source URL.
 fn normalize_url(url: &str, source_url: &str) -> String {
+    // An HTML attribute URL may be surrounded by ASCII whitespace that is not part of it ("valid URL
+    // potentially surrounded by spaces"): strip it first, or ` /x` would become `%20/x`.
+    let url = url.trim_matches(|c: char| c.is_ascii_whitespace());
     // Replace HTML entities and escape sequences
     let mut normalized = url
         .replace("&#38;", "&")
@@ -176,6 +179,22 @@ mod tests {
     fn test_normalize_url_spaces() {
         let found = FoundUrl::new("/path with spaces", "https://example.com/", UrlSource::AHref);
         assert_eq!(found.url, "/path%20with%20spaces");
+    }
+
+    #[test]
+    fn normalize_url_strips_whitespace_around_the_url_before_encoding_spaces() {
+        // HTML: "valid URL potentially surrounded by spaces": the surrounding ASCII whitespace is
+        // not part of the URL, so ` /x` is `/x`, never `%20/x`. Inner spaces stay encoded.
+        for (raw, expected) in [
+            (" /x", "/x"),
+            ("/x ", "/x"),
+            ("  /x  ", "/x"),
+            ("\t\r\n\x0C /a b.html \n", "/a%20b.html"),
+            (" https://other.test/p ", "https://other.test/p"),
+        ] {
+            let found = FoundUrl::new(raw, "https://example.com/", UrlSource::AHref);
+            assert_eq!(found.url, expected, "{raw:?}");
+        }
     }
 
     #[test]
