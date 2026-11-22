@@ -9336,3 +9336,70 @@ fn links_with_a_mistyped_http_scheme_are_reported_and_never_requested() {
         );
     }
 }
+
+/// Every `url()` of a stylesheet is a file the browser loads, whatever its extension: a missing
+/// one is requested and reported. Without a known extension it counts as an image.
+#[test]
+fn stylesheet_url_without_an_extension_is_requested_unless_images_are_disabled() {
+    let site = || {
+        RecordingServer::start(vec![
+            Route {
+                path: "/",
+                headers: vec![("Content-Type", "text/html; charset=utf-8".to_string())],
+                body: br#"<html><head><title>Home</title><link rel="stylesheet" href="/style.css"></head><body>x</body></html>"#.to_vec(),
+            },
+            Route {
+                path: "/style.css",
+                headers: vec![("Content-Type", "text/css".to_string())],
+                body: b"body{background:url(/missing/pattern)}".to_vec(),
+            },
+        ])
+    };
+    let crawl = |server: &RecordingServer, extra: &[&str]| -> serde_json::Value {
+        let url = format!("--url={}", server.url());
+        let mut args = vec![
+            NO_CONFIG_FILE,
+            &url,
+            "--output=json",
+            "--analyzer-filter-regex=/Page404/",
+            "--http-cache-dir=",
+            "--output-html-report=",
+            "--output-json-file=",
+            "--output-text-file=",
+        ];
+        args.extend_from_slice(extra);
+        let output = run_crawler(&args);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).expect("JSON on stdout")
+    };
+    let requested = |server: &RecordingServer, path: &str| {
+        server
+            .requests()
+            .iter()
+            .any(|head| head.starts_with(&format!("GET {path} ")))
+    };
+
+    let server = site();
+    let json = crawl(&server, &[]);
+    assert!(requested(&server, "/missing/pattern"), "{:#?}", server.requests());
+    let missing = format!("{}missing/pattern", server.url());
+    assert!(
+        json["tables"]["404"]["rows"]
+            .as_array()
+            .expect("the 404 table")
+            .iter()
+            .any(|row| row["url"] == missing.as_str()),
+        "{:#?}",
+        json["tables"]["404"]
+    );
+
+    let server = site();
+    crawl(&server, &["--disable-images"]);
+    assert!(requested(&server, "/style.css"), "{:#?}", server.requests());
+    assert!(!requested(&server, "/missing/pattern"), "{:#?}", server.requests());
+}

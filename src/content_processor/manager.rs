@@ -60,7 +60,7 @@ impl ContentProcessorManager {
         for processor in &self.processors {
             if processor.is_content_type_relevant(content_type) {
                 let start = Instant::now();
-                let found_urls = processor.find_urls(content, url);
+                let found_urls = processor.find_urls_for_content_type(content, content_type, url);
                 self.stats.measure_exec_time(processor.get_name(), "findUrls", start);
 
                 if let Some(urls) = found_urls

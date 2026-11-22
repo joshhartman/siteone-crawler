@@ -12,6 +12,18 @@ pub trait ContentProcessor: Send + Sync {
     /// Parse and find framework specific URLs in HTML/CSS/JS
     fn find_urls(&self, content: &str, source_url: &ParsedUrl) -> Option<FoundUrls>;
 
+    /// Like `find_urls`, for content of `content_type` (a processor may handle several types).
+    /// The manager calls this. Default implementation delegates to find_urls; only
+    /// CssProcessor overrides this, to find every `url()` of a stylesheet.
+    fn find_urls_for_content_type(
+        &self,
+        content: &str,
+        _content_type: ContentTypeId,
+        source_url: &ParsedUrl,
+    ) -> Option<FoundUrls> {
+        self.find_urls(content, source_url)
+    }
+
     /// Apply content changes for HTML/CSS/JS before URL parsing,
     /// directly modifying the content string.
     /// Called by manager only if is_content_type_relevant() returns true.

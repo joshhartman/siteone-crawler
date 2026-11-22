@@ -54,10 +54,11 @@ impl CssProcessor {
 
         result
     }
-}
 
-impl ContentProcessor for CssProcessor {
-    fn find_urls(&self, content: &str, source_url: &ParsedUrl) -> Option<FoundUrls> {
+    /// The `url()` references of `content`. In a stylesheet (`every_url`) each one is a file the
+    /// browser loads; one without an image, font or CSS extension counts as an image. In HTML,
+    /// where the pattern also matches script and text, only those with such an extension are kept.
+    fn find_css_urls(&self, content: &str, source_url: &ParsedUrl, every_url: bool) -> Option<FoundUrls> {
         let source_url_str = source_url.get_full_url(true, false);
 
         // Find all url() references in CSS
@@ -66,9 +67,21 @@ impl ContentProcessor for CssProcessor {
             if let Some(m) = caps.get(1) {
                 // `url( x )` and `url(" x ")`: the whitespace around the URL is not part of it
                 let url = m.as_str().trim_matches(|c: char| c.is_ascii_whitespace());
-                let is_image = RE_IS_IMAGE.is_match(url);
+                if url.is_empty() {
+                    continue;
+                }
                 let is_font = RE_IS_FONT.is_match(url);
                 let is_css = RE_IS_CSS.is_match(url);
+                if !is_font && !is_css && !RE_IS_IMAGE.is_match(url) {
+                    // Not a file to load: `url(var(--x))` is an invalid token, which browsers
+                    // ignore, and `@namespace url(…)` only names an XML namespace.
+                    let statement = content[..m.start()].rsplit([';', '{', '}']).next().unwrap_or("");
+                    let is_namespace = statement.trim_start().to_ascii_lowercase().starts_with("@namespace");
+                    if !every_url || url.contains('(') || is_namespace {
+                        continue;
+                    }
+                }
+                let is_image = !is_font && !is_css;
 
                 if (self.config.images_enabled && is_image)
                     || (self.config.fonts_enabled && is_font)
@@ -84,6 +97,21 @@ impl ContentProcessor for CssProcessor {
         } else {
             None
         }
+    }
+}
+
+impl ContentProcessor for CssProcessor {
+    fn find_urls(&self, content: &str, source_url: &ParsedUrl) -> Option<FoundUrls> {
+        self.find_css_urls(content, source_url, false)
+    }
+
+    fn find_urls_for_content_type(
+        &self,
+        content: &str,
+        content_type: ContentTypeId,
+        source_url: &ParsedUrl,
+    ) -> Option<FoundUrls> {
+        self.find_css_urls(content, source_url, content_type == ContentTypeId::Stylesheet)
     }
 
     fn apply_content_changes_before_url_parsing(
@@ -181,6 +209,51 @@ mod tests {
         let result = processor.find_urls(css, &source);
         // Should be None because images are disabled
         assert!(result.is_none());
+    }
+
+    fn sorted_urls(found: Option<FoundUrls>) -> Vec<String> {
+        let mut urls: Vec<String> = found
+            .map(|found| found.get_urls().values().map(|u| u.url.clone()).collect())
+            .unwrap_or_default();
+        urls.sort();
+        urls
+    }
+
+    #[test]
+    fn every_url_of_a_stylesheet_is_found_but_html_keeps_the_extension_filter() {
+        let processor = CssProcessor::new(make_config());
+        let css = "a{background:url(bg/pattern)} b{background:url('/img?id=3')} c{cursor:url(x.cur),auto} \
+                   d{background:url(data:image/png;base64,AAAA)} e{fill:url(#frag)} f{background:url(about:blank)} \
+                   g{background:url(/a.png)} h{background:url(var(--x))} \
+                   @namespace svg url(http://www.w3.org/2000/svg); @NAMESPACE url(http://www.w3.org/1999/xhtml);";
+        let source = ParsedUrl::parse("https://example.com/css/style.css", None);
+        assert_eq!(
+            sorted_urls(processor.find_urls_for_content_type(css, ContentTypeId::Stylesheet, &source)),
+            ["/a.png", "/img?id=3", "bg/pattern", "x.cur"]
+        );
+
+        let html = format!(
+            "<html><head><style>{css}</style><script>var u = new URL(location.href);</script></head>\
+             <body><div style=\"background:url(bg/inline)\"></div><p>Use url(path-in-prose) in CSS.</p></body></html>"
+        );
+        let page = ParsedUrl::parse("https://example.com/", None);
+        assert_eq!(
+            sorted_urls(processor.find_urls_for_content_type(&html, ContentTypeId::Html, &page)),
+            ["/a.png"]
+        );
+    }
+
+    #[test]
+    fn a_stylesheet_url_without_a_known_extension_counts_as_an_image() {
+        let mut config = make_config();
+        config.images_enabled = false;
+        let processor = CssProcessor::new(config);
+        let css = "a{background:url(bg/pattern)} @font-face{src:url(/f.woff2)}";
+        let source = ParsedUrl::parse("https://example.com/style.css", None);
+        assert_eq!(
+            sorted_urls(processor.find_urls_for_content_type(css, ContentTypeId::Stylesheet, &source)),
+            ["/f.woff2"]
+        );
     }
 
     #[test]
