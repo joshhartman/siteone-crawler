@@ -16,6 +16,12 @@ readme = "README.md"
 name = "siteone-crawler"
 path = "src/main.rs"
 
+# The desktop GUI (`gui/`) shares the lock file and target dir. `default-members` keeps plain
+# `cargo build/test/clippy` at the root on the crawler only.
+[workspace]
+members = [".", "gui"]
+default-members = ["."]
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.13", features = ["gzip", "brotli", "deflate", "rustls", "socks", "cookies", "stream", "blocking", "multipart"] }

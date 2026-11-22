@@ -1,0 +1,62 @@
+[package]
+name = "siteone-crawler-gui"
+version = "0.1.0"
+edition = "2024"
+# eframe/egui 0.37 need Rust 1.95; the toolchain is pinned to 1.96.0 by rust-toolchain.toml.
+rust-version = "1.95"
+description = "Native desktop GUI for the SiteOne Crawler CLI"
+license = "MIT"
+publish = false
+
+[lib]
+name = "siteone_crawler_gui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "siteone-crawler-gui"
+path = "src/main.rs"
+
+# Never enable a feature on a dependency shared with the crawler that would change the crawler
+# when both are built together — in particular never `serde_json/preserve_order` (GUI-SPEC §2).
+[dependencies]
+# Default features (incl. `browser`): option validation must accept `--browser` exactly like the
+# released crawler binary does.
+siteone-crawler = { path = ".." }
+eframe = "0.37"
+egui_extras = { version = "0.37", default-features = false }
+egui_material_icons = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rfd = "0.18"
+keyring = "4.2"
+dirs = "6"
+open = "5"
+chrono = "0.4"
+shlex = "2"
+url = "2"
+# The external link check (backend/link_check.rs). Only features the crawler already enables on
+# these crates (reqwest: default + blocking + rustls; rustls: ring), so building both together
+# changes nothing in the crawler. `rustls` is named for the `ring` provider the process installs
+# (as the crawler's main.rs does) and to recognise TLS errors.
+reqwest = { version = "0.13", features = ["blocking", "rustls"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+# Link texts (backend/link_text.rs): parses the source pages, as the crawler's own HTML parser does.
+scraper = "0.27"
+
+# The crawler's process tree in a kill-on-close Job Object; ShellExecuteW (backend/runner.rs, shell.rs).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[dev-dependencies]
+egui_kittest = { version = "0.37", features = ["wgpu", "snapshot"] }
+tempfile = "3"
+# The regex engine of the crawler's `--ignore-regex` (same spec as the crawler's), for the tests of
+# the action-link patterns.
+fancy-regex = "0.18"

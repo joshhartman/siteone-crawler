@@ -1,0 +1,3 @@
+/tmp/
+# Written on every test run; machine-dependent (GPU, fonts).
+/tests/snapshots/
