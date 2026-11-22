@@ -1,11 +1,33 @@
+# Temporary and working dirs
 /target
 /tmp/
 /dist/
 /plans/
-/docs/superpowers/
-*.swp
-*.swo
 *~
+*.cache
+
+# Editor / IDE
 .idea/
 .vscode/
-*.cache
+*.swp
+*.swo
+
+# Other
+/docs/superpowers/
+
+# Coding agents
+.claude/
+CLAUDE.local.md
+.opencode/
+.junie/
+.codex/
+.gemini/
+.cursor/
+.windsurf/
+.continue/
+.cline/
+.roo/
+.kiro/
+.amazonq/
+.aider*
+.specstory/
