@@ -887,9 +887,17 @@ crawl's outcome, which does not wait for the check.
   newest answer (and its title), a queued one the queue mark of the Link checker tab; filters and
   counts use the newest answers. Must stay fluid with 100 000 rows.
 - **Link checker.** Every crawled URL that answered 4xx/5xx or failed without an answer (negative
-  status), classified by the extension of its path into *Internal pages* and *Internal assets*
-  (an older run that crawled external URLs keeps its broken ones as *External*), with the kind
-  (page, image, stylesheet, script, font, document, other); and the external links of the app's
+  status), classified into *Internal pages* and *Internal assets* (an older run that crawled
+  external URLs keeps its broken ones as *External*) by its kind (page, image, stylesheet, script,
+  font, document, other). The kind comes from how the URL is referenced — the `sourceAttr` of the
+  `url` event and of every `links` row (§4.8): the first reference that embeds it decides
+  (`<img src>`, `<img srcset>`, `<input src>` an image, `<script src>` a script, `<video src>`,
+  `<audio src>`, `<source src>` the extension's kind but never a page, `css url()` a font or an
+  `@import`ed stylesheet by the extension, else an image, `<link href>` the extension's kind
+  unless that is a page); links (`<a href>`), script URLs, redirects, sitemaps, URL lists and runs
+  without link data leave it to the extension of the path. Kind's tooltip then says "Image,
+  referenced by `<img src>`", as does the link report's *title or kind*. The kind is set as each
+  URL arrives and again when the `links` table is loaded; and the external links of the app's
   check (§4.7) that are broken or refused, with the status in words ("Refused 403", "404",
   "Connection failed", "Timeout", "TLS error", "Too many redirects"). *Found on* comes from the
   crawler for crawled URLs of every status — the `url` event's page as the URL arrives, then every

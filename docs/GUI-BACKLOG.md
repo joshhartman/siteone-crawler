@@ -70,12 +70,16 @@ crawler as it is. Each entry says what the GUI does instead today.
    stay as the crawl wrote them until the site is crawled again (the HTTP cache makes that cheap;
    see 9 for the retried answers it does not carry over).
 
-6. **Content type of a failed asset.** A missing image is reported with `contentType` "HTML"
-   (the server's 404 page).
-   *Today:* the GUI classifies pages and assets by the URL's file extension. With link data the
-   `sourceAttr` of the referrers could decide instead (`<img src>` → image, `<script src>` →
-   script, `<link href>` → stylesheet or other, `css url()` → image or font, `<a href>` → page or
-   download); the extension would still be needed for `<a href>` to a file and for `<link href>`.
+6. **Content type of a failed asset.** *Done in the GUI.* The crawler still reports a missing
+   image with `contentType` "HTML" (the server's 404 page). The Link checker and the app's link
+   report take the kind from the `sourceAttr` of every known reference (the `url` event's first,
+   then each `links` row): the first that embeds the URL decides (`<img src>`, `<img srcset>`,
+   `<input src>` → image; `<script src>` → script; `<video src>`, `<audio src>`, `<source src>`
+   → the extension's kind, never a page; `css url()` → font, `@import`ed stylesheet or image;
+   `<link href>` → the extension's kind unless that is a page). Links, script URLs, redirects,
+   sitemaps, URL lists and runs without link data keep the extension rule. The Kind cell's tooltip
+   and the report's *Title or kind* say "Image, referenced by `<img src>`" when the reference
+   decided.
 
 ## Coverage
 
@@ -106,6 +110,25 @@ crawler as it is. Each entry says what the GUI does instead today.
     - `url(" /x.png")` with whitespace inside the quotes in an inline `<style>` is not found.
     - `href = "…"` with spaces around `=` is not found.
     - The `queue + visited` limit checks are not atomic, so the URL limits are approximate.
+
+18. **Broken links the crawler does not report** (read in the code, not tested by a crawl):
+    - *Non-breaking space around a URL.* `Crawler` trims all Unicode whitespace from a found URL
+      before queueing it (`found_url.url.trim()`), so a literal U+00A0 before `/x` is removed and
+      `/x` is requested. A browser strips only ASCII whitespace and control characters, keeps the
+      non-breaking space and requests `%C2%A0/x`, which fails. Trimming ASCII whitespace only, as
+      `found_url::normalize_url` and the HTML processor do, would report it.
+    - *Mistyped scheme.* `found_urls::is_url_valid_for_crawling` drops every link whose scheme is
+      not http(s), so `htp://example.com/` is skipped silently like `mailto:` and `tel:`, although
+      a visitor who clicks it gets an error. Reporting it needs a list of known schemes (`mailto:`,
+      `tel:`, `sms:`, `javascript:`, `data:`, `blob:`, `ftp:`, app schemes with a hyphen, `+` or
+      `.`); a link with any other scheme would be recorded as skipped with its own reason, which
+      the Link checker could list as broken.
+    - *A stylesheet `url()` without a known extension.* The CSS processor keeps a `url()` only
+      when it ends in an image, font or `.css` extension (`RE_IS_IMAGE`, `RE_IS_FONT`,
+      `RE_IS_CSS` in `css_processor.rs`), so `url(bg/pattern)`, `url(/img?id=3)` or a `.mp4`,
+      `.cur` or `.jxl` file is never requested and a missing one is not reported (seen in a crawl
+      of a local test site). A `url()` in a stylesheet is always a file the browser loads, so
+      every one that is not `data:` or a `#fragment` could be requested.
 
 ## Requests
 

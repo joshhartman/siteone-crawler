@@ -39,7 +39,7 @@ use egui_material_icons::icons;
 use super::{CheckStatus, RunAction, RunView, padded};
 use crate::model::coverage::{self, Gap, GapInput};
 use crate::model::link_check::{LinkResult, Outcome, OutcomeCounts, classify_status};
-use crate::model::link_data::{LinkGraph, Referrer, TargetRefs, text_on};
+use crate::model::link_data::{CrawlerRef, LinkGraph, Referrer, TargetRefs, text_on};
 use crate::model::link_report::group_by_page;
 use crate::model::link_text::{LinkTexts, RefPosition, TextLookup};
 use crate::model::results::{ResultData, ResultLoad};
@@ -102,8 +102,8 @@ pub fn site_host(url: &str) -> Option<String> {
     Some(host.strip_prefix("www.").map(str::to_string).unwrap_or(host))
 }
 
-/// What a broken URL points to, read from the extension of its path (the reported content type
-/// is the error page's, `HTML`, for a missing image).
+/// What a broken URL points to, read from how it is referenced, else from the extension of its
+/// path (the reported content type is the error page's, `HTML`, for a missing image).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum LinkKind {
     Page,
@@ -160,11 +160,58 @@ pub fn link_kind(url: &str) -> LinkKind {
     }
 }
 
-/// Where a broken URL lives and what it points to: External when its host differs from the start
-/// URL's `site` host (`www.` aside); otherwise an internal asset when its path has a non-page
-/// extension, else an internal page.
-pub fn classify(url: &str, site: Option<&str>) -> (Where, LinkKind) {
-    let kind = link_kind(url);
+/// The kind of a URL from the `sourceAttr` of its known references (in their stored order), else
+/// from its extension ([`link_kind`]). The first reference that embeds the URL decides:
+/// `<img src>`, `<img srcset>` and `<input src>` an image, `<script src>` a script, `<video src>`,
+/// `<audio src>` and `<source src>` the extension's kind but never a page (other), `css url()` a
+/// font or an `@import`ed stylesheet by the extension, else an image, `<link href>` the
+/// extension's kind unless that is a page. A link (`<a href>`), a script's URL, a redirect, a
+/// sitemap, a URL list or an unknown attribute leave it to the extension. Also returns the
+/// attribute that decided (`None` when the extension did).
+pub fn kind_of<'a>(url: &str, attrs: impl IntoIterator<Item = &'a str>) -> (LinkKind, Option<&'a str>) {
+    let by_extension = link_kind(url);
+    for attr in attrs {
+        let kind = match attr {
+            "<img src>" | "<img srcset>" | "<input src>" => LinkKind::Image,
+            "<script src>" => LinkKind::Script,
+            "<video src>" | "<audio src>" | "<source src>" if by_extension == LinkKind::Page => LinkKind::Other,
+            "<video src>" | "<audio src>" | "<source src>" => by_extension,
+            "css url()" if matches!(by_extension, LinkKind::Font | LinkKind::Stylesheet) => by_extension,
+            "css url()" => LinkKind::Image,
+            "<link href>" if by_extension != LinkKind::Page => by_extension,
+            _ => continue,
+        };
+        return (kind, Some(attr));
+    }
+    (by_extension, None)
+}
+
+/// The `sourceAttr` of every known reference to a URL: its `url` event's first, then every kept
+/// referrer of the crawler's `links` table.
+pub fn reference_attrs<'a>(
+    link: Option<&'a CrawlerRef>,
+    refs: Option<&'a TargetRefs>,
+) -> impl Iterator<Item = &'a str> {
+    link.into_iter()
+        .chain(refs.into_iter().flat_map(|refs| &refs.refs))
+        .map(|reference| &*reference.attr)
+}
+
+/// The kind with the reference that decided it ("Image, referenced by <img src>"); `None` when the
+/// extension decided.
+pub fn referenced_by(kind: LinkKind, attr: Option<&str>) -> Option<String> {
+    attr.map(|attr| format!("{}, referenced by {attr}", kind.label()))
+}
+
+/// Where a broken URL lives and what it points to ([`kind_of`], with the attribute that decided):
+/// External when its host differs from the start URL's `site` host (`www.` aside); otherwise an
+/// internal page when it is a page, else an internal asset.
+pub fn classify<'a>(
+    url: &str,
+    attrs: impl IntoIterator<Item = &'a str>,
+    site: Option<&str>,
+) -> (Where, LinkKind, Option<&'a str>) {
+    let (kind, attr) = kind_of(url, attrs);
     let external = matches!((site, site_host(url).as_deref()), (Some(site), Some(host)) if site != host);
     let place = if external {
         Where::External
@@ -173,7 +220,7 @@ pub fn classify(url: &str, site: Option<&str>) -> (Where, LinkKind) {
     } else {
         Where::InternalAsset
     };
-    (place, kind)
+    (place, kind, attr)
 }
 
 /// The broken URL rows of a run (and the queued ones), collected as rows arrive.
@@ -187,6 +234,9 @@ pub struct BrokenIndex {
     pub sources_reported: bool,
     scanned: usize,
     site: Option<String>,
+    /// Built with the crawler's `links` table (it arrives with the result: every row is then
+    /// classified again by all its references).
+    graph: bool,
     /// The revisions of the rows and of the retries the index was built for.
     revisions: (u64, u64),
 }
@@ -194,11 +244,23 @@ pub struct BrokenIndex {
 impl BrokenIndex {
     /// Brings the index up to date with `rows`; `revision` is theirs (a retry changes rows in
     /// place).
-    pub fn sync(&mut self, rows: &[UrlRow], site: Option<&str>, retries: &RetryState, revision: u64) {
+    pub fn sync(
+        &mut self,
+        rows: &[UrlRow],
+        site: Option<&str>,
+        graph: Option<&LinkGraph>,
+        retries: &RetryState,
+        revision: u64,
+    ) {
         let revisions = (revision, retries.revision);
-        if self.site.as_deref() != site || rows.len() < self.scanned || self.revisions != revisions {
+        if self.site.as_deref() != site
+            || self.graph != graph.is_some()
+            || rows.len() < self.scanned
+            || self.revisions != revisions
+        {
             *self = Self {
                 site: site.map(str::to_string),
+                graph: graph.is_some(),
                 revisions,
                 ..Self::default()
             };
@@ -209,7 +271,8 @@ impl BrokenIndex {
             if (broken || retries.is_queued(&row.url))
                 && let Ok(index) = u32::try_from(index)
             {
-                let (place, kind) = classify(&row.url, site);
+                let refs = graph.and_then(|graph| graph.target(&row.url));
+                let (place, kind, _) = classify(&row.url, reference_attrs(row.link.as_deref(), refs), site);
                 if broken && let Some(count) = self.counts.get_mut(place.slot()) {
                     *count += 1;
                 }
@@ -334,7 +397,15 @@ impl<'a> Item<'a> {
     fn kind(&self) -> LinkKind {
         match self {
             Item::Crawled { kind, .. } => *kind,
-            Item::Link(link, _) => link_kind(&link.url),
+            Item::Link(..) => self.kind_and_attr().0,
+        }
+    }
+
+    /// The kind and the reference attribute that decided it (`None` when the extension did).
+    fn kind_and_attr(&self) -> (LinkKind, Option<&'a str>) {
+        match self {
+            Item::Crawled { row, refs, .. } => kind_of(&row.url, reference_attrs(row.link.as_deref(), *refs)),
+            Item::Link(link, refs) => kind_of(&link.url, reference_attrs(None, *refs)),
         }
     }
 
@@ -474,7 +545,7 @@ pub struct BrokenView {
     rows: Vec<RowRef>,
     scanned: usize,
     scanned_links: usize,
-    built_for: Option<(BrokenFilter, BrokenSort, bool, bool, usize)>,
+    built_for: Option<(BrokenFilter, BrokenSort, bool, u8, usize)>,
     /// The revisions of the rows and the retries the rows were built for.
     built_revisions: (u64, u64),
     pub rebuilds: u64,
@@ -580,8 +651,9 @@ impl BrokenView {
     }
 
     fn sync(&mut self, context: &Context<'_>, filter: &BrokenFilter, sort: BrokenSort, ascending: bool) {
-        // The result's joins (the `404` table, the crawler's `links` table) arrive together.
-        let joined = context.found_on.is_some() || context.graph.is_some();
+        // How many of the result's joins have arrived (the `404` table, and the crawler's `links`
+        // table, which may classify rows again; each arrives once, maybe in different frames).
+        let joined = u8::from(context.found_on.is_some()) + u8::from(context.graph.is_some());
         // New link texts change what the filter and the sort see.
         let texts = context.texts.pages.len();
         let total = context.entries.len();
@@ -887,8 +959,13 @@ impl BrokenUi {
             .unwrap_or(view.url);
         let site = site_host(site);
         let retries = view.retry.state;
-        self.index
-            .sync(&view.state.urls, site.as_deref(), retries, view.state.revision);
+        self.index.sync(
+            &view.state.urls,
+            site.as_deref(),
+            view.links.graph,
+            retries,
+            view.state.revision,
+        );
         if self.found_on.is_none()
             && let Some(data) = view.data()
         {
@@ -1652,9 +1729,7 @@ fn broken_table(ui: &mut Ui, view: &RunView<'_>, broken: &mut BrokenUi, actions:
                         } else {
                             row.col(|ui| match scope {
                                 Scope::RetryQueue => retry::state_cell(ui, &view.retry, item.url()),
-                                _ => {
-                                    ui.label(RichText::new(item.kind().label()).color(p.text));
-                                }
+                                _ => kind_cell(ui, &item),
                             });
                             row.col(|ui| {
                                 let place = item.place();
@@ -1832,9 +1907,7 @@ fn page_table(ui: &mut Ui, view: &RunView<'_>, broken: &mut BrokenUi, actions: &
                                     }
                                     retry::mark(ui, &view.retry, item.url());
                                 });
-                                row.col(|ui| {
-                                    ui.label(RichText::new(item.kind().label()).color(p.text));
-                                });
+                                row.col(|ui| kind_cell(ui, &item));
                                 row.col(|ui| {
                                     let place = item.place();
                                     let color = if place == Where::External { p.info } else { p.text };
@@ -1985,6 +2058,16 @@ fn title_cell(ui: &mut Ui, item: &Item<'_>) {
             ui.label(widgets::weak(ui, "crawled"))
                 .on_hover_text("Crawled by an older version of the external link check.");
         }
+    }
+}
+
+/// The kind; how the URL is referenced in the tooltip when that decided it.
+fn kind_cell(ui: &mut Ui, item: &Item<'_>) {
+    let p = theme::palette(ui);
+    let (kind, attr) = item.kind_and_attr();
+    let response = ui.label(RichText::new(kind.label()).color(p.text));
+    if let Some(tip) = referenced_by(kind, attr) {
+        response.on_hover_text(tip);
     }
 }
 
@@ -2241,6 +2324,8 @@ fn is_stylesheet(url: &str) -> bool {
 mod tests {
     use super::*;
 
+    use std::sync::Arc;
+
     use crate::model::link_check::Failure;
     use crate::model::run_state::ContentKind;
 
@@ -2265,36 +2350,216 @@ mod tests {
         let site = site_host("http://127.0.0.1:8911/");
         let site = site.as_deref();
         assert_eq!(
-            classify("http://127.0.0.1:8911/img/missing-background.jpg", site),
-            (Where::InternalAsset, LinkKind::Image)
+            classify("http://127.0.0.1:8911/img/missing-background.jpg", [], site),
+            (Where::InternalAsset, LinkKind::Image, None)
         );
         assert_eq!(
-            classify("http://127.0.0.1:8911/missing-page.html", site),
-            (Where::InternalPage, LinkKind::Page)
+            classify("http://127.0.0.1:8911/missing-page.html", [], site),
+            (Where::InternalPage, LinkKind::Page, None)
         );
         assert_eq!(
-            classify("http://127.0.0.1:8911/practice_areas/agricultural-law/", site),
-            (Where::InternalPage, LinkKind::Page)
+            classify("http://127.0.0.1:8911/practice_areas/agricultural-law/", [], site),
+            (Where::InternalPage, LinkKind::Page, None)
         );
         assert_eq!(
-            classify("https://example.com/missing-external-bg.png", site),
-            (Where::External, LinkKind::Image)
+            classify("https://example.com/missing-external-bg.png", [], site),
+            (Where::External, LinkKind::Image, None)
         );
         assert_eq!(
-            classify("http://dead-domain.invalid/page", site),
-            (Where::External, LinkKind::Page)
+            classify("http://dead-domain.invalid/page", [], site),
+            (Where::External, LinkKind::Page, None)
         );
         // www. and the bare host are one site; the query and fragment do not count.
         let site = site_host("https://www.example.com/");
         assert_eq!(
-            classify("https://example.com/css/site.css?v=3#x", site.as_deref()),
-            (Where::InternalAsset, LinkKind::Stylesheet)
+            classify("https://example.com/css/site.css?v=3#x", [], site.as_deref()),
+            (Where::InternalAsset, LinkKind::Stylesheet, None)
         );
         assert_eq!(link_kind("https://example.com/fonts/a.woff2"), LinkKind::Font);
         assert_eq!(link_kind("https://example.com/docs/terms.pdf"), LinkKind::Document);
         assert_eq!(link_kind("https://example.com/app.mjs"), LinkKind::Script);
         assert_eq!(link_kind("https://example.com/archive.zip"), LinkKind::Other);
         assert_eq!(link_kind("https://example.com/index.php?id=4"), LinkKind::Page);
+    }
+
+    #[test]
+    fn the_reference_decides_the_kind_before_the_extension() {
+        let kind = |url: &str, attr: &'static str| kind_of(url, [attr]);
+        let bare = "https://example.com/media/logo";
+        // Embedding references decide, whatever the extension says.
+        for attr in ["<img src>", "<img srcset>", "<input src>"] {
+            assert_eq!(kind(bare, attr), (LinkKind::Image, Some(attr)), "{attr}");
+            assert_eq!(kind("https://example.com/x.php", attr), (LinkKind::Image, Some(attr)));
+        }
+        assert_eq!(kind(bare, "<script src>"), (LinkKind::Script, Some("<script src>")));
+        // Media: the extension's kind, but never a page.
+        for attr in ["<video src>", "<audio src>", "<source src>"] {
+            assert_eq!(kind(bare, attr), (LinkKind::Other, Some(attr)), "{attr}");
+            assert_eq!(kind("https://example.com/v.html", attr), (LinkKind::Other, Some(attr)));
+            assert_eq!(kind("https://example.com/v.mp4", attr), (LinkKind::Other, Some(attr)));
+            assert_eq!(kind("https://example.com/p.webp", attr), (LinkKind::Image, Some(attr)));
+        }
+        // A stylesheet's url(): a font, an @import, else an image.
+        let css = "css url()";
+        assert_eq!(kind("https://example.com/f.woff2", css), (LinkKind::Font, Some(css)));
+        assert_eq!(
+            kind("https://example.com/more.css", css),
+            (LinkKind::Stylesheet, Some(css))
+        );
+        assert_eq!(kind(bare, css), (LinkKind::Image, Some(css)));
+        assert_eq!(kind("https://example.com/x.pdf", css), (LinkKind::Image, Some(css)));
+        // <link href>: the extension, unless it gives a page (then the extension rule as before).
+        let link = "<link href>";
+        assert_eq!(
+            kind("https://example.com/s.css", link),
+            (LinkKind::Stylesheet, Some(link))
+        );
+        assert_eq!(kind("https://example.com/i.ico", link), (LinkKind::Image, Some(link)));
+        assert_eq!(kind(bare, link), (LinkKind::Page, None));
+        assert_eq!(
+            kind("https://example.com/feed.xml", link),
+            (LinkKind::Other, Some(link))
+        );
+        // Links, scripts' URLs, redirects, sitemaps, URL lists and unknown attributes: the
+        // extension.
+        for attr in [
+            "<a href>",
+            "js url",
+            "redirect",
+            "sitemap",
+            "url list",
+            "<embed src>",
+            "",
+        ] {
+            assert_eq!(kind(bare, attr), (LinkKind::Page, None), "{attr}");
+            assert_eq!(kind("https://example.com/terms.pdf", attr), (LinkKind::Document, None));
+        }
+        assert_eq!(kind_of(bare, []), (LinkKind::Page, None));
+        assert_eq!(
+            referenced_by(LinkKind::Image, Some("<img src>")).as_deref(),
+            Some("Image, referenced by <img src>")
+        );
+        assert_eq!(referenced_by(LinkKind::Page, None), None);
+    }
+
+    #[test]
+    fn an_embedding_reference_wins_over_links_and_the_first_one_decides() {
+        let bare = "https://example.com/banner";
+        assert_eq!(
+            kind_of(bare, ["<a href>", "redirect", "<img src>", "<script src>"]),
+            (LinkKind::Image, Some("<img src>"))
+        );
+        // A <link href> that falls back to the extension does not embed: the next one decides.
+        assert_eq!(
+            kind_of(bare, ["<link href>", "<script src>"]),
+            (LinkKind::Script, Some("<script src>"))
+        );
+        assert_eq!(
+            kind_of("https://example.com/app.css", ["<a href>", "<link href>", "css url()"]),
+            (LinkKind::Stylesheet, Some("<link href>"))
+        );
+        assert_eq!(kind_of(bare, ["<a href>", "sitemap"]), (LinkKind::Page, None));
+    }
+
+    #[test]
+    fn link_checker_rows_take_their_kind_from_every_known_reference() {
+        use crate::model::link_data::LinkRow;
+        let reference = |source: &str, attr: &str| CrawlerRef {
+            source: Arc::from(source),
+            attr: Arc::from(attr),
+            text: None,
+            line: None,
+            column: None,
+        };
+        let referenced = |url: &str, source: &str, attr: &str| {
+            let mut row = row(url, 404, ContentKind::Html);
+            row.link = Some(Box::new(reference(source, attr)));
+            row
+        };
+        let rows = vec![
+            // (a) An image without an extension, from the `url` event.
+            referenced("https://site.example/media/logo", "https://site.example/", "<img src>"),
+            // (b) Queued by a link; the `links` table has an <img src> on another page.
+            referenced("https://site.example/banner", "https://site.example/a", "<a href>"),
+            // (c) No link data: the extension, as before.
+            row("https://site.example/gone", 404, ContentKind::Html),
+            row("https://site.example/img/x.png", 404, ContentKind::Html),
+        ];
+        let links_row = |url: &str, source: &str, attr: &str| LinkRow {
+            url: url.to_string(),
+            source_url: source.to_string(),
+            source_attr: attr.to_string(),
+            ..LinkRow::default()
+        };
+        let graph = LinkGraph::build(
+            [
+                links_row("https://site.example/banner", "https://site.example/a", "<a href>"),
+                links_row("https://site.example/banner", "https://site.example/b", "<img src>"),
+            ],
+            [],
+        );
+        let retries = RetryState::default();
+        let texts = LinkTexts::default();
+        let mut index = BrokenIndex::default();
+        let shown = |index: &BrokenIndex, graph: Option<&LinkGraph>| -> Vec<(LinkKind, Option<String>)> {
+            let context = Context {
+                rows: &rows,
+                entries: &index.entries,
+                found_on: None,
+                graph,
+                links: &[],
+                texts: &texts,
+                retries: &retries,
+                revision: 0,
+                queue_order: false,
+            };
+            (0..index.entries.len() as u32)
+                .filter_map(|position| context.item(RowRef::Crawled(position)))
+                .map(|item| {
+                    let (kind, attr) = item.kind_and_attr();
+                    assert_eq!(kind, item.kind(), "the cell and the sort agree");
+                    (kind, referenced_by(kind, attr))
+                })
+                .collect()
+        };
+
+        // Live: the event's reference only.
+        index.sync(&rows, Some("site.example"), None, &retries, 0);
+        let places: Vec<(Where, LinkKind)> = index.entries.iter().map(|(_, place, kind)| (*place, *kind)).collect();
+        assert_eq!(
+            places,
+            [
+                (Where::InternalAsset, LinkKind::Image),
+                (Where::InternalPage, LinkKind::Page),
+                (Where::InternalPage, LinkKind::Page),
+                (Where::InternalAsset, LinkKind::Image),
+            ]
+        );
+        assert_eq!(index.counts, [2, 2, 0]);
+        assert_eq!(
+            shown(&index, None),
+            [
+                (LinkKind::Image, Some("Image, referenced by <img src>".to_string())),
+                (LinkKind::Page, None),
+                (LinkKind::Page, None),
+                (LinkKind::Image, None),
+            ]
+        );
+
+        // The `links` table arrives with the result: the rows already collected are classified
+        // again, and the counts follow.
+        index.sync(&rows, Some("site.example"), Some(&graph), &retries, 0);
+        assert_eq!(index.entries[1], (1, Where::InternalAsset, LinkKind::Image));
+        assert_eq!(index.counts, [1, 3, 0]);
+        assert_eq!(
+            shown(&index, Some(&graph))[1],
+            (LinkKind::Image, Some("Image, referenced by <img src>".to_string()))
+        );
+        assert_eq!(
+            scope_urls(&rows, &index, &retries, 0, Scope::InternalPages),
+            ["https://site.example/gone"]
+        );
+        assert_eq!(scope_urls(&rows, &index, &retries, 0, Scope::InternalAssets).len(), 3);
     }
 
     #[test]
@@ -2312,10 +2577,10 @@ mod tests {
             row("https://example.com/a", 404, ContentKind::Html),
         ];
         let mut index = BrokenIndex::default();
-        index.sync(&rows, Some("example.com"), &RetryState::default(), 0);
+        index.sync(&rows, Some("example.com"), None, &RetryState::default(), 0);
         assert_eq!(index.entries, vec![(1, Where::InternalPage, LinkKind::Page)]);
         rows.push(row("https://ext.org/", -2, ContentKind::Other));
-        index.sync(&rows, Some("example.com"), &RetryState::default(), 0);
+        index.sync(&rows, Some("example.com"), None, &RetryState::default(), 0);
         assert_eq!(index.counts, [1, 0, 1]);
     }
 
@@ -2325,7 +2590,7 @@ mod tests {
         let rows = vec![row("https://site.example/gone", 404, ContentKind::Html)];
         let texts = LinkTexts::default();
         let mut index = BrokenIndex::default();
-        index.sync(&rows, Some("site.example"), &RetryState::default(), 0);
+        index.sync(&rows, Some("site.example"), None, &RetryState::default(), 0);
         let mut links = vec![
             link("https://ok.example/", Outcome::Ok, Some(200)),
             link("https://refused.example/", Outcome::Refused, Some(403)),
@@ -2486,7 +2751,7 @@ mod tests {
         retries.enqueue("https://site.example/c", first(&state.urls[2]));
         retries.enqueue("https://site.example/a", first(&state.urls[0]));
         let mut index = BrokenIndex::default();
-        index.sync(&state.urls, Some("site.example"), &retries, state.revision);
+        index.sync(&state.urls, Some("site.example"), None, &retries, state.revision);
         let urls = |index: &BrokenIndex, retries: &RetryState, revision, scope| {
             scope_urls(&state.urls, index, retries, revision, scope)
         };
@@ -2505,7 +2770,7 @@ mod tests {
         retries.record_answer("https://site.example/a", answer);
         retries.apply_to_state(&mut state);
         let revision = state.revision;
-        index.sync(&state.urls, Some("site.example"), &retries, revision);
+        index.sync(&state.urls, Some("site.example"), None, &retries, revision);
         assert_eq!(index.total(), 2, "the counts follow");
         assert_eq!(index.entries.len(), 2, "neither broken nor queued: out of the index");
         let urls = |scope| scope_urls(&state.urls, &index, &retries, revision, scope);
@@ -2526,7 +2791,7 @@ mod tests {
         let texts = LinkTexts::default();
         let retries = RetryState::default();
         let mut index = BrokenIndex::default();
-        index.sync(&rows, Some("site.example"), &retries, 0);
+        index.sync(&rows, Some("site.example"), None, &retries, 0);
         let context = Context {
             rows: &rows,
             entries: &index.entries,
@@ -2603,7 +2868,7 @@ mod tests {
         let texts = LinkTexts::default();
         let retries = RetryState::default();
         let mut index = BrokenIndex::default();
-        index.sync(&rows, Some("site.example"), &retries, 0);
+        index.sync(&rows, Some("site.example"), None, &retries, 0);
         let found_on = FoundOn(HashMap::from([
             (
                 "https://site.example/gone".to_string(),

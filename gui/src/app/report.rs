@@ -88,8 +88,11 @@ fn gather(source: &Source<'_>) -> LinkReport {
         if !broken::is_broken(row.status) {
             continue;
         }
-        let (place, kind) = broken::classify(&row.url, site_host.as_deref());
-        let shown = crawled_row(row, broken::status_text(row.status), kind.label());
+        let refs = graph.and_then(|graph| graph.target(&row.url));
+        let attrs = broken::reference_attrs(row.link.as_deref(), refs);
+        let (place, kind, attr) = broken::classify(&row.url, attrs, site_host.as_deref());
+        let kind = broken::referenced_by(kind, attr).unwrap_or_else(|| kind.label().to_string());
+        let shown = crawled_row(row, broken::status_text(row.status), &kind);
         match place {
             Where::InternalPage => pages.push(shown),
             Where::InternalAsset => assets.push(shown),
@@ -280,5 +283,55 @@ impl App {
                     .error(format!("The link report could not be written: {error}")),
             })
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::model::link_data::CrawlerRef;
+    use crate::model::run_state::ContentKind;
+
+    #[test]
+    fn the_report_gives_the_kind_with_the_reference_that_decided_it() {
+        let mut state = RunState::new();
+        let mut logo = UrlRow::new("https://site.example/media/logo", 404, ContentKind::Html, 1, 1, false);
+        logo.link = Some(Box::new(CrawlerRef {
+            source: Arc::from("https://site.example/"),
+            attr: Arc::from("<img src>"),
+            text: None,
+            line: None,
+            column: None,
+        }));
+        state.urls.push(logo);
+        state.urls.push(UrlRow::new(
+            "https://site.example/img/x.png",
+            404,
+            ContentKind::Html,
+            1,
+            1,
+            false,
+        ));
+        let links = RunLinks::default();
+        let report = gather(&Source {
+            state: &state,
+            links: &links,
+            site: "https://site.example/".to_string(),
+        });
+        let assets: Vec<&str> = report.groups[1]
+            .rows
+            .iter()
+            .map(|row| row.title_or_kind.as_str())
+            .collect();
+        // Decided by the reference: said so; by the extension: the kind alone, as before.
+        assert_eq!(assets, ["Image, referenced by <img src>", "Image"]);
+        assert!(report.groups[0].rows.is_empty(), "no broken page");
+        assert!(
+            report
+                .render()
+                .contains("<td>Image, referenced by &lt;img src&gt;</td>")
+        );
     }
 }
