@@ -1195,7 +1195,7 @@ impl Crawler {
                 return;
             }
 
-            let url_for_queue = found_url.url.trim().to_string();
+            let url_for_queue = found_url.url.trim_ascii().to_string();
             let parsed_url_for_queue = ParsedUrl::parse(&url_for_queue, Some(source_url));
 
             // Skip URLs that are not requestable resources

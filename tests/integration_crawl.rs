@@ -9216,3 +9216,38 @@ fn url_discovery_requests_the_right_urls_and_reports_the_page_they_were_found_on
         );
     }
 }
+
+/// Only ASCII whitespace around a URL attribute is not part of the URL. A browser keeps a
+/// non-breaking space and requests it percent-encoded, relative to the page.
+#[test]
+fn non_breaking_space_around_a_url_is_part_of_the_url() {
+    let server = RecordingServer::start(vec![Route {
+        path: "/",
+        headers: vec![("Content-Type", "text/html; charset=utf-8".to_string())],
+        body: "<html><head><title>Home</title></head><body><a href=\"\u{a0}/x\">x</a></body></html>"
+            .as_bytes()
+            .to_vec(),
+    }]);
+    let output = run_crawler(&[
+        NO_CONFIG_FILE,
+        &format!("--url={}", server.url()),
+        LOCAL_ANALYZERS,
+        "--http-cache-dir=",
+        "--output-html-report=",
+        "--output-json-file=",
+        "--output-text-file=",
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let heads = server.requests();
+    assert!(
+        heads.iter().any(|head| head.starts_with("GET /%C2%A0/x ")),
+        "{heads:#?}"
+    );
+    assert!(!heads.iter().any(|head| head.starts_with("GET /x ")), "{heads:#?}");
+}

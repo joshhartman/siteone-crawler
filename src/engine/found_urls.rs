@@ -56,7 +56,7 @@ impl FoundUrls {
         source: UrlSource,
     ) {
         if is_url_valid_for_crawling(url) {
-            let offset = offset + (url.len() - url.trim_start().len());
+            let offset = offset + (url.len() - url.trim_ascii_start().len());
             self.add_url(FoundUrl::new(url, source_url, source).with_details(Some(offset), text));
         }
     }
@@ -98,7 +98,7 @@ fn md5_hex(input: &str) -> String {
 /// - data:, mailto:, javascript: and other non-http(s) links
 /// - file:// links
 fn is_url_valid_for_crawling(url: &str) -> bool {
-    let url = url.trim();
+    let url = url.trim_ascii();
     if url.starts_with('#') {
         return false;
     }
@@ -143,6 +143,16 @@ mod tests {
         assert!(!is_url_valid_for_crawling("javascript:void(0)"));
         assert!(!is_url_valid_for_crawling("data:text/html,test"));
         assert!(!is_url_valid_for_crawling("file:///etc/passwd"));
+    }
+
+    #[test]
+    fn only_ascii_whitespace_around_a_found_url_is_not_part_of_it() {
+        let mut urls = FoundUrls::new();
+        urls.add_url_with_details(" \u{a0}/x", 10, None, "https://example.com/", UrlSource::AHref);
+        let found = urls.get_urls().values().next().expect("the URL is kept");
+        assert_eq!(found.url, "\u{a0}/x");
+        assert_eq!(found.offset, Some(11), "the URL text starts at its non-breaking space");
+        assert!(is_url_valid_for_crawling("\u{a0}#x"), "a relative path, not a fragment");
     }
 
     #[test]
