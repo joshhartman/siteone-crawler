@@ -176,6 +176,7 @@ pub enum SkippedReason {
     NotAllowedHost = 1,
     RobotsTxt = 2,
     ExceedsMaxDepth = 3,
+    MistypedScheme = 4,
 }
 
 impl SkippedReason {
@@ -184,6 +185,7 @@ impl SkippedReason {
             1 => Some(SkippedReason::NotAllowedHost),
             2 => Some(SkippedReason::RobotsTxt),
             3 => Some(SkippedReason::ExceedsMaxDepth),
+            4 => Some(SkippedReason::MistypedScheme),
             _ => None,
         }
     }
@@ -193,6 +195,7 @@ impl SkippedReason {
             SkippedReason::NotAllowedHost => "Not allowed host",
             SkippedReason::RobotsTxt => "Robots.txt",
             SkippedReason::ExceedsMaxDepth => "Exceeds max depth",
+            SkippedReason::MistypedScheme => "Mistyped scheme",
         }
     }
 }

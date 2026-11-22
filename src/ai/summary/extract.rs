@@ -305,18 +305,20 @@ fn security_headers(status: &Status) -> Value {
 /// and depth limits, so the model does not flag normal external links as a crawlability problem.
 fn skipped_by_reason(status: &Status) -> Value {
     use crate::types::SkippedReason;
-    let (mut external, mut robots, mut max_depth) = (0i64, 0i64, 0i64);
+    let (mut external, mut robots, mut max_depth, mut mistyped) = (0i64, 0i64, 0i64, 0i64);
     for e in status.get_skipped_urls() {
         match e.reason {
             SkippedReason::NotAllowedHost => external += 1,
             SkippedReason::RobotsTxt => robots += 1,
             SkippedReason::ExceedsMaxDepth => max_depth += 1,
+            SkippedReason::MistypedScheme => mistyped += 1,
         }
     }
     json!({
         "external_or_disallowed_host_normal": external,
         "blocked_by_robots_txt": robots,
         "exceeded_max_crawl_depth": max_depth,
+        "broken_links_with_a_mistyped_http_scheme": mistyped,
     })
 }
 

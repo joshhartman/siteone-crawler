@@ -37,6 +37,7 @@ impl SkippedUrlsAnalyzer {
             SkippedReason::NotAllowedHost => "Not allowed host",
             SkippedReason::RobotsTxt => "Robots.txt",
             SkippedReason::ExceedsMaxDepth => "Max depth",
+            SkippedReason::MistypedScheme => "Mistyped scheme",
         }
     }
 

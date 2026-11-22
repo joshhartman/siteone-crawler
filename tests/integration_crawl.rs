@@ -9251,3 +9251,88 @@ fn non_breaking_space_around_a_url_is_part_of_the_url() {
     );
     assert!(!heads.iter().any(|head| head.starts_with("GET /x ")), "{heads:#?}");
 }
+
+/// A link whose scheme is a typo of http or https cannot be opened by a visitor: it is reported
+/// as skipped with its own reason and never requested. Other schemes stay silently skipped.
+#[test]
+fn links_with_a_mistyped_http_scheme_are_reported_and_never_requested() {
+    let server = RecordingServer::start_with(|port| {
+        let body = format!(
+            r#"<html><head><title>Home</title></head><body>
+<a href="htp://127.0.0.1:{port}/typo-a">a</a>
+<img src="htps://127.0.0.1:{port}/typo-b.png" alt="b">
+<a href="mailto:someone@example.com">mail</a>
+<a href="ftp://127.0.0.1:{port}/typo-ftp">ftp</a>
+<a href="zoommtg://127.0.0.1:{port}/typo-zoom">zoom</a>
+</body></html>"#
+        );
+        vec![Route {
+            path: "/",
+            headers: vec![("Content-Type", "text/html; charset=utf-8".to_string())],
+            body: body.into_bytes(),
+        }]
+    });
+    let output = run_crawler(&[
+        NO_CONFIG_FILE,
+        &format!("--url={}", server.url()),
+        "--output=json",
+        "--link-details",
+        "--analyzer-filter-regex=/SkippedUrls/",
+        "--http-cache-dir=",
+        "--output-html-report=",
+        "--output-json-file=",
+        "--output-text-file=",
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON on stdout");
+
+    let typo_a = format!("htp://127.0.0.1:{}/typo-a", server.port());
+    let typo_b = format!("htps://127.0.0.1:{}/typo-b.png", server.port());
+    let mut skipped: Vec<(String, String, String, String)> = json["tables"]["skipped"]["rows"]
+        .as_array()
+        .expect("the skipped table")
+        .iter()
+        .map(|row| {
+            let field = |name: &str| row[name].as_str().unwrap_or_default().to_string();
+            (field("reason"), field("url"), field("sourceAttr"), field("sourceUqId"))
+        })
+        .collect();
+    skipped.sort();
+    assert_eq!(
+        skipped,
+        [
+            (
+                "Mistyped scheme".to_string(),
+                typo_a.clone(),
+                "<a href>".to_string(),
+                "/".to_string()
+            ),
+            (
+                "Mistyped scheme".to_string(),
+                typo_b.clone(),
+                "<img src>".to_string(),
+                "/".to_string()
+            ),
+        ]
+    );
+
+    let heads = server.requests();
+    assert!(!heads.iter().any(|head| head.contains("typo")), "{heads:#?}");
+
+    let links: Vec<&serde_json::Value> = json["tables"]["links"]["rows"]
+        .as_array()
+        .expect("the links table")
+        .iter()
+        .collect();
+    for target in [&typo_a, &typo_b] {
+        assert!(
+            links.iter().any(|row| row["url"] == target.as_str()),
+            "{target}: {links:#?}"
+        );
+    }
+}

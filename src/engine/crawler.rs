@@ -1196,6 +1196,31 @@ impl Crawler {
             }
 
             let url_for_queue = found_url.url.trim_ascii().to_string();
+
+            // A scheme mistyped for http(s) cannot be opened: reported as skipped, never resolved or requested
+            if crate::engine::found_urls::has_mistyped_http_scheme(&url_for_queue) {
+                let host = url::Url::parse(&url_for_queue)
+                    .ok()
+                    .and_then(|url| url.host_str().map(str::to_string));
+                let external = Self::is_external_host(host.as_deref(), initial_parsed_url);
+                page.record(
+                    url_for_queue.clone(),
+                    external,
+                    found_url.source as i32,
+                    found_url.offset,
+                    found_url.text.as_deref(),
+                );
+                skipped
+                    .entry(utils::to_lower_hex(Md5::digest(url_for_queue.as_bytes())))
+                    .or_insert_with(|| SkippedEntry {
+                        url: url_for_queue.clone(),
+                        reason: SkippedReason::MistypedScheme,
+                        source_uq_id: source_url_uq_id.to_string(),
+                        source_attr: found_url.source as i32,
+                    });
+                continue;
+            }
+
             let parsed_url_for_queue = ParsedUrl::parse(&url_for_queue, Some(source_url));
 
             // Skip URLs that are not requestable resources
