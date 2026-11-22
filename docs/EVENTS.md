@@ -94,9 +94,30 @@ action, exporters).
 | `cached` | bool | Served from the HTTP cache. |
 | `done` | int | URLs crawled so far. |
 | `total` | int | URLs known so far (grows as links are discovered). |
+| `source` | string? | The page (or stylesheet, script, sitemap, redirecting URL) whose reference queued this URL — the page itself, also when it has a `<base href>`; as its own `url` event names it. Absent for a start URL (`--url`, `--url-list`). |
+| `sourceAttr` | string? | How `source` referenced it, as the crawler's tables name it: `<a href>`, `<img src>`, `<img srcset>`, `<input src>`, `<source src>`, `<video src>`, `<audio src>`, `<script src>`, `inline <script src>`, `<link href>`, `css url()`, `js url`, `redirect`, `sitemap`. Absent with `source`. |
+| `linkText` | string? | Only with `--link-details`: the text of that link — for `<a>` its visible text (tags removed, entities decoded, whitespace collapsed; when it has none, the `alt` of its image), for `<img>` its `alt`; at most 120 characters, the last one `…` when cut. Absent when there is none (CSS, scripts, redirects, an empty `alt`). |
+| `sourceLine` | int? | Only with `--link-details`: 1-based line in `source` where the URL text of the reference starts (in the attribute value or `url(...)`), in the body as received (decoded, before any rewriting). A line ends at `\n`, `\r\n` or `\r`. Absent when unknown (see below). |
+| `sourceColumn` | int? | With `sourceLine`: 1-based column, counted in characters (Unicode scalar values) from the start of the line. |
+| `external` | bool | Not on the initial host or its www/non-www variant. |
+| `depth` | int | Link distance from a start URL as known when the URL was crawled: 0 for a start URL, otherwise 1 + the depth of the page that queued it (a redirect adds nothing), lowered with `--link-details` when a shorter path was already recorded. Never smaller than the final `depth` of the result JSON, which is exact. |
+
+`source` and `sourceAttr` name the first reference only — the one that queued the URL. With
+`--link-details` the result JSON lists every referring page (`links` table, see
+[JSON-OUTPUT.md](JSON-OUTPUT.md#529-links-links)). A position is not given for references found by the
+JavaScript, Next.js, Astro and XML (sitemap) processors, for a page rendered with `--browser` (its
+body is the rendered DOM, not the source), and for a body that a processor rewrote before the URLs
+were extracted (Next.js query parameters).
 
 ```json
-{"type":"url","url":"http://127.0.0.1:8888/about.html","status":200,"contentType":"HTML","timeMs":1,"size":172,"cached":false,"done":2,"total":2}
+{"type":"url","url":"http://127.0.0.1:8888/about.html","status":200,"contentType":"HTML","timeMs":1,"size":172,"cached":false,"done":2,"total":2,"source":"http://127.0.0.1:8888/","sourceAttr":"<a href>","external":false,"depth":1}
+```
+
+With `--link-details` (a line of a run over a generated sample site):
+
+```json
+{"type":"url","url":"http://127.0.0.1:8891/page-141.html","status":200,"contentType":"HTML","timeMs":3,"size":4102,"cached":false,"done":2,"total":73,"source":"http://127.0.0.1:8891/","sourceAttr":"<a href>","linkText":"article 141","sourceLine":45,"sourceColumn":257,"external":false,"depth":1}
+{"type":"url","url":"http://127.0.0.1:8891/img/m-3.png","status":200,"contentType":"Image","timeMs":2,"size":69,"cached":false,"done":419,"total":483,"source":"http://127.0.0.1:8891/css/min.css","sourceAttr":"css url()","sourceLine":1,"sourceColumn":86,"external":false,"depth":2}
 ```
 
 ### aiRequest

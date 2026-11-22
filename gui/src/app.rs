@@ -386,6 +386,11 @@ pub enum Action {
     RunAgain(Box<RunAgain>),
     /// Deletes a run folder (History, confirmed).
     DeleteRun(PathBuf),
+    /// Puts the text on the clipboard; `what` names it in the toast.
+    CopyText {
+        text: String,
+        what: String,
+    },
 }
 
 /// Applied to the [`App`] on the UI thread when a background task finishes.
@@ -707,6 +712,10 @@ impl App {
             Action::StopAndClose => self.stop_and_close(),
             Action::RunAgain(run_again) => self.apply_run_again(*run_again),
             Action::DeleteRun(dir) => history::delete(self, dir),
+            Action::CopyText { text, what } => {
+                self.toasts.success(format!("Copied {what}."));
+                self.pending_copy = Some(text);
+            }
             other => setup::perform(self, other, dialog),
         }
     }

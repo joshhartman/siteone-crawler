@@ -137,7 +137,11 @@ pub const HIDDEN: &[&str] = &[
 ///
 /// `--timeout`: the CLI's 5 s is too short for a slow site that has to build a page its cache no
 /// longer holds.
-pub const APP_DEFAULTS: &[(&str, &str)] = &[("--timeout", "30")];
+///
+/// `--link-details`: the Link checker lists every page a broken link is on, with its link text and
+/// line, from the crawler's own data — without it the app has to request those pages again after
+/// the crawl, and knows only the first page of each URL.
+pub const APP_DEFAULTS: &[(&str, &str)] = &[("--timeout", "30"), ("--link-details", "true")];
 
 /// Options whose values live in the credential store, never in a file.
 pub const SECRET: &[&str] = &["--http-auth", "--mail-smtp-pass", "--upload-password", "--ai-api-key"];

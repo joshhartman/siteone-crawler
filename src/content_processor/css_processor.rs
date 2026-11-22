@@ -61,7 +61,7 @@ impl ContentProcessor for CssProcessor {
         let source_url_str = source_url.get_full_url(true, false);
 
         // Find all url() references in CSS
-        let mut url_texts: Vec<&str> = Vec::new();
+        let mut found_urls = FoundUrls::new();
         for caps in RE_CSS_URL.captures_iter(content) {
             if let Some(m) = caps.get(1) {
                 // `url( x )` and `url(" x ")`: the whitespace around the URL is not part of it
@@ -74,13 +74,10 @@ impl ContentProcessor for CssProcessor {
                     || (self.config.fonts_enabled && is_font)
                     || (self.config.styles_enabled && is_css)
                 {
-                    url_texts.push(url);
+                    found_urls.add_url_with_details(url, m.start(), None, &source_url_str, UrlSource::CssUrl);
                 }
             }
         }
-
-        let mut found_urls = FoundUrls::new();
-        found_urls.add_urls_from_text_array(&url_texts, &source_url_str, UrlSource::CssUrl);
 
         if found_urls.get_count() > 0 {
             Some(found_urls)
@@ -159,6 +156,19 @@ mod tests {
         let result = processor.find_urls(css, &source);
         assert!(result.is_some());
         assert!(result.unwrap().get_count() >= 2);
+    }
+
+    #[test]
+    fn css_urls_carry_their_offset() {
+        let processor = CssProcessor::new(make_config());
+        let css = "a{background:url( '/img/a.png' )}\n@import url(\"/b.css\");";
+        let source = ParsedUrl::parse("https://example.com/style.css", None);
+        let found = processor.find_urls(css, &source).unwrap();
+        for url in ["/img/a.png", "/b.css"] {
+            let found_url = found.get_urls().values().find(|u| u.url == url).unwrap();
+            assert_eq!(found_url.offset, css.find(url), "{url}");
+            assert_eq!(found_url.text, None);
+        }
     }
 
     #[test]

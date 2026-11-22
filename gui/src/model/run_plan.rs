@@ -249,7 +249,9 @@ mod tests {
             "{:?}",
             plan.argv
         );
-        assert_eq!(plan.argv[2 + skip..], expected[..]);
+        // Link details are on by default (an app default too).
+        assert_eq!(plan.argv[2 + skip], "--link-details=true");
+        assert_eq!(plan.argv[3 + skip..], expected[..]);
         assert!(!has(&plan.argv, "--ai-"), "no AI option without AI");
         assert_eq!(plan.events_file, dir.join(EVENTS_FILE));
         assert_eq!(plan.console_log, dir.join(CONSOLE_LOG));

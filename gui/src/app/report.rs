@@ -11,9 +11,9 @@ use super::{App, PastLoad};
 use crate::backend::shell;
 use crate::model::coverage::{self, CrawlScope, Gap, GapInput};
 use crate::model::link_check::{Outcome, OutcomeCounts, RunLinks};
+use crate::model::link_data::{Referrer, text_on};
 use crate::model::link_report::{LinkReport, ReportGroup, ReportRow, group_by_page};
-use crate::model::link_text::RefPosition;
-use crate::model::run_state::RunState;
+use crate::model::run_state::{RunState, UrlRow};
 use crate::ui::run::broken::{self, Where};
 use crate::ui::widgets::format;
 
@@ -27,41 +27,58 @@ struct Source<'a> {
 fn gather(source: &Source<'_>) -> LinkReport {
     let site_host = broken::site_host(&source.site);
     let texts = &source.links.texts;
-    // Where each page a link was found on references it.
-    let positions = |url: &str, pages: &[&str]| -> Vec<Option<RefPosition>> {
-        pages.iter().map(|page| texts.position(url, page).copied()).collect()
-    };
+    let graph = source.links.graph.as_deref();
     let found_on: HashMap<&str, &str> = source
         .links
         .internal
         .iter()
         .map(|(url, page)| (url.trim_end_matches('/'), page.as_str()))
         .collect();
-    let crawled_row = |url: &str, status: String, kind: &str| {
-        let sources: Vec<String> = found_on
-            .get(url.trim().trim_end_matches('/'))
-            .map(|page| vec![page.to_string()])
-            .unwrap_or_default();
-        let pages: Vec<&str> = sources.iter().map(String::as_str).collect();
-        ReportRow {
+    // A row from the pages a link was found on — with what the crawler reported about each
+    // reference — and how many pages reference it in all.
+    let row_of =
+        |status: String, url: &str, title_or_kind: String, referrers: Vec<Referrer<'_>>, total: usize| ReportRow {
             status,
             url: url.to_string(),
-            title_or_kind: kind.to_string(),
-            link_text: texts.lookup(url, &pages).text().to_string(),
-            positions: positions(url, &pages),
-            found_on: sources,
-        }
+            title_or_kind,
+            link_text: text_on(texts, url, &referrers).text().to_string(),
+            positions: referrers.iter().map(|referrer| referrer.position(texts, url)).collect(),
+            more: total.saturating_sub(referrers.len()),
+            found_on: referrers.iter().map(|referrer| referrer.page.to_string()).collect(),
+        };
+    // A crawled URL: every kept referrer of the crawler's `links` table, else the page of its `url`
+    // event, else the page of the `404` table (crawlers before link data).
+    let crawled_row = |row: &UrlRow, status: String, kind: &str| {
+        let target = graph.and_then(|graph| graph.target(&row.url));
+        let referrers: Vec<Referrer<'_>> = match (target, row.link.as_deref()) {
+            (Some(target), _) => target.refs.iter().map(Referrer::of).collect(),
+            (None, Some(link)) => vec![Referrer::of(link)],
+            (None, None) => found_on
+                .get(row.url.trim().trim_end_matches('/'))
+                .map(|page| vec![Referrer::page(page)])
+                .unwrap_or_default(),
+        };
+        let total = target.map_or(referrers.len(), |target| target.in_links as usize);
+        row_of(status, &row.url, kind.to_string(), referrers, total)
     };
     let link_row = |link: &crate::model::link_check::LinkResult| {
-        let pages: Vec<&str> = link.sources.iter().map(String::as_str).collect();
-        ReportRow {
-            status: link.status_label(),
-            url: link.url.clone(),
-            title_or_kind: link.title.clone().unwrap_or_default(),
-            link_text: texts.lookup(&link.url, &pages).text().to_string(),
-            positions: positions(&link.url, &pages),
-            found_on: link.sources.clone(),
-        }
+        let target = graph.and_then(|graph| graph.target(&link.url));
+        let referrers: Vec<Referrer<'_>> = link
+            .sources
+            .iter()
+            .map(|page| Referrer {
+                page,
+                crawler: target.and_then(|target| target.on(page)),
+            })
+            .collect();
+        let total = target.map_or(referrers.len(), |target| target.in_links as usize);
+        row_of(
+            link.status_label(),
+            &link.url,
+            link.title.clone().unwrap_or_default(),
+            referrers,
+            total,
+        )
     };
 
     let mut pages = Vec::new();
@@ -72,7 +89,7 @@ fn gather(source: &Source<'_>) -> LinkReport {
             continue;
         }
         let (place, kind) = broken::classify(&row.url, site_host.as_deref());
-        let shown = crawled_row(&row.url, broken::status_text(row.status), kind.label());
+        let shown = crawled_row(row, broken::status_text(row.status), kind.label());
         match place {
             Where::InternalPage => pages.push(shown),
             Where::InternalAsset => assets.push(shown),

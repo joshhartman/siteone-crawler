@@ -418,6 +418,15 @@ impl Manager {
             }
         }
 
+        // With --link-details: every link found and the link facts of each crawled URL (JSON only;
+        // not a SuperTable of the status, so the text output and the HTML report stay as they are)
+        if let Some(graph) = crawler.get_link_graph() {
+            let report = graph.lock().map(|graph| graph.report()).unwrap_or_default();
+            if let Ok(mut out) = output.lock() {
+                out.add_link_details(&report);
+            }
+        }
+
         // Optional AI executive summary (after analyzers populate findings/tables, before the
         // HTML report is generated so the AI box can be embedded in the Summary tab).
         if self.options.ai_enabled && !self.options.ai_dry_run && self.options.ai_actions.iter().any(|a| a == "summary")
@@ -1107,6 +1116,7 @@ impl Manager {
         config.force_relative_urls = options.force_relative_urls;
         config.offline_export_preserve_url_structure = options.offline_export_preserve_url_structure;
         config.ignore_html_comments = options.ignore_html_comments;
+        config.collect_link_details = options.link_details;
         let (static_cb, crawling_cb) = Self::build_domain_allow_callbacks(options);
         config.is_domain_allowed_for_static_files = Some(static_cb);
         config.is_external_domain_allowed_for_crawling = Some(crawling_cb);

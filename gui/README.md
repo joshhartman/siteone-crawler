@@ -42,7 +42,7 @@ read against the folder the GUI is started from. The GUI makes its data folder i
 directory. A run folder holds `run.json` (outcome, redacted command line, configuration without
 secrets or `--header` values), `events.ndjson`, `console.log`, the result JSON, the HTML report
 and any exports — and, once the app has checked them, `external-links.json` (the external link
-check) and `link-texts.json` (link texts read from the source pages), `retries.json` (the retry
+check) and `link-texts.json` (link texts the app read on source pages, when the crawler gave none), `retries.json` (the retry
 queue and the newest answers) and `link-report.html` (the app's report of the run's links).
 
 ## Tests
@@ -56,7 +56,7 @@ runs everything:
 - **Unit tests** in the source files (option schema vs. the CLI's options, argv round trip through
   the CLI's parser, events, run state, ANSI parsing, result JSON, storage, history, redaction).
 - **Integration tests** `tests/core_*.rs`, `tests/ui_start.rs`, `tests/ui_run_e2e.rs`,
-  `tests/ui_link_check_e2e.rs`, `tests/ui_retry_e2e.rs` with the real crawler: they build it for the same profile
+  `tests/ui_link_check_e2e.rs`, `tests/ui_link_data_e2e.rs`, `tests/ui_retry_e2e.rs` with the real crawler: they build it for the same profile
   (`cargo build -p siteone-crawler`, a no-op when up to date) and crawl a small generated site served
   by the crawler's own `--serve-offline` on 127.0.0.1 — no network. The external link check and the
   link texts — and the retries of `tests/core_retry.rs` — run against a small HTTP server written in
@@ -96,13 +96,16 @@ cargo test -p siteone-crawler-gui
   no answer (DNS, connection, TLS, timeout, too many redirects). The site's `--http-auth`,
   `--header` values and cookies are never sent to other sites. *Check external links now* in the
   Link checker tab checks any finished run, also one crawled with the switch off.
-- **Found on** for crawled URLs comes from the result JSON's `404` table, so it is known only for
-  404 responses and only once the run has finished; other 4xx, 5xx and connection failures are
-  listed without it. The crawler keeps only the **first** page that referenced a URL, so a full
-  "pages linking to this one" list (as in Xenu) is not available without a change to the crawler.
-- **By page** (Link checker tab) groups the broken links under the pages they were found on, and
-  the link report adds *Broken links by page*. Because of the limit above, the internal links other
-  than 404s land in the last group, "Page not reported by the crawler".
+- **Found on and link data**: *Record every referring page* (Setup → Scope, `--link-details`) is
+  on by default and passed on every run (`--link-details=true`, like `--timeout=30`). The crawler
+  then names, for every URL, the page that queued it as the URL arrives (any status: 404, 5xx,
+  timeouts) and, in its result, every referring page (up to 50, with the total) with the link text
+  and line. The Link checker shows the first page with "+N more", *By page* lists a link under each
+  of its pages, the URLs tab has *Depth* and *In links* and *Pages linking here…* in the row menu,
+  and the external link check gets every page of each link. The cost is a larger result JSON on big
+  sites (about 7 MB per 1,000 pages with 60 links each). Turned off, the app knows only the first
+  page of each URL; a run of an older crawler, only the page of each 404 (its `404` table), and its
+  other failures land in "Page not reported by the crawler".
 - **What was checked** (link report; one line *Not checked* in the Link checker tab) lists what the
   run left out: robots.txt and other skip reasons with counts, files on other sites, links over the
   cap or not checked, URL limits, depth, single page, turned-off content types and skip patterns.
@@ -112,22 +115,20 @@ cargo test -p siteone-crawler-gui
   `--ignore-regex` (shown in the command): WooCommerce `add-to-cart`, `remove_item`, `undo_item` and
   the WordPress log-out link. Requesting them changes the site's state and checks nothing (on one
   shop they were 154 of 172 crawled pages, ~4 s each). Turn it off to crawl them.
-- **Link text** is read by fetching the "found on" pages again after the crawl — only pages of the
-  crawled site, each once, at most 200 per run. The run's own `--http-auth` and `--header` go only
-  where the crawler sends them (not from https to http; for an IP address or `localhost` only to the
-  start port); other pages of the site are fetched without them. A run from History that used them
-  does not fetch its pages (History keeps no password; Setup's is never borrowed). A page that
-  changed since the crawl, or a link built by a script, shows "not found on the page".
-- **Line of the reference**: the same fetch locates the link in the file, so *Found on* ends with
-  the place to fix — `…/page-styles.css:1929`, or line and column on a minified line
-  (`style.min.css:1:20345`); the tooltip and the link report add "(and N more)" when the page
-  references the link again. A "found on" that is a stylesheet (a missing font or background image
-  in a `url()`) is fetched too, within the same 200 pages (up to 8 MB of it; 2 MB of a page); its
-  link text reads "in a stylesheet". The position is in the file as fetched after the crawl: a page
-  that changed since, or a link built by a script, has none.
+- **Link text and line** come from the crawler with link details: nothing is requested again
+  after the crawl. The crawler gives no line length, so a column beyond 500 (a minified file) is
+  shown too (`style.min.css:1:20345`). Without link details, for a page rendered with `--browser`,
+  and for runs of an older crawler, the app reads the "found on" pages itself after the crawl — only
+  pages of the crawled site, each once, at most 200 per run (up to 8 MB of a stylesheet, 2 MB of a
+  page). The run's own `--http-auth` and `--header` go only where the crawler sends them (not from
+  https to http; for an IP address or `localhost` only to the start port). A run from History that
+  used them does not fetch its pages (History keeps no password; Setup's is never borrowed). That
+  position is in the file as fetched after the crawl: a page that changed since, or a link built by
+  a script, shows "not found on the page".
 - **Retry** (Link checker tab, after the crawl): selected rows, or the retry queue, are requested
   again one by one — a crawled URL by the crawler (one process per URL, exactly one request: no
-  robots.txt, no assets, no links, a redirect not followed), an external link by the app's check.
+  robots.txt, no assets, no links, a redirect not followed; one process with `--url-list` was
+  tested and would not keep the 500 ms after a slow answer nor give up a dead host), an external link by the app's check.
   The app's views, counts and link report take the new answers, so they show what is still broken (a
   URL that answers OK now leaves them; no list of retried URLs is kept); the crawler's HTML report, result
   JSON and scores stay as the crawl wrote them (the app says so and offers *Run again*). The retry

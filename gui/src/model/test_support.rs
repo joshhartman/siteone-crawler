@@ -35,7 +35,7 @@ pub fn check(argv: &[String]) -> Result<(), String> {
 pub const DOC_LINES: &[&str] = &[
     r#"{"type":"runStarted","protocol":1,"version":"2.6.1.20260914-gui-review.3","executedAt":"2026-09-25T19:06:20.727600099+02:00","url":"http://127.0.0.1:8888/","workingDir":"/tmp/evdoc"}"#,
     r#"{"type":"phase","name":"crawl","state":"finished","ms":113}"#,
-    r#"{"type":"url","url":"http://127.0.0.1:8888/about.html","status":200,"contentType":"HTML","timeMs":1,"size":172,"cached":false,"done":2,"total":2}"#,
+    r#"{"type":"url","url":"http://127.0.0.1:8888/about.html","status":200,"contentType":"HTML","timeMs":1,"size":172,"cached":false,"done":2,"total":2,"source":"http://127.0.0.1:8888/","sourceAttr":"<a href>","external":false,"depth":1}"#,
     r#"{"type":"aiRequest","seq":3,"task":"seo","label":"SEO","done":1,"total":2,"category":"SEO analysis","subject":"/about.html","provider":"openai-compatible","model":"qwen3.8","attempt":1,"maxAttempts":3,"outcome":"ok","status":200,"inputTokens":17,"outputTokens":37,"reasoningTokens":33,"cachedInputTokens":0,"reasoningChars":148,"ms":401,"outputTokensPerSecond":92.3,"totalTokensPerSecond":134.7,"finishReason":"stop"}"#,
     r#"{"type":"aiRequest","seq":1,"task":"seo","label":"SEO","done":0,"total":2,"category":"SEO analysis","subject":"/","provider":"openai-compatible","model":"qwen3.8","attempt":1,"maxAttempts":3,"outcome":"retry","status":429,"error":"HTTP 429","ms":402}"#,
     r#"{"type":"aiRequest","seq":1,"task":"seo","label":"SEO","done":0,"total":2,"category":"SEO analysis","subject":"/","provider":"openai-compatible","model":"qwen3.8","attempt":1,"maxAttempts":3,"outcome":"cacheHit","inputTokens":17,"outputTokens":37,"reasoningTokens":33,"cachedInputTokens":0,"finishReason":"stop"}"#,
@@ -46,4 +46,10 @@ pub const DOC_LINES: &[&str] = &[
     r#"{"type":"artifact","kind":"ai-report-json","label":"AI report (JSON)","path":"/tmp/evdoc/out/ai-report.ia.127-0-0-1.2026-09-25-19-06-25-763-2411710.json"}"#,
     r#"{"type":"issue","kind":"ai","label":"AI phase skipped","detail":"AI phase skipped: AI is enabled but no API key resolved for provider 'anthropic'. Set ANTHROPIC_API_KEY or use --ai-api-key-file."}"#,
     r#"{"type":"runFinished","outcome":"success","exitCode":0,"ms":3375,"interrupted":false}"#,
+];
+
+/// The example lines of `docs/EVENTS.md` with `--link-details`, verbatim.
+pub const DOC_LINK_DETAIL_LINES: &[&str] = &[
+    r#"{"type":"url","url":"http://127.0.0.1:8891/page-141.html","status":200,"contentType":"HTML","timeMs":3,"size":4102,"cached":false,"done":2,"total":73,"source":"http://127.0.0.1:8891/","sourceAttr":"<a href>","linkText":"article 141","sourceLine":45,"sourceColumn":257,"external":false,"depth":1}"#,
+    r#"{"type":"url","url":"http://127.0.0.1:8891/img/m-3.png","status":200,"contentType":"Image","timeMs":2,"size":69,"cached":false,"done":419,"total":483,"source":"http://127.0.0.1:8891/css/min.css","sourceAttr":"css url()","sourceLine":1,"sourceColumn":86,"external":false,"depth":2}"#,
 ];

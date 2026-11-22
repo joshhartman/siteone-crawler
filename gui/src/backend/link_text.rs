@@ -506,6 +506,7 @@ fn position_at(source: &str, newlines: &[usize], offset: usize, count: u32) -> R
         column: u32::try_from(column).unwrap_or(u32::MAX),
         count,
         long_line: length > LONG_LINE_CHARS,
+        crawled: false,
     }
 }
 
@@ -1183,6 +1184,7 @@ mod tests {
             column: column as u32,
             count: 1,
             long_line: true,
+            crawled: false,
         };
         assert_eq!(position.suffix(), format!(":1:{column}"));
         // A short line: the line alone.

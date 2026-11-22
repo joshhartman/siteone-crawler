@@ -44,7 +44,8 @@ pub fn perform(app: &mut App, action: Action, dialog: Option<Dialog<Action>>) {
         | Action::ForceQuit
         | Action::StopAndClose
         | Action::RunAgain(_)
-        | Action::DeleteRun(_) => {}
+        | Action::DeleteRun(_)
+        | Action::CopyText { .. } => {}
     }
 }
 

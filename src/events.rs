@@ -58,6 +58,24 @@ pub enum Event {
         cached: bool,
         done: usize,
         total: usize,
+        /// The page (or stylesheet) whose link queued this URL; none for a start URL.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+        /// How `source` referenced it: `<a href>`, `<img src>`, `css url()`, `redirect`, …
+        #[serde(skip_serializing_if = "Option::is_none")]
+        source_attr: Option<&'static str>,
+        /// With `--link-details`: the text of that link (or the image's `alt`).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        link_text: Option<String>,
+        /// With `--link-details`: where the URL starts in `source` as received, 1-based.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        source_line: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        source_column: Option<u32>,
+        /// Not on the initial host (or its www/non-www variant).
+        external: bool,
+        /// Link distance from a start URL as known when the URL was crawled.
+        depth: u32,
     },
     #[serde(rename_all = "camelCase")]
     Phase {
@@ -359,11 +377,48 @@ mod tests {
             cached: false,
             done: 1,
             total: 9,
+            source: None,
+            source_attr: None,
+            link_text: None,
+            source_line: None,
+            source_column: None,
+            external: false,
+            depth: 0,
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.starts_with(r#"{"type":"url","#), "got {json}");
         assert!(json.contains(r#""contentType":"html""#), "fields are camelCase: {json}");
         assert!(!json.contains('\n'), "an event must stay on one line");
+    }
+
+    #[test]
+    fn a_url_event_names_the_link_that_led_to_it() {
+        let event = Event::Url {
+            url: "http://127.0.0.1:8888/about.html".to_string(),
+            status: 404,
+            content_type: "HTML",
+            time_ms: 1,
+            size: 9,
+            cached: false,
+            done: 2,
+            total: 3,
+            source: Some("http://127.0.0.1:8888/".to_string()),
+            source_attr: Some("<a href>"),
+            link_text: Some("About us".to_string()),
+            source_line: Some(12),
+            source_column: Some(18),
+            external: false,
+            depth: 1,
+        };
+        assert_eq!(
+            serde_json::to_string(&event).unwrap(),
+            concat!(
+                r#"{"type":"url","url":"http://127.0.0.1:8888/about.html","status":404,"contentType":"HTML","#,
+                r#""timeMs":1,"size":9,"cached":false,"done":2,"total":3,"source":"http://127.0.0.1:8888/","#,
+                r#""sourceAttr":"<a href>","linkText":"About us","sourceLine":12,"sourceColumn":18,"#,
+                r#""external":false,"depth":1}"#
+            )
+        );
     }
 
     #[test]

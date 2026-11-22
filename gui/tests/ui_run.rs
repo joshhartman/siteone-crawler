@@ -599,6 +599,7 @@ fn add_rows(app: &mut App, from: u64, count: u64) {
                 cached: n % 3 == 0,
                 done: n + 1,
                 total: 200_000,
+                ..UrlEvent::default()
             }),
             now,
         );
@@ -854,4 +855,109 @@ fn the_link_report_gives_where_each_page_references_the_link() {
         html.contains("<td class=\"line\">212 <span class=\"more\">(and 1 more)</span></td>"),
         "{html}"
     );
+}
+
+/// A run folder as the GUI wrote it before the crawler reported link data: `run.json`, an
+/// `events.ndjson` whose `url` events have no `source`, the result JSON without a `links` table,
+/// `link-texts.json` (read pages), `external-links.json` (a check) and `retries.json` (a queue).
+/// It opens and works as before: Found on and the link text of the 404 from the `404` table and the
+/// pages the app read, the check's pages for external links, the queue, no Depth or In links.
+#[test]
+fn a_run_stored_by_the_released_gui_opens_and_works_as_before() {
+    use siteone_crawler_gui::model::link_check::{CheckReport, link_list};
+    use siteone_crawler_gui::model::results::parse_result;
+    use siteone_crawler_gui::model::retry::{Answer, CrawledAnswer, RetryState};
+
+    let env = Env::new();
+    let runs_dir = env.runs_dir();
+    let run_dir = runs::record(
+        &runs_dir,
+        "20261118-090507-crawler.siteone.io",
+        runs::SITE,
+        Some(RecordedOutcome::Finished),
+        Some(8.3),
+        73,
+    );
+    let mut lines = vec![format!(
+        r#"{{"type":"runStarted","protocol":1,"version":"2.6.1.20260914","executedAt":"2026-11-18T09:05:07+01:00","url":"{}","workingDir":{}}}"#,
+        runs::SITE,
+        serde_json::to_string(&run_dir.display().to_string()).expect("json")
+    )];
+    lines.extend(runs::site_urls(73, 73));
+    lines.push(format!(
+        r#"{{"type":"artifact","kind":"json","label":"JSON output","path":{}}}"#,
+        serde_json::to_string(&run_dir.join("result.json").display().to_string()).expect("json")
+    ));
+    lines.push(r#"{"type":"runFinished","outcome":"success","exitCode":0,"ms":25132,"interrupted":false}"#.to_string());
+    assert!(lines.iter().all(|line| !line.contains("\"source\"")), "no link data");
+    std::fs::write(run_dir.join("events.ndjson"), lines.join("\n") + "\n").expect("events");
+    std::fs::write(run_dir.join("result.json"), runs::FIXTURE).expect("result");
+    let list = link_list(&parse_result(runs::FIXTURE).expect("fixture"), runs::SITE);
+    runs::link_texts(&list).write(&run_dir).expect("link-texts.json");
+    CheckReport {
+        complete: true,
+        checked_at: "2026-11-18T10:00:00+01:00".to_string(),
+        total: list.links.len(),
+        files_not_checked: list.files,
+        truncated: 0,
+        results: runs::check_results(&list, list.links.len()),
+    }
+    .write(&run_dir)
+    .expect("external-links.json");
+    let mut retries = RetryState::default();
+    retries.enqueue(
+        runs::FIXTURE_404,
+        Answer::Crawled(CrawledAnswer {
+            status: 404,
+            content_type: "HTML".to_string(),
+            ..CrawledAnswer::default()
+        }),
+    );
+    retries.write(&run_dir).expect("retries.json");
+
+    let mut app = env.app();
+    // As in the released GUI: link texts may be fetched (none is wanted here).
+    app.fetch_link_texts = true;
+    let mut harness = harness(app, LARGE, egui::Theme::Light);
+    settle(&mut harness);
+    harness.state_mut().open_past_run(run_dir.clone());
+    settle(&mut harness);
+    let Some(PastLoad::Ready(data)) = harness.state().past_run.as_ref().map(|past| &past.load) else {
+        panic!("the run did not open");
+    };
+    assert!(data.links.graph.is_none());
+    assert!(
+        data.state
+            .urls
+            .iter()
+            .all(|row| row.link.is_none() && row.depth.is_none())
+    );
+    assert_eq!(data.retries.queue, [runs::FIXTURE_404]);
+    // The pages to read for link texts: the 404's, already read — nothing is fetched.
+    let crawled = data.links.crawled_pairs(&data.state.urls);
+    assert_eq!(crawled, data.links.internal);
+    assert!(data.links.wanted_pages(&crawled).is_empty());
+
+    harness.state_mut().run_ui.tab = Tab::Broken;
+    settle(&mut harness);
+    assert!(harness.state().text_job.is_none(), "nothing is fetched");
+    let rows = broken_rows(harness.state());
+    let missing = rows.iter().find(|row| row.url == runs::FIXTURE_404).expect("the 404");
+    assert_eq!(missing.sources, [runs::FIXTURE_404_SOURCE]);
+    assert_eq!(missing.positions, [":212"]);
+    assert_eq!((missing.link_text.as_str(), missing.more), ("Content type analysis", 0));
+    // The other failures have no page, as before.
+    let unknown = rows.iter().find(|row| row.code == 429).expect("a 429");
+    assert!(unknown.sources.is_empty());
+    assert!(shows_text(&harness, "not reported by the crawler"));
+    // External links: the check's pages, no count beyond them.
+    let external = rows.iter().find(|row| row.checked).expect("a checked link");
+    assert!(!external.sources.is_empty() && external.more == 0);
+    // The retry queue is there; the URLs tab has no link columns.
+    assert!(shows_text(&harness, "Retry queue: 1 URL"));
+    harness.state_mut().run_ui.tab = Tab::Urls;
+    settle(&mut harness);
+    assert!(harness.query_by_label("Sort by Depth").is_none());
+    assert!(harness.query_by_label("Sort by In links").is_none());
+    assert!(harness.query_by_label("Sort by Title").is_some());
 }

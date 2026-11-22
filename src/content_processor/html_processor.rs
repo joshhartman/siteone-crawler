@@ -176,42 +176,49 @@ impl HtmlProcessor {
     fn find_href_urls(&self, html: &str, source_url: &ParsedUrl, found_urls: &mut FoundUrls) {
         let source_url_str = source_url.get_full_url(true, false);
 
+        // If single_foreign_page is set and source is on a different 2nd-level domain, skip
+        if self.config.single_foreign_page && source_url.domain_2nd_level != self.config.initial_url.domain_2nd_level {
+            return;
+        }
+
         // Standard <a href="..."> links
-        let mut urls: Vec<String> = Vec::new();
+        let mut urls: Vec<Hit> = Vec::new();
         for caps in RE_A_HREF.captures_iter(html) {
-            if let Some(m) = caps.get(1).or_else(|| caps.get(2)) {
+            if let (Some(tag), Some(m)) = (caps.get(0), caps.get(1).or_else(|| caps.get(2))) {
+                // The pattern also matches <area href>, which has no text
+                let is_anchor = tag.as_str().as_bytes().get(2).is_some_and(|b| b.is_ascii_whitespace());
+                let text = if self.config.collect_link_details && is_anchor {
+                    anchor_text(html, tag.end())
+                } else {
+                    None
+                };
                 // Without the whitespace around it, which the depth and file filters below must not see
-                urls.push(m.as_str().trim_matches(|c: char| c.is_ascii_whitespace()).to_string());
+                let url = m.as_str().trim_matches(|c: char| c.is_ascii_whitespace());
+                urls.push(Hit::at(html, url, text));
             }
         }
 
         // Escaped href URLs (e.g., href\":\")
         for caps in RE_ESCAPED_HREF.captures_iter(html) {
             if let Some(m) = caps.get(1) {
-                urls.push(m.as_str().to_string());
+                urls.push(Hit::new(m, None));
             }
-        }
-
-        // If single_foreign_page is set and source is on a different 2nd-level domain, skip
-        if self.config.single_foreign_page && source_url.domain_2nd_level != self.config.initial_url.domain_2nd_level {
-            return;
         }
 
         // Filter by max depth
         if self.config.max_depth > 0 {
-            urls.retain(|url_str| {
-                let parsed = ParsedUrl::parse(url_str, Some(source_url));
+            urls.retain(|hit| {
+                let parsed = ParsedUrl::parse(hit.url, Some(source_url));
                 parsed.get_depth() <= self.config.max_depth as usize
             });
         }
 
         // Filter out files if files are disabled
         if !self.config.files_enabled {
-            urls.retain(|url_str| !RE_FILE_EXTENSION.is_match(url_str) || HTML_EXT_REGEX.is_match(url_str));
+            urls.retain(|hit| !RE_FILE_EXTENSION.is_match(hit.url) || HTML_EXT_REGEX.is_match(hit.url));
         }
 
-        let url_refs: Vec<&str> = urls.iter().map(|s| s.as_str()).collect();
-        found_urls.add_urls_from_text_array(&url_refs, &source_url_str, UrlSource::AHref);
+        add_hits(found_urls, urls, &source_url_str, UrlSource::AHref);
     }
 
     /// Find font URLs in CSS and link tags
@@ -219,18 +226,20 @@ impl HtmlProcessor {
         let source_url_str = source_url.get_full_url(true, false);
 
         // CSS @font-face url()
-        let font_urls: Vec<&str> = RE_FONT_URL
-            .captures_iter(html)
-            .filter_map(|caps| caps.get(1).map(|m| m.as_str()))
-            .collect();
-        found_urls.add_urls_from_text_array(&font_urls, &source_url_str, UrlSource::CssUrl);
+        add_hits(
+            found_urls,
+            capture_hits(&RE_FONT_URL, html),
+            &source_url_str,
+            UrlSource::CssUrl,
+        );
 
         // <link href="...(font extensions)"
-        let link_fonts: Vec<&str> = RE_FONT_LINK
-            .captures_iter(html)
-            .filter_map(|caps| caps.get(1).or_else(|| caps.get(2)).map(|m| m.as_str()))
-            .collect();
-        found_urls.add_urls_from_text_array(&link_fonts, &source_url_str, UrlSource::LinkHref);
+        add_hits(
+            found_urls,
+            capture_hits(&RE_FONT_LINK, html),
+            &source_url_str,
+            UrlSource::LinkHref,
+        );
     }
 
     /// Find image URLs from various sources
@@ -238,15 +247,21 @@ impl HtmlProcessor {
         let source_url_str = source_url.get_full_url(true, false);
 
         // <img>/<source> image attributes, lazy-loading variants included (#109)
-        let mut img_srcs: Vec<&str> = Vec::new();
-        let mut source_srcs: Vec<&str> = Vec::new();
-        let mut srcset_values: Vec<&str> = Vec::new();
+        let mut img_srcs: Vec<Hit> = Vec::new();
+        let mut source_srcs: Vec<Hit> = Vec::new();
+        // srcset values with the alt of their <img>
+        let mut srcset_values: Vec<(&str, Option<Box<str>>)> = Vec::new();
         for tag in split_at_scripts(html)
             .into_iter()
             .flat_map(|part| RE_IMG_OR_SOURCE_TAG.captures_iter(part))
         {
             let is_img = tag[1].eq_ignore_ascii_case("img");
             let attributes = tag.get(2).map_or("", |m| m.as_str());
+            let alt = if self.config.collect_link_details && is_img {
+                image_alt(attributes)
+            } else {
+                None
+            };
             for attribute in RE_TAG_ATTRIBUTE.captures_iter(attributes) {
                 let name = attribute[2].to_ascii_lowercase();
                 let Some((_, value)) = image_attribute_value(&attribute) else {
@@ -254,48 +269,51 @@ impl HtmlProcessor {
                 };
                 if IMAGE_URL_ATTRIBUTES.contains(&name.as_str()) {
                     if is_img {
-                        img_srcs.push(value);
+                        img_srcs.push(Hit::at(html, value, alt.clone()));
                     } else {
-                        source_srcs.push(value);
+                        source_srcs.push(Hit::at(html, value, None));
                     }
                 } else if IMAGE_SRCSET_ATTRIBUTES.contains(&name.as_str()) {
-                    srcset_values.push(value);
+                    srcset_values.push((value, alt.clone()));
                 }
             }
         }
-        found_urls.add_urls_from_text_array(&img_srcs, &source_url_str, UrlSource::ImgSrc);
-        found_urls.add_urls_from_text_array(&source_srcs, &source_url_str, UrlSource::SourceSrc);
+        add_hits(found_urls, img_srcs, &source_url_str, UrlSource::ImgSrc);
+        add_hits(found_urls, source_srcs, &source_url_str, UrlSource::SourceSrc);
 
         // <input src="..."
-        let input_srcs: Vec<&str> = RE_INPUT_SRC
-            .captures_iter(html)
-            .filter_map(|caps| caps.get(1).or_else(|| caps.get(2)).map(|m| m.as_str()))
-            .collect();
-        found_urls.add_urls_from_text_array(&input_srcs, &source_url_str, UrlSource::InputSrc);
+        add_hits(
+            found_urls,
+            capture_hits(&RE_INPUT_SRC, html),
+            &source_url_str,
+            UrlSource::InputSrc,
+        );
 
         // <link href="...(image extensions)"
-        let link_imgs: Vec<&str> = RE_LINK_IMAGE
-            .captures_iter(html)
-            .filter_map(|caps| caps.get(1).or_else(|| caps.get(2)).map(|m| m.as_str()))
-            .collect();
-        found_urls.add_urls_from_text_array(&link_imgs, &source_url_str, UrlSource::LinkHref);
+        add_hits(
+            found_urls,
+            capture_hits(&RE_LINK_IMAGE, html),
+            &source_url_str,
+            UrlSource::LinkHref,
+        );
 
         // CSS url() with image extensions
-        let css_imgs: Vec<&str> = RE_CSS_URL_IMAGE
-            .captures_iter(html)
-            .filter_map(|caps| caps.get(1).map(|m| m.as_str()))
-            .collect();
-        found_urls.add_urls_from_text_array(&css_imgs, &source_url_str, UrlSource::CssUrl);
+        add_hits(
+            found_urls,
+            capture_hits(&RE_CSS_URL_IMAGE, html),
+            &source_url_str,
+            UrlSource::CssUrl,
+        );
 
         // srcset candidates of <img>/<source> (collected above) and imagesrcset
         for caps in RE_IMAGESRCSET.captures_iter(html) {
             if let Some(m) = caps.get(1) {
-                srcset_values.push(m.as_str());
+                srcset_values.push((m.as_str(), None));
             }
         }
 
-        let mut srcset_urls: Vec<String> = Vec::new();
-        for srcset in &srcset_values {
+        let mut srcset_urls: Vec<Hit> = Vec::new();
+        for (srcset, alt) in &srcset_values {
             // srcset sources are separated by ", " (comma+space)
             for source in srcset.split(", ") {
                 let trimmed = source.trim();
@@ -304,35 +322,36 @@ impl HtmlProcessor {
                 }
                 // Split by whitespace to separate URL from size descriptor
                 let url_part = trimmed.split_whitespace().next().unwrap_or("");
-                let url_trimmed = url_part.trim().to_string();
-                if !url_trimmed.is_empty() && !srcset_urls.contains(&url_trimmed) {
-                    srcset_urls.push(url_trimmed);
+                let url_trimmed = url_part.trim();
+                if !url_trimmed.is_empty() && !srcset_urls.iter().any(|hit| hit.url == url_trimmed) {
+                    srcset_urls.push(Hit::at(html, url_trimmed, alt.clone()));
                 }
             }
         }
 
-        let srcset_refs: Vec<&str> = srcset_urls.iter().map(|s| s.as_str()).collect();
-        found_urls.add_urls_from_text_array(&srcset_refs, &source_url_str, UrlSource::ImgSrcset);
+        add_hits(found_urls, srcset_urls, &source_url_str, UrlSource::ImgSrcset);
     }
 
     /// Find audio URLs
     fn find_audio(&self, html: &str, source_url: &ParsedUrl, found_urls: &mut FoundUrls) {
         let source_url_str = source_url.get_full_url(true, false);
-        let urls: Vec<&str> = RE_AUDIO_SRC
-            .captures_iter(html)
-            .filter_map(|caps| caps.get(1).or_else(|| caps.get(2)).map(|m| m.as_str()))
-            .collect();
-        found_urls.add_urls_from_text_array(&urls, &source_url_str, UrlSource::AudioSrc);
+        add_hits(
+            found_urls,
+            capture_hits(&RE_AUDIO_SRC, html),
+            &source_url_str,
+            UrlSource::AudioSrc,
+        );
     }
 
     /// Find video URLs
     fn find_video(&self, html: &str, source_url: &ParsedUrl, found_urls: &mut FoundUrls) {
         let source_url_str = source_url.get_full_url(true, false);
-        let urls: Vec<&str> = RE_VIDEO_SRC
-            .captures_iter(html)
-            .filter_map(|caps| caps.get(1).or_else(|| caps.get(2)).map(|m| m.as_str()))
-            .collect();
-        found_urls.add_urls_from_text_array(&urls, &source_url_str, UrlSource::VideoSrc);
+        add_hits(
+            found_urls,
+            capture_hits(&RE_VIDEO_SRC, html),
+            &source_url_str,
+            UrlSource::VideoSrc,
+        );
     }
 
     /// Find script URLs from <script src>, <link href=".js">, .src= assignments, and NextJS chunks
@@ -340,28 +359,31 @@ impl HtmlProcessor {
         let source_url_str = source_url.get_full_url(true, false);
 
         // <script src="..."
-        let script_srcs: Vec<&str> = RE_SCRIPT_SRC
-            .captures_iter(html)
-            .filter_map(|caps| caps.get(1).or_else(|| caps.get(2)).map(|m| m.as_str()))
-            .collect();
-        found_urls.add_urls_from_text_array(&script_srcs, &source_url_str, UrlSource::ScriptSrc);
+        add_hits(
+            found_urls,
+            capture_hits(&RE_SCRIPT_SRC, html),
+            &source_url_str,
+            UrlSource::ScriptSrc,
+        );
 
         // <link href="...(json|js)"
-        let link_js: Vec<&str> = RE_LINK_JS
-            .captures_iter(html)
-            .filter_map(|caps| caps.get(1).or_else(|| caps.get(2)).map(|m| m.as_str()))
-            .collect();
-        found_urls.add_urls_from_text_array(&link_js, &source_url_str, UrlSource::LinkHref);
+        add_hits(
+            found_urls,
+            capture_hits(&RE_LINK_JS, html),
+            &source_url_str,
+            UrlSource::LinkHref,
+        );
 
         // .src = "..." (lazy loading in JS)
-        let dot_srcs: Vec<&str> = RE_DOT_SRC
-            .captures_iter(html)
-            .filter_map(|caps| caps.get(1).map(|m| m.as_str()))
-            .collect();
-        found_urls.add_urls_from_text_array(&dot_srcs, &source_url_str, UrlSource::InlineScriptSrc);
+        add_hits(
+            found_urls,
+            capture_hits(&RE_DOT_SRC, html),
+            &source_url_str,
+            UrlSource::InlineScriptSrc,
+        );
 
-        // NextJS chunks
-        let mut next_js_chunks: Vec<String> = Vec::new();
+        // NextJS chunks (built from the matched path; the offset is where the match starts)
+        let mut next_js_chunks: Vec<(String, usize)> = Vec::new();
         for caps in RE_NEXTJS_CHUNKS.captures_iter(html) {
             if let Some(m) = caps.get(1) {
                 let matched = m.as_str();
@@ -378,31 +400,31 @@ impl HtmlProcessor {
                 } else {
                     format!("{}/_next/{}", source_url.get_full_homepage_url(), matched)
                 };
-                next_js_chunks.push(chunk_url);
+                next_js_chunks.push((chunk_url, m.start()));
             }
         }
-        let chunk_refs: Vec<&str> = next_js_chunks.iter().map(|s| s.as_str()).collect();
-        found_urls.add_urls_from_text_array(&chunk_refs, &source_url_str, UrlSource::InlineScriptSrc);
+        for (chunk_url, offset) in &next_js_chunks {
+            found_urls.add_url_with_details(chunk_url, *offset, None, &source_url_str, UrlSource::InlineScriptSrc);
+        }
     }
 
     /// Find stylesheet URLs from <link> tags with rel="stylesheet"
     fn find_stylesheets(&self, html: &str, source_url: &ParsedUrl, found_urls: &mut FoundUrls) {
         let source_url_str = source_url.get_full_url(true, false);
 
-        let mut stylesheet_urls: Vec<String> = Vec::new();
+        let mut stylesheet_urls: Vec<Hit> = Vec::new();
         for caps in RE_LINK_STYLESHEET.captures_iter(html) {
             let full_match = caps.get(0).map(|m| m.as_str()).unwrap_or("");
             if let Some(href) = caps.get(1) {
                 // Only include if no rel= attribute or rel="stylesheet"
                 let full_lower = full_match.to_lowercase();
                 if !full_lower.contains("rel=") || full_lower.contains("stylesheet") {
-                    stylesheet_urls.push(href.as_str().to_string());
+                    stylesheet_urls.push(Hit::new(href, None));
                 }
             }
         }
 
-        let url_refs: Vec<&str> = stylesheet_urls.iter().map(|s| s.as_str()).collect();
-        found_urls.add_urls_from_text_array(&url_refs, &source_url_str, UrlSource::LinkHref);
+        add_hits(found_urls, stylesheet_urls, &source_url_str, UrlSource::LinkHref);
     }
 
     /// Remove all unwanted code from HTML with respect to --disable-* options
@@ -805,10 +827,12 @@ impl ContentProcessor for HtmlProcessor {
         // When --ignore-html-comments is set, strip `<!-- ... -->` regions before URL
         // extraction so commented links are not crawled or reported as broken.
         // This only affects extraction here — the stored/exported content is untouched.
+        // `removed` maps offsets in the stripped content back to the content as received.
         let stripped;
+        let mut removed: Vec<(usize, usize)> = Vec::new();
         let content: &str = if self.config.ignore_html_comments && content.contains("<!--") {
-            stripped = RE_HTML_COMMENT.replace_all(content, "");
-            stripped.as_ref()
+            stripped = strip_html_comments(content, &mut removed);
+            stripped.as_str()
         } else {
             content
         };
@@ -836,6 +860,13 @@ impl ContentProcessor for HtmlProcessor {
 
         if self.config.styles_enabled {
             self.find_stylesheets(content, source_url, &mut found_urls);
+        }
+
+        if !removed.is_empty() {
+            found_urls.map_offsets(|offset| {
+                let comments_before = removed.partition_point(|(position, _)| *position <= offset);
+                offset + comments_before.checked_sub(1).map_or(0, |i| removed[i].1)
+            });
         }
 
         if found_urls.get_count() > 0 {
@@ -939,6 +970,148 @@ impl ContentProcessor for HtmlProcessor {
     fn set_debug_mode(&mut self, debug_mode: bool) {
         self.debug_mode = debug_mode;
     }
+}
+
+/// One URL found in the HTML: its text (a slice of the HTML), the byte offset where it starts
+/// and its link text (with `--link-details`).
+struct Hit<'a> {
+    url: &'a str,
+    offset: usize,
+    text: Option<Box<str>>,
+}
+
+impl<'a> Hit<'a> {
+    fn new(m: regex::Match<'a>, text: Option<Box<str>>) -> Self {
+        Hit {
+            url: m.as_str(),
+            offset: m.start(),
+            text,
+        }
+    }
+
+    /// `url` is a slice of `html` (possibly found in a part of it): its offset is where it lies.
+    fn at(html: &str, url: &'a str, text: Option<Box<str>>) -> Self {
+        Hit {
+            url,
+            offset: (url.as_ptr() as usize).saturating_sub(html.as_ptr() as usize),
+            text,
+        }
+    }
+}
+
+/// The URL in group 1 (or 2) of every match of `re`.
+fn capture_hits<'a>(re: &Regex, html: &'a str) -> Vec<Hit<'a>> {
+    re.captures_iter(html)
+        .filter_map(|caps| caps.get(1).or_else(|| caps.get(2)).map(|m| Hit::new(m, None)))
+        .collect()
+}
+
+fn add_hits(found_urls: &mut FoundUrls, hits: Vec<Hit>, source_url: &str, source: UrlSource) {
+    for hit in hits {
+        found_urls.add_url_with_details(hit.url, hit.offset, hit.text, source_url, source);
+    }
+}
+
+/// `content` without its `<!-- ... -->` comments, as `RE_HTML_COMMENT.replace_all(content, "")`.
+/// `removed` gets, per comment, its position in the result and the bytes removed up to it.
+fn strip_html_comments(content: &str, removed: &mut Vec<(usize, usize)>) -> String {
+    let mut stripped = String::with_capacity(content.len());
+    let mut last = 0;
+    let mut removed_bytes = 0;
+    for comment in RE_HTML_COMMENT.find_iter(content) {
+        stripped.push_str(&content[last..comment.start()]);
+        removed_bytes += comment.len();
+        removed.push((stripped.len(), removed_bytes));
+        last = comment.end();
+    }
+    stripped.push_str(&content[last..]);
+    stripped
+}
+
+/// Link text is cut to this many characters (the last one an ellipsis).
+pub const MAX_LINK_TEXT_CHARS: usize = 120;
+
+/// How far after an `<a>` start tag its text is looked for.
+const ANCHOR_TEXT_WINDOW: usize = 4096;
+
+/// Tags that separate the words around them in the text of a link; inline tags do not.
+const WORD_BREAKING_TAGS: &[&str] = &[
+    "br", "p", "/p", "div", "/div", "li", "/li", "td", "th", "h1", "h2", "h3", "h4", "h5", "h6",
+];
+
+/// Whether `rest` (what follows a `<`) starts with the tag `name`, case-insensitively.
+fn starts_with_tag(rest: &str, name: &str) -> bool {
+    let bytes = rest.as_bytes();
+    bytes.len() >= name.len()
+        && bytes[..name.len()].eq_ignore_ascii_case(name.as_bytes())
+        && bytes
+            .get(name.len())
+            .is_none_or(|b| b.is_ascii_whitespace() || *b == b'>' || *b == b'/')
+}
+
+/// The visible text of the `<a>` whose start tag ends at `start` in `html`: up to its `</a>` (or
+/// the next `<a>`, at most `ANCHOR_TEXT_WINDOW` bytes on), tags removed, entities decoded,
+/// whitespace collapsed. When it has no text, the `alt` of its first image.
+fn anchor_text(html: &str, start: usize) -> Option<Box<str>> {
+    let mut end = (start + ANCHOR_TEXT_WINDOW).min(html.len());
+    while !html.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut rest = html.get(start..end)?;
+    let mut text = String::new();
+    let mut alt: Option<Box<str>> = None;
+    while let Some(lt) = rest.find('<') {
+        text.push_str(&rest[..lt]);
+        let tag = &rest[lt + 1..];
+        if starts_with_tag(tag, "/a") || starts_with_tag(tag, "a") {
+            rest = "";
+            break;
+        }
+        let tag_end = tag.find('>').map_or(tag.len(), |gt| gt + 1);
+        if alt.is_none() && starts_with_tag(tag, "img") {
+            alt = image_alt(&tag[3..tag_end]);
+        }
+        if WORD_BREAKING_TAGS.iter().any(|name| starts_with_tag(tag, name)) {
+            text.push(' ');
+        }
+        rest = &tag[tag_end..];
+    }
+    text.push_str(rest);
+    link_text(&html_entity_decode(&text)).or(alt)
+}
+
+/// The `alt` of an `<img>` with these attributes.
+fn image_alt(attributes: &str) -> Option<Box<str>> {
+    RE_TAG_ATTRIBUTE
+        .captures_iter(attributes)
+        .find(|attribute| attribute[2].eq_ignore_ascii_case("alt"))
+        .and_then(|attribute| {
+            let value = attribute.get(3).or(attribute.get(4)).or(attribute.get(5))?;
+            link_text(&html_entity_decode(value.as_str()))
+        })
+}
+
+/// `text` with its whitespace collapsed and trimmed, cut to `MAX_LINK_TEXT_CHARS`; `None` when empty.
+fn link_text(text: &str) -> Option<Box<str>> {
+    let mut collapsed = String::new();
+    for word in text.split_whitespace() {
+        if !collapsed.is_empty() {
+            collapsed.push(' ');
+        }
+        collapsed.push_str(word);
+        if collapsed.len() > MAX_LINK_TEXT_CHARS * 4 {
+            break;
+        }
+    }
+    if collapsed.is_empty() {
+        return None;
+    }
+    if collapsed.chars().count() > MAX_LINK_TEXT_CHARS {
+        let mut cut: String = collapsed.chars().take(MAX_LINK_TEXT_CHARS - 1).collect();
+        cut.push('\u{2026}');
+        return Some(cut.into_boxed_str());
+    }
+    Some(collapsed.into_boxed_str())
 }
 
 /// `html` cut where the content of every `<script>` block starts and ends: markup in a script is a JS
@@ -1343,6 +1516,87 @@ mod tests {
             "commented link should NOT be captured when ignore_html_comments is set. Found: {:?}",
             urls
         );
+    }
+
+    /// The found URL `url` (as normalized) of `html`.
+    fn found<'a>(found: &'a FoundUrls, url: &str) -> &'a crate::engine::found_url::FoundUrl {
+        found
+            .get_urls()
+            .values()
+            .find(|found_url| found_url.url == url)
+            .unwrap_or_else(|| panic!("{url} is found"))
+    }
+
+    fn link_details_processor() -> HtmlProcessor {
+        let mut config = make_config();
+        config.collect_link_details = true;
+        HtmlProcessor::new(config)
+    }
+
+    #[test]
+    fn link_text_of_anchors_and_images() {
+        let long = "word ".repeat(40);
+        let html = format!(
+            concat!(
+                "<a href=\"/a\">  Hello <b>big</b>\n  world &amp; more </a>",
+                "<a class=\"logo\" href=\"/b\"><img src=\"/logo.png\" alt=\" Logo  &amp; co \"></a>",
+                "<a href=\"/c\"></a><a href=\"/d\">Read<br>more</a>",
+                "<a href=\"/long\">{}</a><img src=\"/deco.png\" alt=\"\">",
+                "<area shape=\"rect\" href=\"/area\" alt=\"Area\"><p>after</p>",
+            ),
+            long
+        );
+        let source = ParsedUrl::parse("https://example.com/", None);
+        let urls = link_details_processor().find_urls(&html, &source).unwrap();
+        assert_eq!(found(&urls, "/a").text.as_deref(), Some("Hello big world & more"));
+        assert_eq!(
+            found(&urls, "/b").text.as_deref(),
+            Some("Logo & co"),
+            "a link with only an image has the image's alt"
+        );
+        assert_eq!(found(&urls, "/logo.png").text.as_deref(), Some("Logo & co"));
+        assert_eq!(found(&urls, "/c").text, None);
+        assert_eq!(found(&urls, "/d").text.as_deref(), Some("Read more"));
+        let long_text = found(&urls, "/long").text.as_deref().unwrap();
+        assert_eq!(long_text.chars().count(), MAX_LINK_TEXT_CHARS);
+        assert!(long_text.ends_with('\u{2026}'));
+        assert_eq!(found(&urls, "/deco.png").text, None, "an empty alt is no text");
+        assert_eq!(found(&urls, "/area").text, None);
+
+        // Without --link-details no text is collected
+        let urls = HtmlProcessor::new(make_config()).find_urls(&html, &source).unwrap();
+        assert_eq!(found(&urls, "/a").text, None);
+        assert_eq!(found(&urls, "/logo.png").text, None);
+    }
+
+    #[test]
+    fn offsets_point_at_the_url_in_the_html_as_received() {
+        let html = concat!(
+            "<html><head><link rel=\"stylesheet\" href=\"/s.css\"><script src=\"/app.js\"></script></head>\n",
+            "<body><a href=\" /x\">X</a>\n",
+            "<img srcset=\"/a.png 1x, /b.png 2x\" alt=\"Pic\"><div style=\"background:url(/bg.jpg)\"></div>",
+        );
+        let source = ParsedUrl::parse("https://example.com/", None);
+        let urls = link_details_processor().find_urls(html, &source).unwrap();
+        for url in ["/s.css", "/app.js", "/a.png", "/b.png", "/bg.jpg"] {
+            assert_eq!(found(&urls, url).offset, html.find(url), "{url}");
+        }
+        // The whitespace around the URL is not part of it: the offset is where the URL starts
+        assert_eq!(found(&urls, "/x").offset, html.find("/x"));
+        assert_eq!(found(&urls, "/b.png").text.as_deref(), Some("Pic"));
+    }
+
+    #[test]
+    fn offsets_skip_the_html_comments_left_out() {
+        let mut config = make_config();
+        config.ignore_html_comments = true;
+        config.collect_link_details = true;
+        let processor = HtmlProcessor::new(config);
+        let html = "<!-- <a href=\"/commented\">x</a> --><p><a href=\"/one\">1</a><!-- y --> <a href=\"/two\">2</a>";
+        let source = ParsedUrl::parse("https://example.com/", None);
+        let urls = processor.find_urls(html, &source).unwrap();
+        assert_eq!(found(&urls, "/one").offset, html.find("/one"));
+        assert_eq!(found(&urls, "/two").offset, html.find("/two"));
     }
 
     #[test]

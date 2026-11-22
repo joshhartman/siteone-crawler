@@ -1715,6 +1715,43 @@ mod tests {
         assert_eq!(timeout(&imported.config), ["--timeout=30"]);
     }
 
+    #[test]
+    fn link_details_are_on_by_default_and_always_passed() {
+        let schema = schema();
+        let secrets = SecretValues::default();
+        let details = |config: &CrawlConfig| -> Vec<String> {
+            config
+                .to_argv(&schema, &secrets)
+                .into_iter()
+                .filter(|arg| arg.starts_with("--link-details"))
+                .collect()
+        };
+        let mut config = CrawlConfig::new("https://example.com/");
+        assert_eq!(config.get(&schema, "--link-details"), Some(Value::Bool(true)));
+        assert_eq!(details(&config), ["--link-details=true"]);
+        assert!(!config.is_changed(&schema, "--link-details"));
+        config.set(&schema, "--link-details", Value::Bool(false)).expect("set");
+        assert!(config.is_changed(&schema, "--link-details"));
+        assert_eq!(details(&config), ["--link-details=false"]);
+        // A command or a stored configuration without it gets the app's default; with it off, off.
+        let imported = import_args(&schema, &["--url=https://example.com/".to_string()]);
+        assert_eq!(details(&imported.config), ["--link-details=true"]);
+        let off = import_args(
+            &schema,
+            &[
+                "--url=https://example.com/".to_string(),
+                "--link-details=false".to_string(),
+            ],
+        );
+        assert_eq!(details(&off.config), ["--link-details=false"]);
+        // The CLI's parser takes both.
+        for config in [&imported.config, &off.config] {
+            let mut argv = config.to_argv(&schema, &secrets);
+            argv.push(format!("--config-file={}", empty_config_file().display()));
+            check_argv(&argv).expect("valid argv");
+        }
+    }
+
     /// The heart of the configuration model: every editable option, with adversarial values, comes
     /// back exactly from the crawler's own option parser — and touches no other option.
     #[test]

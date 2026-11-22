@@ -74,6 +74,8 @@ pub struct ProcessorConfig {
     /// When true, URLs inside HTML comments (`<!-- ... -->`) are stripped before
     /// URL extraction, so commented links are not crawled or reported as broken.
     pub ignore_html_comments: bool,
+    /// `--link-details`: the HTML processor also captures the link text of `<a>` and `<img>`.
+    pub collect_link_details: bool,
     pub initial_url: ParsedUrl,
     /// Returns true if the given host is allowed for downloading static files
     /// (`--allowed-domain-for-external-files`). Used by offline export so that
@@ -111,6 +113,7 @@ impl std::fmt::Debug for ProcessorConfig {
                 &self.offline_export_preserve_url_structure,
             )
             .field("ignore_html_comments", &self.ignore_html_comments)
+            .field("collect_link_details", &self.collect_link_details)
             .field("initial_url", &self.initial_url)
             .field(
                 "is_domain_allowed_for_static_files",
@@ -146,6 +149,7 @@ impl ProcessorConfig {
             force_relative_urls: false,
             offline_export_preserve_url_structure: false,
             ignore_html_comments: false,
+            collect_link_details: false,
             initial_url,
             is_domain_allowed_for_static_files: None,
             is_external_domain_allowed_for_crawling: None,

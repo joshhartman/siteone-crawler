@@ -6,6 +6,7 @@ pub mod coverage;
 pub mod events;
 pub mod history;
 pub mod link_check;
+pub mod link_data;
 pub mod link_report;
 pub mod link_text;
 pub mod paths;

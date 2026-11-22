@@ -42,6 +42,10 @@ pub struct RefPosition {
     /// column is shown too.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub long_line: bool,
+    /// Reported by the crawler (in the page as it received it), not read by the app after the
+    /// crawl. Never stored: a crawler position comes from the result JSON each time.
+    #[serde(skip)]
+    pub crawled: bool,
 }
 
 fn one() -> u32 {
@@ -69,6 +73,17 @@ impl RefPosition {
             text.push_str(&format!(" (and {} more)", self.count - 1));
         }
         text
+    }
+
+    /// For a tooltip: "Referenced at line 1929 (and 2 more) in the file as fetched after the
+    /// crawl." — or, from the crawler, "in the page as the crawler received it".
+    pub fn tip(&self) -> String {
+        let place = if self.crawled {
+            "in the file as the crawler received it"
+        } else {
+            "in the file as fetched after the crawl"
+        };
+        format!("Referenced at {} {place}.", self.describe())
     }
 }
 
@@ -302,6 +317,7 @@ mod tests {
                         column: 9,
                         count: 3,
                         long_line: false,
+                        crawled: false,
                     },
                 )]),
             },
@@ -319,6 +335,7 @@ mod tests {
                         column: 20345,
                         count: 1,
                         long_line: true,
+                        crawled: false,
                     },
                 )]),
             },

@@ -26,8 +26,11 @@ pub struct ReportRow {
     pub link_text: String,
     /// Every page it was found on.
     pub found_on: Vec<String>,
-    /// For each of `found_on`, where it references the URL (when the page was read and does).
+    /// For each of `found_on`, where it references the URL (from the crawler, or when the app read
+    /// the page and it does).
     pub positions: Vec<Option<RefPosition>>,
+    /// Pages that reference the URL beyond `found_on` (the crawler lists 50 per URL).
+    pub more: usize,
 }
 
 impl ReportRow {
@@ -224,7 +227,7 @@ fn group_html(html: &mut String, group: &ReportGroup) {
     html.push_str(COLUMNS);
     html.push_str("<thead><tr><th>Status</th><th>URL</th><th>Title or kind</th><th>Link text</th><th>Found on</th></tr></thead>\n<tbody>\n");
     for row in &group.rows {
-        let found_on: Vec<String> = row
+        let mut found_on: Vec<String> = row
             .found_on
             .iter()
             .enumerate()
@@ -236,6 +239,10 @@ fn group_html(html: &mut String, group: &ReportGroup) {
                 )
             })
             .collect();
+        if row.more > 0 {
+            let noun = if row.more == 1 { "page" } else { "pages" };
+            found_on.push(format!("<span class=\"more\">and {} more {noun}</span>", row.more));
+        }
         html.push_str(&format!(
             "<tr><td class=\"status\">{}</td><td class=\"url\">{}</td><td>{}</td><td>{}</td><td class=\"url\">{}</td></tr>\n",
             escape(&row.status),
@@ -260,7 +267,7 @@ fn page_html(html: &mut String, group: &PageGroup<ReportRow>) {
         group.items.len()
     ));
     if group.page.is_none() {
-        html.push_str("<p class=\"note\">The crawler reports the page a link was found on only for a 404, and only the first such page.</p>\n");
+        html.push_str("<p class=\"note\">The crawler reported no page for these links: a start URL has none, and crawlers before link data report the page only for a 404, and only the first such page.</p>\n");
     }
     html.push_str("<table>\n<colgroup><col class=\"c-status\"><col class=\"c-url-wide\"><col class=\"c-title-wide\"><col class=\"c-line\"><col></colgroup>\n");
     html.push_str(
@@ -410,8 +417,10 @@ mod tests {
                                 column: 22,
                                 count: 3,
                                 long_line: false,
+                                crawled: false,
                             }),
                         ],
+                        more: 2,
                     }],
                     ..ReportGroup::default()
                 },
@@ -449,7 +458,9 @@ mod tests {
                         column: 20345,
                         count: 1,
                         long_line: true,
+                        crawled: false,
                     })],
+                    more: 0,
                 }],
             }],
         }
@@ -505,6 +516,11 @@ mod tests {
         ));
         assert!(html.contains("<td class=\"line\">1:20345</td>"), "{html}");
         assert!(html.contains("<th>Line</th>"));
+        // The pages beyond the ones listed (the crawler lists 50 per URL) are counted.
+        assert!(
+            html.contains("<br><span class=\"more\">and 2 more pages</span></td>"),
+            "{html}"
+        );
         // Nothing broken: no section, and an empty gap list says so.
         let quiet = LinkReport {
             site: "https://site.example/".to_string(),

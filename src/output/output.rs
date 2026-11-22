@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::components::summary::summary::Summary;
 use crate::components::super_table::SuperTable;
+use crate::engine::link_graph::LinkReport;
 use crate::extra_column::ExtraColumn;
 use crate::output::output_type::OutputType;
 use crate::scoring::ci_gate::CiGateResult;
@@ -108,6 +109,10 @@ pub trait Output: Send + Sync {
         _markdown_paths: Option<&HashMap<String, String>>,
     ) {
     }
+
+    /// With `--link-details`: the link facts of each crawled URL and the `links` table. Only the
+    /// JSON output shows them.
+    fn add_link_details(&mut self, _report: &LinkReport) {}
 }
 
 /// Basic crawl statistics, used by add_total_stats().

@@ -81,12 +81,14 @@ cargo clippy --no-default-features -- -D warnings  # lint the lean variant
    - Per-URL flow: check robots.txt → HTTP request → on error, store with negative status code → on success, run content processors → extract links from HTML → enqueue discovered URLs
    - Content processors (`HtmlProcessor`, `CssProcessor`, etc.) transform response bodies during crawl — used by offline/markdown exporters for URL rewriting
    - Each visited URL's response is stored in `Status` for post-crawl analysis
+   - Each `QueueEntry` carries its link `depth` and the `FirstRef` that queued it (the referring page, attribute, and with `--link-details` link text and position), which the `url` event reports. With `--link-details` every link found is also recorded, also for targets already known, skipped or dropped: each page collects its links in a `PageLinks` (`engine/link_graph.rs`) and commits them with one short lock of the `LinkGraph`
    - Per-URL data collected: status code, headers, body, response time, content type, size, redirects
 
 6. **Post-Crawl Analysis** (`Manager::run_post_crawl()`): Sequential pipeline after crawling ends:
    - Transfer skipped URLs from crawler to `Status`
    - Run all registered analyzers (`AnalysisManager::run_analyzers()`): each analyzer gets read access to `Status` (all crawled data) and write access to `Output` (adds tables/findings)
    - Add content processor stats table
+   - With `--link-details`: `LinkGraph::report()` (final depths by a 0-1 BFS) goes to `Output::add_link_details`, which only `JsonOutput` implements (per-URL keys in `results` + the `links` table; not a `Status` SuperTable, so the text output and HTML report are unchanged)
 
 7. **Exporters** (`Manager::run_exporters()`): Generate output files based on CLI options:
    - `SitemapExporter`: XML/TXT sitemap files
@@ -179,6 +181,7 @@ This approach is useful for reproducing bug reports, testing regex edge cases (e
 - `src/export/html_report/report.rs`: HTML report generation with embedded template
 - `src/scoring/scorer.rs`: Quality score calculation from summary findings
 - `src/scoring/ci_gate.rs`: CI/CD threshold evaluation
+- `src/engine/link_graph.rs` (`--link-details`): every (page → URL) link once per page, interned `u32` ids; up to 50 referrers per URL (`LinkRef`: attribute, link text, 1-based line/column) plus the total count, each page's distinct out-links. Offsets come from the extraction itself (`FoundUrl::offset`, set by the HTML and CSS processors; the HTML processor maps them back through the comments `--ignore-html-comments` cuts out) and are turned into line/column in one pass per page (`line_columns`); link text (`FoundUrl::text`) is captured by the HTML processor only with `ProcessorConfig::collect_link_details`. No positions for a `--browser`-rendered DOM or a body rewritten before extraction
 - `src/engine/fetcher.rs`: `Fetcher` trait — the single seam the crawl loop fetches through; `HttpClient` (direct HTTP) and `BrowserRenderer` both implement it
 - `src/browser/` (feature `browser`): `BrowserRenderer` (renderer.rs), Chromium detection/download/launch (launcher.rs), CDP diagnostics collection (diagnostics.rs), screenshots in every `--screenshot-viewport` size + pre-capture animation settling (screenshot.rs), `--screenshot-viewport` parsing: `WxH`/presets, up to 5 sizes (viewport.rs), pre-capture auto-scroll for lazy-loaded and scroll-triggered content (auto_scroll.rs, `--browser-auto-scroll`, on by default), cookie-banner dismissal/hiding (cookie_consent.rs). `diagnostics.rs` data types are always compiled so `HttpResponse` can carry an inert `Option<BrowserDiagnostics>`, and so is `viewport.rs`, because option validation runs in every build. With `--ai-geo`, `BrowserRenderer::fetch` records `BrowserDiagnostics.raw_text_chars` (the Main-region text of the HTML as fetched, `ai::geo::render::own_text_chars`, dialogs and cookie banners left out) before it replaces the body with the rendered DOM, so `--ai-geo` compares raw and rendered text without a refetch
 - `src/export/animation_exporter.rs` (feature `browser`): builds GIF/MP4 animations from per-page screenshots (GIF via the embedded `image` crate, MP4 via external ffmpeg; frames streamed to disk for O(1) memory)

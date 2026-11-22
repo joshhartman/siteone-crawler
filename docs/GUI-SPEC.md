@@ -87,6 +87,7 @@ gui/
       history.rs           # run records
       link_check.rs        # external links of a run (from the result JSON), check results, external-links.json
       link_text.rs         # link texts and reference positions per source page, URL normalization, link-texts.json
+      link_data.rs         # the crawler's link data: the url event's referrer, the `links` table (LinkGraph), text/position lookup
       retry.rs             # retry queue and results, retries.json, the retry child's argv, merge into the run
       link_report.rs       # link-report.html (rendering, escaping), grouping by page
       coverage.rs          # what a run checked and did not (scope from the result JSON, gaps)
@@ -241,7 +242,11 @@ stdout, also on failure (`{"ok":false,"error":…}`); the GUI shows `error` verb
 The crawler never requests anything on another host. The **app** checks a run's external links
 after the crawl (`backend/link_check.rs`, no egui; workers + `mpsc` + waker like the runner).
 
-- **Which links** (`model/link_check.rs::link_list`): the result JSON's `skipped` table (rows with
+- **Which links, with link data** (`--link-details`, the app's default): the result JSON's `links`
+  table — every URL on another host that a page links to with `<a href>` (the others are external
+  files, counted), with every kept referring page (up to 50) and `inLinks` as the count, most
+  referring pages first, at most 2,000 links.
+- **Which links, without** (`model/link_check.rs::link_list`): the result JSON's `skipped` table (rows with
   reason `Not allowed host`; `sourceAttr` tells a link, `<a href>`, from a file; `sourceUqId` is the
   page without the start URL's scheme and host) joined by URL with `external-urls` (`count`;
   `foundOn` = full URLs joined by `", "`, ` (+N)` for more). A URL only one table has is used too
@@ -282,12 +287,28 @@ after the crawl (`backend/link_check.rs`, no egui; workers + `mpsc` + waker like
 
 ### 4.8 Link texts
 
-The crawler records no link text. To help find a broken link on its page, the app fetches the pages
-the broken and external links were found on and reads the text of the link that points to each and
-where in the file it is — the line to go and fix (`backend/link_text.rs`).
+**From the crawler** (`model/link_data.rs`): every `url` event names the page that queued the URL
+(`source`, `sourceAttr`; with `--link-details` also `linkText`, `sourceLine`, `sourceColumn`), so
+*Found on* is known as each URL arrives, for every status. With `--link-details` the result JSON's
+`links` table lists every referring page of every URL (up to 50, the queueing page first, with the
+total `inLinks`) with its link text and position. The link text is the crawler's; a reference
+without one is named by its attribute (`<script src>`, `redirect`), one in a stylesheet "in a
+stylesheet". The position is the crawler's line and column in the page as it received it; the
+crawler does not report the length of the line, so a column beyond 500 (a minified file) is shown
+too (`style.min.css:1:20345`), any other reference by its line. Pages the crawler reported a
+position for are **not fetched again**.
 
-- **Which pages**: after a crawl, the pages of the internal 404s (the `404` table's `sourceUqId`);
-  once the run's external links are checked, also the pages of the external links. Each page is
+**The app's own reading** is the fallback (`backend/link_text.rs`): the app fetches a page a broken
+or external link was found on and reads the text of the link that points to it and where in the
+file it is — only for a reference the crawler gave no position for that the reading can locate (an
+HTML attribute or a stylesheet's `url()`: a run without `--link-details`, a page rendered with
+`--browser`), and for a run of a crawler without link data (its `404` table, as before). References
+found in scripts, sitemaps or redirects are never fetched for. A run with complete crawler data
+makes no request.
+
+- **Which pages**: after a crawl, the pages above of the broken crawled URLs (the `404` table's
+  `sourceUqId` for runs of an older crawler); once the run's external links are checked, also the
+  pages of the external links without a crawler position. Each page is
   fetched once per run; what it says about every target the run knows is kept. At most 200 pages
   per run (the rest is reported). A *found on* that is a stylesheet (a missing font or background
   image referenced by `url()`) is fetched like a page and counts within the same 200.
@@ -330,8 +351,8 @@ where in the file it is — the line to go and fix (`backend/link_text.rs`).
 - **External links**: their *found on* pages (from `external-urls`, any number) are fetched under
   the same rules — once the run's external links are checked, pages of the crawled site only,
   within the same 200 — and get positions there; no request is added for positions.
-- The crawler keeps only the first page that referenced an internal URL (404s only), so the app
-  cannot list every page that links to a URL.
+- Without `--link-details` the app knows only the first page that referenced a URL (the event's),
+  and for runs of an older crawler only for 404s.
 
 ### 4.9 Retry queue
 
@@ -370,7 +391,10 @@ views show what is still broken.
   scripts, a stylesheet and links is requested alone; a redirect is reported as the answer (301)
   and its target is not requested; no robots.txt is requested. `--analyzer-filter-regex` keeps
   only the analyzer whose `seo` table gives the title of an OK HTML answer; the DNS and SSL/TLS
-  analyzers, which open connections of their own, do not run. The request options are taken from
+  analyzers, which open connections of their own, do not run. One process per pass with
+  `--url-list` was tested and is not used (`core_retry.rs` pins why): it sends one request per URL,
+  but spaces only the starts of requests (no 500 ms after a slow answer) and requests every URL of
+  a host that does not answer. The request options are taken from
   the run's argv and pinned by a unit test that fails when the CLI gains an option the list has not
   classified: `--device`, `--user-agent`, `--timeout`, `--proxy`, `--http-auth`, `--header`,
   `--accept-invalid-certs`, `--accept-encoding`, `--resolve`, `--transform-url`,
@@ -437,7 +461,8 @@ external resource, light and dark by `prefers-color-scheme`, printable).
   refused external links — and, folded (`<details>`), the working external links. Columns: status,
   URL, title or kind, link text, found on — each page with where it references the link
   (`…/page-styles.css:1929`, "(and 2 more)" for further references on that page; the link opens
-  the page without it). Last, **Broken links by page**.
+  the page without it), then "and N more pages" beyond the 50 the crawler lists. Last, **Broken
+  links by page**.
 - **What was checked** (`model/coverage.rs`): *Scope* — the start host, with or without `www.`, and
   the `--allowed-domain-for-crawling` and `--include-regex` values of the result JSON's `options`;
   *Crawled URLs* — the number and the newest answers by class ("268 OK (2xx), 1 redirect (3xx),
@@ -555,6 +580,14 @@ with that default, so the command always says what the run does: a configuration
 override emits `--timeout=30`, one set to 5 emits `--timeout=5`. A stored configuration or an
 imported command without `--timeout` gets the app's default.
 
+The same holds for **`--link-details`, on by default** (the CLI's default is off): the crawler then
+reports every referring page of each URL with its link text and line (§4.8), which the Link checker,
+the link report and the URLs tab use, and the app needs no second request of those pages. Every run
+emits `--link-details=true` (or `=false` when turned off in Setup → Scope, *Record every referring
+page*); a stored configuration or an imported command without it gets the default. The cost: a
+larger result JSON on big sites (a generated 3,000-page site with about 60 links per page: 22 MB
+instead of 0.9 MB, `docs/JSON-OUTPUT.md` §5.29). A retry child never gets it (§4.9).
+
 - `to_argv(&schema, &secrets) -> Vec<String>`: `--url`, then overrides in schema order, one
   `--name=value` element per value; list options use the form that round-trips every item
   exactly (see `options/option.rs`: repeated options and the literal-array `--name:=value` form);
@@ -645,7 +678,8 @@ optional, an `Unknown` catch-all variant. `RunState::apply(event)` is a pure fun
 input and therefore also rebuilds a finished run from its `events.ndjson` (history).
 
 `RunState` holds: run metadata; phase states (crawl / ai / analysis); `done`/`total`; URL rows
-(compact struct per row); counters by status class and content type; total bytes; average and
+(compact struct per row, with the `url` event's depth and its referrer — page, attribute, link text,
+line, column — whose strings are shared between rows; none from an older crawler); counters by status class and content type; total bytes; average and
 maximum response time; URLs per second over the last 5 s; AI tasks (key → label, done, total,
 state), AI request log, AI usage totals; artifacts; issues; console lines (ring buffer, 20 000
 lines); final outcome.
@@ -654,8 +688,12 @@ lines); final outcome.
 
 Typed view of the result JSON (`docs/JSON-OUTPUT.md`): `qualityScores` (overall + 5 categories
 with deductions), `stats`, `summary.items`, `tables` (ordered columns, string rows), `options` (kept
-as JSON: a value of an unexpected type never makes the file unreadable). Loaded on a
-worker thread; fields the GUI does not use are skipped; a missing or unreadable file yields an
+as JSON: a value of an unexpected type never makes the file unreadable), and with
+`--link-details` the `links` table and the link facts of the `results` rows (`depth`, `inLinks`,
+`outLinks`), streamed row by row into a compact `LinkGraph` (target → kept referrers and total,
+strings shared, looked up by hash) instead of a generic table — the `links` table is not in the
+Tables tab. Loaded on a worker thread (a 3,000-page sample with 161,000 `links` rows, 54 MB:
+0.2 s in a release build, 2 s in a debug build, 16 MB of heap at the peak, 15 MB kept); fields the GUI does not use are skipped; a missing or unreadable file yields an
 explanatory state, not an error dialog. `docs/OUTPUT-crawler.siteone.io.json` is the test
 fixture.
 
@@ -760,7 +798,7 @@ as inline code.
 
 | Section | Options |
 |---|---|
-| Scope | `--single-page`, `--max-depth`, `--max-visited-urls`, **Check external links**, **Skip cart and action links**, `--allowed-domain-for-crawling`, `--include-regex`, `--ignore-regex`, `--ignore-robots-txt` |
+| Scope | `--single-page`, `--max-depth`, `--max-visited-urls`, **Check external links**, **Skip cart and action links**, `--link-details` (*Record every referring page*, on: app default, §5.2), `--allowed-domain-for-crawling`, `--include-regex`, `--ignore-regex`, `--ignore-robots-txt` |
 | Speed | `--workers`, `--max-reqs-per-sec`, `--timeout`, `--device` |
 | Content | `--disable-javascript`, `--disable-styles`, `--disable-fonts`, `--disable-images`, `--disable-files` (shown as "Download: ☑ scripts ☑ styles …") |
 | Access | `--http-auth`, `--header`, `--proxy`, `--accept-invalid-certs` |
@@ -832,12 +870,19 @@ crawl's outcome, which does not wait for the check.
   scores says "Retries changed answers after the crawl. The HTML report, the scores and the tables
   show the crawl as it ran." with **Run again** (its tooltip says what a new crawl takes from the
   HTTP cache, when the run's cache is on).
-- **URLs.** Virtualized table: #, status (coloured chip), type, time, size, cached, URL, title.
+- **URLs.** Virtualized table: #, status (coloured chip), type, time, size, cached, depth, in links,
+  URL, title. *Depth* is the `url` event's while the crawl runs and the exact one of the result JSON
+  with `--link-details`; *In links* (with `--link-details`) counts the pages referencing the URL.
+  Each is shown only when the run has its data (an older run has neither); both sort, rows
+  without a value last.
   The title of an internal HTML page comes from the result JSON's `seo` table (joined by path and
   query, `urlPathAndQuery`), built once when the result is loaded; empty for other rows and while
   the crawl runs. Filter by text (URL and title), status class and content type; sort by any
   column; *Follow* keeps the newest row in view while running (switched off by scrolling or
-  sorting). Context menu: open in browser, copy URL; for a failed row of a finished run first
+  sorting). Context menu: open in browser, copy URL, **Pages linking here…** (a dialog listing every
+  referring page with its line, attribute and link text, "and N more pages" beyond the 50 the
+  crawler lists, *Copy list*; with only the event's page while the crawl runs or without
+  `--link-details`, it says so); for a failed row of a finished run first
   **Retry now** and **Add to retry queue** / **Remove from retry queue**. A retried row shows its
   newest answer (and its title), a queued one the queue mark of the Link checker tab; filters and
   counts use the newest answers. Must stay fluid with 100 000 rows.
@@ -846,9 +891,12 @@ crawl's outcome, which does not wait for the check.
   (an older run that crawled external URLs keeps its broken ones as *External*), with the kind
   (page, image, stylesheet, script, font, document, other); and the external links of the app's
   check (§4.7) that are broken or refused, with the status in words ("Refused 403", "404",
-  "Connection failed", "Timeout", "TLS error", "Too many redirects"). *Found on* is joined from the
-  result JSON's `404` table for crawled URLs (404s only) and is the check's pages for external links
-  (the first, "+N more" with the full list in the tooltip and in Copy list). Once the page was read,
+  "Connection failed", "Timeout", "TLS error", "Too many redirects"). *Found on* comes from the
+  crawler for crawled URLs of every status — the `url` event's page as the URL arrives, then every
+  kept page of the `links` table (§4.8); joined from the `404` table for runs of an older crawler —
+  and is the check's pages for external links (from the `links` table, all of them). The first is
+  shown, "+N more" (in a narrow column "+N") counts the others, with every known page and its
+  position in the tooltip and in Copy list, and "and N more pages" beyond the 50 the crawler lists. Once the page was read,
   *Found on* ends with where it references the link (§4.8): `…/page-styles.css:1929`, or
   `style.min.css:1:20345` on a long line — the page is cut in the middle when the column is narrow,
   the position never; the tooltip has the full page and "Referenced at line 1929 (and 2 more) in
@@ -878,8 +926,8 @@ crawl's outcome, which does not wait for the check.
   the link: `1929`, `1:20345`; "(and N more)" in the tooltip) and the link text on that page (no
   *Found on*). A link found on several pages (external links carry all their sources) is under
   each; pages with more links first, then by URL; the links whose page is not known last under
-  "Page not reported by the crawler" ("Pages known when the crawl finishes" while it runs, "Page not
-  available" without a result), the reason in the tooltip. Built from the by-link rows: filter and
+  "Page not reported by the crawler" (start URLs; with an older crawler "Pages known when the crawl
+  finishes" while it runs, "Page not available" without a result), the reason in the tooltip. Built from the by-link rows: filter and
   sort (within each page) apply, and a link shown only because the filter matched one of its pages
   is listed under that page only. The row count reads "25 broken links on 7 pages". Checkboxes,
   Shift ranges (over the rows as drawn), the header checkbox (every link once), the row menu and
@@ -1016,6 +1064,23 @@ Action links: the argv (the user's patterns first, no pattern twice, accepted by
 the patterns against action and ordinary URLs with the crawler's `fancy_regex`, storage only when
 off and the default for older files, the import of a command with all, none or some of them.
 
+Link data: the `url` event's referrer on the URL rows (shared strings, kept by a retry), the `links`
+table and the link facts read into the graph (lenient cells, not an analysis table, no graph for
+older files), the external links and all their referrers from it, the crawled pairs that need a
+fetch (none with complete data; the event's page without a position; the `404` table for an older
+run), crawler text and position before the app's reading, Depth and In links (exact before the
+event's, rows without a value last), *Pages linking here*, `--link-details` on by default in every
+command. `ui_run.rs` opens a run folder exactly as the released GUI wrote it (no link data
+anywhere) and finds Found on, texts, the check, the queue and the URLs tab as before.
+`ui_link_data_e2e.rs` crawls a site of `tests/link_server` (three pages linking to a missing page
+and to a partner on `localhost`, a page answering 500, a stylesheet with a missing image) with the
+real crawler: Found on of the 500 from its event, all three pages of the 404 with their lines and
+the link text, the stylesheet's line, the partner with its three pages, Depth and In links, and
+the server log shows every page requested once — none after the crawl; with the switch off the
+app reads the pages itself (each source requested twice). `core_retry.rs` pins why a pass keeps
+one crawler per URL (`--url-list`, §4.9). Snapshots `run-link-data-broken*`, `run-link-data-by-page*`,
+`run-link-data-urls*` and `run-link-data-linking-pages*`.
+
 **Link check tests** (`gui/tests/core_link_check.rs`, a small HTTP server written in the test on
 `127.0.0.1`/`::1`, `tests/link_server`): 200 with a title, 404, 403, 500, a redirect chain, a
 redirect loop, a timeout, a closed connection, garbage, a 5 MB body (read stops at the cap), plain
@@ -1081,7 +1146,7 @@ sorts; the Link checker tab filters and joins *Found on*; Stop → Force quit; c
 asks first, also while the window is minimized; a finished run reopens from History after a
 restart; every control on every page has an accessible name. The run-page tests drive a
 scripted child through the `ChildControl` seam (and a scripted check through `CheckControl`);
-`ui_start.rs`, `ui_run_e2e.rs`, `ui_link_check_e2e.rs` and `ui_retry_e2e.rs` use the real crawler binary when it is
+`ui_start.rs`, `ui_run_e2e.rs`, `ui_link_check_e2e.rs`, `ui_link_data_e2e.rs` and `ui_retry_e2e.rs` use the real crawler binary when it is
 built. `ui_link_check_e2e.rs` crawls a site on `127.0.0.1` that links to a second one on
 `localhost`: the crawl makes no request to the second site; *Check external links now* and the
 automatic check request each link once and nothing else; the dead link (with its link text) and the

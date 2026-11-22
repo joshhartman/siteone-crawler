@@ -127,6 +127,9 @@ pub struct CoreOptions {
     pub control_stdin: bool,
     pub ignore_robots_txt: bool,
     pub ignore_html_comments: bool,
+    /// Record every link found (all referring pages, link text, position, depth, link counts)
+    /// for the `links` table and extra per-URL keys of the JSON output and the `url` event.
+    pub link_details: bool,
     pub allowed_domains_for_external_files: Vec<String>,
     pub allowed_domains_for_crawling: Vec<String>,
     pub single_foreign_page: bool,
@@ -427,6 +430,7 @@ impl CoreOptions {
             control_stdin: false,
             ignore_robots_txt: false,
             ignore_html_comments: false,
+            link_details: false,
             allowed_domains_for_external_files: Vec::new(),
             allowed_domains_for_crawling: Vec::new(),
             single_foreign_page: false,
@@ -1475,6 +1479,11 @@ impl CoreOptions {
             "ignoreHtmlComments" => {
                 if let Some(b) = value.as_bool() {
                     self.ignore_html_comments = b;
+                }
+            }
+            "linkDetails" => {
+                if let Some(b) = value.as_bool() {
+                    self.link_details = b;
                 }
             }
             "allowedDomainsForExternalFiles" => {
@@ -2755,6 +2764,11 @@ pub fn get_options() -> Options {
             CrawlerOption::new(
                 "--ignore-html-comments", Some("-ihc"), "ignoreHtmlComments", OptionType::Bool, false,
                 "Ignore URLs found inside HTML comments (<!-- ... -->), which search engines also ignore, so commented links are not crawled or reported as broken.",
+                Some("false"), false, false, None,
+            ),
+            CrawlerOption::new(
+                "--link-details", Some("-ld"), "linkDetails", OptionType::Bool, false,
+                "Record every link found: all referring pages of each URL (up to 50, plus their total count), link text, position in the source, link depth and in/out link counts. Adds the `links` table and per-URL keys to the JSON output and link fields to the `url` event; the text output and HTML report are unchanged.",
                 Some("false"), false, false, None,
             ),
             CrawlerOption::new(
@@ -4458,6 +4472,7 @@ mod tests {
             control_stdin: false,
             ignore_robots_txt: false,
             ignore_html_comments: false,
+            link_details: false,
             allowed_domains_for_external_files: Vec::new(),
             allowed_domains_for_crawling: Vec::new(),
             single_foreign_page: false,
@@ -4871,6 +4886,15 @@ mod tests {
     }
 
     #[test]
+    fn apply_link_details() {
+        let mut opts = make_default_core_options();
+        assert!(!opts.link_details);
+        opts.apply_option_value("linkDetails", &OptionValue::Bool(true))
+            .unwrap();
+        assert!(opts.link_details);
+    }
+
+    #[test]
     fn apply_ignore_html_comments() {
         let mut opts = make_default_core_options();
         assert!(!opts.ignore_html_comments);
@@ -5207,7 +5231,7 @@ mod tests {
                 .values()
                 .map(|group| group.options.len())
                 .sum::<usize>(),
-            226
+            227
         );
     }
 

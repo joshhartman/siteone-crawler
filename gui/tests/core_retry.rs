@@ -305,3 +305,104 @@ fn a_missing_crawler_is_an_error_on_the_url_and_external_links_are_checked_again
         "{messages:?}"
     );
 }
+
+/// Why a pass keeps one crawler per URL (GUI-SPEC §4.9): one crawler with `--url-list` for N URLs
+/// (`--max-visited-urls=N`, `--single-page`, `--workers=1`, the request limits of a retry child)
+/// does send exactly one request per URL — no robots.txt, asset, link or redirect target — with a
+/// `url` event each; but its rate limit spaces the *starts* of requests, so the request after a
+/// slow answer follows it at once (the pass waits 500 ms after the end of a request to a host), and
+/// it requests every URL of a host that does not answer (the pass gives such a host up after two
+/// failures). If this test fails, the crawler has changed: look again at a pass with one process.
+#[test]
+fn one_crawler_with_a_url_list_sends_one_request_each_but_keeps_neither_the_gap_nor_the_dead_host_rule() {
+    use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let child = |root: &Path, urls: &[String], timeout: &str| -> RunState {
+        let work = root.join("work");
+        std::fs::create_dir_all(&work).expect("work");
+        let list = work.join("urls.txt");
+        std::fs::write(&list, urls[1..].join("\n")).expect("list");
+        let argv = vec![
+            format!("--url={}", urls[0]),
+            format!("--url-list={}", list.display()),
+            format!("--max-visited-urls={}", urls.len()),
+            "--single-page=true".to_string(),
+            "--disable-all-assets=true".to_string(),
+            "--ignore-robots-txt=true".to_string(),
+            "--workers=1".to_string(),
+            "--max-reqs-per-sec=2".to_string(),
+            format!("--timeout={timeout}"),
+            format!("--http-cache-dir={}", root.join("cache").display()),
+            "--http-cache-ttl=0s".to_string(),
+            "--analyzer-filter-regex=/^SeoAndOpenGraphAnalyzer$/".to_string(),
+            format!("--config-file={}", empty_config_file(root).display()),
+            format!("--events-file={}", work.join("events.ndjson").display()),
+            "--output=text".to_string(),
+            "--hide-progress-bar=true".to_string(),
+            format!("--output-json-file={}", work.join("result.json").display()),
+            "--output-html-report=".to_string(),
+            "--output-text-file=".to_string(),
+        ];
+        let request = RunRequest {
+            binary: crawler_binary().to_path_buf(),
+            argv,
+            env: siteone_crawler_gui::model::run_plan::ChildEnv::default(),
+            run_dir: work.clone(),
+            events_file: work.join("events.ndjson"),
+            console_log: work.join("console.log"),
+        };
+        let mut handle = runner::start(request, || {}).expect("starts");
+        let mut state = RunState::new();
+        drive(&mut handle, &mut state, Duration::from_secs(120), |_, _, _| {});
+        state
+    };
+
+    // One request per URL, a `url` event each, in the list's order.
+    let server = LinkServer::start();
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let paths = ["/slow-1s", "/404", "/ok", "/redirect/1", "/500", "/flaky-page"];
+    let urls: Vec<String> = paths.iter().map(|path| server.url(path)).collect();
+    let state = child(tmp.path(), &urls, "5");
+    let counts = server.counts();
+    assert_eq!(counts.len(), paths.len(), "nothing else: {counts:?}");
+    assert!(paths.iter().all(|path| counts.get(*path) == Some(&1)), "{counts:?}");
+    let answers: Vec<(&str, i32)> = state.urls.iter().map(|row| (&*row.url, row.status)).collect();
+    assert_eq!(answers.len(), paths.len(), "{answers:?}");
+    assert!(
+        answers.contains(&(urls[3].as_str(), 301)),
+        "the redirect is the answer: {answers:?}"
+    );
+    // The gap: `/slow-1s` answers 1 s after its request; the next request follows at once.
+    let requests = server.requests();
+    let gap = requests[1]
+        .at
+        .saturating_duration_since(requests[0].at + Duration::from_secs(1));
+    assert!(
+        gap < Duration::from_millis(400),
+        "the crawler waited {gap:?} after the slow answer"
+    );
+
+    // A host that accepts connections and never answers: every URL is requested.
+    let dead = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = dead.local_addr().expect("address").port();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&accepted);
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for stream in dead.incoming().flatten() {
+            counter.fetch_add(1, Ordering::SeqCst);
+            held.push(stream);
+        }
+    });
+    let dead_urls: Vec<String> = (1..=4).map(|n| format!("http://127.0.0.1:{port}/p{n}")).collect();
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let state = child(tmp.path(), &dead_urls, "1");
+    assert!(state.urls.iter().all(|row| row.status == -2), "timeouts");
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        4,
+        "a pass would have asked this host twice"
+    );
+}

@@ -1,7 +1,9 @@
 //! The Link checker tab: every crawled URL that answered 4xx or 5xx or failed without an answer,
-//! split into internal pages and internal assets (with the page or stylesheet it was found on, from
-//! the result JSON's `404` table once the run has finished), and the external links as the app's
-//! check after the crawl found them (GUI-SPEC §4.7, §6.3).
+//! split into internal pages and internal assets, and the external links as the app's check after
+//! the crawl found them (GUI-SPEC §4.7, §6.3). *Found on* is the page or stylesheet that referenced
+//! the URL: the `url` event's `source` as the URL arrives (every status), then — with
+//! `--link-details` — every referring page of the result JSON's `links` table; for runs of a
+//! crawler before link data, the result JSON's `404` table (404s only).
 //!
 //! The crawler does not request other hosts, so crawled URLs are internal; an older run that did
 //! crawl external URLs still shows its broken ones as *External*. The check's links are listed
@@ -37,6 +39,7 @@ use egui_material_icons::icons;
 use super::{CheckStatus, RunAction, RunView, padded};
 use crate::model::coverage::{self, Gap, GapInput};
 use crate::model::link_check::{LinkResult, Outcome, OutcomeCounts, classify_status};
+use crate::model::link_data::{LinkGraph, Referrer, TargetRefs, text_on};
 use crate::model::link_report::group_by_page;
 use crate::model::link_text::{LinkTexts, RefPosition, TextLookup};
 use crate::model::results::{ResultData, ResultLoad};
@@ -180,6 +183,8 @@ pub struct BrokenIndex {
     pub entries: Vec<(u32, Where, LinkKind)>,
     /// Counts of the broken rows by [`Where`].
     pub counts: [u64; 3],
+    /// A row names the page it was found on: the crawler reports referring pages.
+    pub sources_reported: bool,
     scanned: usize,
     site: Option<String>,
     /// The revisions of the rows and of the retries the index was built for.
@@ -199,6 +204,7 @@ impl BrokenIndex {
             };
         }
         for (index, row) in rows.iter().enumerate().skip(self.scanned) {
+            self.sources_reported |= row.link.is_some();
             let broken = is_broken(row.status);
             if (broken || retries.is_queued(&row.url))
                 && let Ok(index) = u32::try_from(index)
@@ -301,30 +307,34 @@ enum Item<'a> {
         row: &'a UrlRow,
         place: Where,
         kind: LinkKind,
+        /// The page of the result JSON's `404` table (crawlers before link data).
         found_on: Option<&'a str>,
+        /// Every kept referrer from the crawler's `links` table (`--link-details`).
+        refs: Option<&'a TargetRefs>,
     },
-    Link(&'a LinkResult),
+    /// A checked external link, with its referrers from the crawler's `links` table.
+    Link(&'a LinkResult, Option<&'a TargetRefs>),
 }
 
 impl<'a> Item<'a> {
     fn url(&self) -> &'a str {
         match self {
             Item::Crawled { row, .. } => &row.url,
-            Item::Link(link) => &link.url,
+            Item::Link(link, _) => &link.url,
         }
     }
 
     fn place(&self) -> Where {
         match self {
             Item::Crawled { place, .. } => *place,
-            Item::Link(_) => Where::External,
+            Item::Link(..) => Where::External,
         }
     }
 
     fn kind(&self) -> LinkKind {
         match self {
             Item::Crawled { kind, .. } => *kind,
-            Item::Link(link) => link_kind(&link.url),
+            Item::Link(link, _) => link_kind(&link.url),
         }
     }
 
@@ -333,7 +343,7 @@ impl<'a> Item<'a> {
         match self {
             Item::Crawled { row, .. } if is_broken(row.status) => Outcome::Broken,
             Item::Crawled { .. } => Outcome::Ok,
-            Item::Link(link) => link.outcome,
+            Item::Link(link, _) => link.outcome,
         }
     }
 
@@ -341,7 +351,7 @@ impl<'a> Item<'a> {
     fn status(&self) -> i64 {
         match self {
             Item::Crawled { row, .. } => i64::from(row.status),
-            Item::Link(link) => link.status.map_or(-1, i64::from),
+            Item::Link(link, _) => link.status.map_or(-1, i64::from),
         }
     }
 
@@ -352,14 +362,14 @@ impl<'a> Item<'a> {
     fn status_text(&self) -> String {
         match self {
             Item::Crawled { row, .. } => status_text(row.status),
-            Item::Link(link) => link.status_label(),
+            Item::Link(link, _) => link.status_label(),
         }
     }
 
     fn tone(&self) -> Tone {
         match self {
             Item::Crawled { row, .. } => super::urls::status_tone(row.status),
-            Item::Link(link) => match (link.outcome, link.status) {
+            Item::Link(link, _) => match (link.outcome, link.status) {
                 (Outcome::Refused, _) => Tone::Warning,
                 (_, Some(status)) => super::urls::status_tone(i32::from(status)),
                 (_, None) => Tone::Danger,
@@ -369,30 +379,79 @@ impl<'a> Item<'a> {
 
     fn title(&self) -> &str {
         match self {
-            Item::Link(link) => link.title.as_deref().unwrap_or(""),
+            Item::Link(link, _) => link.title.as_deref().unwrap_or(""),
             Item::Crawled { .. } => "",
         }
     }
 
-    /// The first page it was found on.
-    fn found_on(&self) -> &str {
+    /// Every page it was found on that is known, with what the crawler reported about each
+    /// reference: for a crawled URL every kept referrer of the `links` table, else the page of its
+    /// `url` event, else the page of the `404` table; for an external link the check's pages.
+    fn referrers(&self) -> Vec<Referrer<'a>> {
         match self {
-            Item::Crawled { found_on, .. } => found_on.unwrap_or(""),
-            Item::Link(link) => link.sources.first().map_or("", String::as_str),
+            Item::Crawled { refs: Some(refs), .. } => refs.refs.iter().map(Referrer::of).collect(),
+            Item::Crawled { row, found_on, .. } => match row.link.as_deref() {
+                Some(link) => vec![Referrer::of(link)],
+                None => found_on.iter().map(|page| Referrer::page(page)).collect(),
+            },
+            Item::Link(link, refs) => link
+                .sources
+                .iter()
+                .map(|page| Referrer {
+                    page,
+                    crawler: refs.and_then(|refs| refs.on(page)),
+                })
+                .collect(),
         }
     }
 
-    /// Every page it was found on.
-    fn sources(&self) -> Vec<&str> {
+    /// The first page it was found on.
+    fn found_on(&self) -> &'a str {
         match self {
-            Item::Crawled { found_on, .. } => found_on.iter().copied().collect(),
-            Item::Link(link) => link.sources.iter().map(String::as_str).collect(),
+            Item::Crawled { refs: Some(refs), .. } => refs.refs.first().map_or("", |r| &*r.source),
+            Item::Crawled { row, found_on, .. } => row
+                .link
+                .as_deref()
+                .map(|link| &*link.source)
+                .or(*found_on)
+                .unwrap_or(""),
+            Item::Link(link, _) => link.sources.first().map_or("", String::as_str),
+        }
+    }
+
+    /// Every page it was found on that is known.
+    fn sources(&self) -> Vec<&'a str> {
+        self.referrers().iter().map(|referrer| referrer.page).collect()
+    }
+
+    /// How many pages reference it in all: also those beyond the known ones (the crawler keeps 50
+    /// per URL).
+    fn total(&self) -> usize {
+        let known = self.sources().len();
+        match self {
+            Item::Crawled { refs: Some(refs), .. } | Item::Link(_, Some(refs)) => (refs.in_links as usize).max(known),
+            Item::Crawled { .. } | Item::Link(_, None) => known,
         }
     }
 
     /// The link text on the page(s) it was found on.
-    fn link_text<'t>(&self, texts: &'t LinkTexts) -> TextLookup<'t> {
-        texts.lookup(self.url(), &self.sources())
+    fn link_text<'t>(&self, texts: &'t LinkTexts) -> TextLookup<'t>
+    where
+        'a: 't,
+    {
+        text_on(texts, self.url(), &self.referrers())
+    }
+
+    /// The referrer of `page` (a trailing `/` aside); the page alone when it is not one of them.
+    fn referrer_on<'p>(&self, page: &'p str) -> Referrer<'p>
+    where
+        'a: 'p,
+    {
+        let key = page.trim().trim_end_matches('/');
+        self.referrers()
+            .into_iter()
+            .find(|referrer| referrer.page.trim().trim_end_matches('/') == key)
+            .unwrap_or(Referrer::page(page))
     }
 
     fn in_scope(&self, scope: Scope, retries: &RetryState) -> bool {
@@ -425,6 +484,8 @@ struct Context<'a> {
     rows: &'a [UrlRow],
     entries: &'a [(u32, Where, LinkKind)],
     found_on: Option<&'a FoundOn>,
+    /// The crawler's `links` table (`--link-details`), once the result is loaded.
+    graph: Option<&'a LinkGraph>,
     links: &'a [LinkResult],
     texts: &'a LinkTexts,
     retries: &'a RetryState,
@@ -445,9 +506,13 @@ impl<'a> Context<'a> {
                     place: *place,
                     kind: *kind,
                     found_on: self.found_on.and_then(|found| found.get(&row.url)),
+                    refs: self.graph.and_then(|graph| graph.target(&row.url)),
                 })
             }
-            RowRef::Link(position) => self.links.get(position as usize).map(Item::Link),
+            RowRef::Link(position) => self
+                .links
+                .get(position as usize)
+                .map(|link| Item::Link(link, self.graph.and_then(|graph| graph.target(&link.url)))),
         }
     }
 
@@ -515,7 +580,8 @@ impl BrokenView {
     }
 
     fn sync(&mut self, context: &Context<'_>, filter: &BrokenFilter, sort: BrokenSort, ascending: bool) {
-        let joined = context.found_on.is_some();
+        // The result's joins (the `404` table, the crawler's `links` table) arrive together.
+        let joined = context.found_on.is_some() || context.graph.is_some();
         // New link texts change what the filter and the sort see.
         let texts = context.texts.pages.len();
         let total = context.entries.len();
@@ -676,6 +742,7 @@ fn context_of<'a>(
         rows: &view.state.urls,
         entries: &index.entries,
         found_on,
+        graph: view.links.graph,
         links: view.links.results,
         texts: view.links.texts,
         retries: view.retry.state,
@@ -698,10 +765,12 @@ pub struct ShownRow {
     /// The link text on the page it was found on, or what became of it ("not found on the page",
     /// "source not fetched", "in a stylesheet"); empty when unknown.
     pub link_text: String,
-    /// Every page it was found on (empty when unknown).
+    /// Every page it was found on that is known (empty when unknown).
     pub sources: Vec<String>,
     /// For each of `sources`, where it references the URL (`:1929`, `:1:20345`), or empty.
     pub positions: Vec<String>,
+    /// Pages that reference it beyond `sources` (the crawler keeps 50 per URL).
+    pub more: usize,
     /// A checked external link (not a crawled URL).
     pub checked: bool,
 }
@@ -712,13 +781,19 @@ impl ShownRow {
         self.sources.first().map(String::as_str)
     }
 
-    /// Every page it was found on, each with where it references the URL (`…/style.css:1929`).
+    /// Every page it was found on, each with where it references the URL (`…/style.css:1929`),
+    /// then "and N more pages" for those beyond the known ones.
     pub fn found_on_with_positions(&self) -> Vec<String> {
-        self.sources
+        let mut pages: Vec<String> = self
+            .sources
             .iter()
             .enumerate()
             .map(|(at, source)| format!("{source}{}", self.positions.get(at).map_or("", String::as_str)))
-            .collect()
+            .collect();
+        if self.more > 0 {
+            pages.push(more_pages(self.more));
+        }
+        pages
     }
 
     /// Where `page` (one of `sources`, a trailing `/` aside) references the URL, or empty.
@@ -730,6 +805,23 @@ impl ShownRow {
             .and_then(|at| self.positions.get(at))
             .map_or("", String::as_str)
     }
+}
+
+/// What the shown rows are read from: the run's URL rows, its checked links, the link texts the app
+/// read, the crawler's `links` table and the retries.
+#[derive(Clone, Copy)]
+pub struct ShownFrom<'a> {
+    pub urls: &'a [UrlRow],
+    pub links: &'a [LinkResult],
+    pub texts: &'a LinkTexts,
+    pub graph: Option<&'a LinkGraph>,
+    pub retries: &'a RetryState,
+}
+
+/// "and 312 more pages".
+pub fn more_pages(more: usize) -> String {
+    let noun = if more == 1 { "page" } else { "pages" };
+    format!("and {} more {noun}", format::count(more as u64))
 }
 
 /// Counts of the views.
@@ -827,6 +919,7 @@ impl BrokenUi {
             rows: &view.state.urls,
             entries: &self.index.entries,
             found_on: self.found_on.as_ref(),
+            graph: view.links.graph,
             links,
             texts: view.links.texts,
             retries,
@@ -893,23 +986,9 @@ impl BrokenUi {
     }
 
     /// The shown rows (after [`Self::sync`] with the run's URL rows and checked links).
-    pub fn shown(
-        &self,
-        urls: &[UrlRow],
-        links: &[LinkResult],
-        texts: &LinkTexts,
-        retries: &RetryState,
-    ) -> Vec<ShownRow> {
-        let context = Context {
-            rows: urls,
-            entries: &self.index.entries,
-            found_on: self.found_on.as_ref(),
-            links,
-            texts,
-            retries,
-            revision: 0,
-            queue_order: false,
-        };
+    pub fn shown(&self, rows: ShownFrom<'_>) -> Vec<ShownRow> {
+        let texts = rows.texts;
+        let context = self.context_from(&rows);
         self.view
             .rows()
             .iter()
@@ -918,25 +997,25 @@ impl BrokenUi {
             .collect()
     }
 
-    /// The shown rows of the *by page* layout: `(page, its rows)`, `None` for the links whose page
-    /// is not known; the link text is the one on that page (after [`Self::sync`]).
-    pub fn shown_by_page(
-        &self,
-        urls: &[UrlRow],
-        links: &[LinkResult],
-        texts: &LinkTexts,
-        retries: &RetryState,
-    ) -> Vec<(Option<String>, Vec<ShownRow>)> {
-        let context = Context {
-            rows: urls,
+    fn context_from<'a>(&'a self, rows: &ShownFrom<'a>) -> Context<'a> {
+        Context {
+            rows: rows.urls,
             entries: &self.index.entries,
             found_on: self.found_on.as_ref(),
-            links,
-            texts,
-            retries,
+            graph: rows.graph,
+            links: rows.links,
+            texts: rows.texts,
+            retries: rows.retries,
             revision: 0,
             queue_order: false,
-        };
+        }
+    }
+
+    /// The shown rows of the *by page* layout: `(page, its rows)`, `None` for the links whose page
+    /// is not known; the link text is the one on that page (after [`Self::sync`]).
+    pub fn shown_by_page(&self, rows: ShownFrom<'_>) -> Vec<(Option<String>, Vec<ShownRow>)> {
+        let texts = rows.texts;
+        let context = self.context_from(&rows);
         let mut groups: Vec<(Option<String>, Vec<ShownRow>)> = Vec::new();
         for row in self.pages.rows() {
             match row {
@@ -954,7 +1033,7 @@ impl BrokenUi {
 
 /// What Copy list and the tests see of a row.
 fn shown_row(item: &Item<'_>, link_text: TextLookup<'_>, texts: &LinkTexts) -> ShownRow {
-    let sources = item.sources();
+    let referrers = item.referrers();
     ShownRow {
         status: item.status_text(),
         code: item.status(),
@@ -962,40 +1041,31 @@ fn shown_row(item: &Item<'_>, link_text: TextLookup<'_>, texts: &LinkTexts) -> S
         url: item.url().to_string(),
         title: Some(item.title().to_string()).filter(|title| !title.is_empty()),
         final_url: match item {
-            Item::Link(link) => link.final_url.clone(),
+            Item::Link(link, _) => link.final_url.clone(),
             Item::Crawled { .. } => None,
         },
         link_text: link_text.text().to_string(),
-        positions: sources
+        positions: referrers
             .iter()
-            .map(|source| {
-                texts
-                    .position(item.url(), source)
-                    .map(RefPosition::suffix)
+            .map(|referrer| {
+                referrer
+                    .position(texts, item.url())
+                    .map(|position| position.suffix())
                     .unwrap_or_default()
             })
             .collect(),
-        sources: sources.iter().map(|source| source.to_string()).collect(),
-        checked: matches!(item, Item::Link(_)),
+        sources: referrers.iter().map(|referrer| referrer.page.to_string()).collect(),
+        more: item.total().saturating_sub(referrers.len()),
+        checked: matches!(item, Item::Link(..)),
     }
 }
 
-/// The item's own spelling of `page` (the group shows the page as first met; the item's spelling
-/// is the key of its texts).
-fn own_source<'b>(item: &'b Item<'_>, page: &'b str) -> &'b str {
-    let key = page.trim().trim_end_matches('/');
-    item.sources()
-        .into_iter()
-        .find(|source| source.trim().trim_end_matches('/') == key)
-        .unwrap_or(page)
-}
-
 /// The link text of `item` on `page` (on any page it was found on when the page is not known).
-fn page_text<'t>(texts: &'t LinkTexts, item: &Item<'_>, page: Option<&str>) -> TextLookup<'t> {
+fn page_text<'t>(texts: &'t LinkTexts, item: &Item<'t>, page: Option<&'t str>) -> TextLookup<'t> {
     let Some(page) = page else {
         return item.link_text(texts);
     };
-    texts.lookup(item.url(), &[own_source(item, page)])
+    text_on(texts, item.url(), &[item.referrer_on(page)])
 }
 
 pub fn show(ui: &mut Ui, view: &RunView<'_>, broken: &mut BrokenUi, focus: bool, actions: &mut Vec<RunAction>) {
@@ -1342,13 +1412,18 @@ fn filter_row(ui: &mut Ui, view: &RunView<'_>, broken: &mut BrokenUi, focus: boo
                 "Copy the shown rows as tab-separated text (Status, Where, URL, Link text, Found on)"
             });
         if copy.clicked() {
-            let (urls, links, texts, retries) =
-                (&view.state.urls, view.links.results, view.links.texts, view.retry.state);
+            let from = ShownFrom {
+                urls: &view.state.urls,
+                links: view.links.results,
+                texts: view.links.texts,
+                graph: view.links.graph,
+                retries: view.retry.state,
+            };
             let (text, count) = if by_page {
-                let groups = broken.shown_by_page(urls, links, texts, retries);
+                let groups = broken.shown_by_page(from);
                 (copy_text_by_page(&groups), broken.view.rows().len())
             } else {
-                let rows = broken.shown(urls, links, texts, retries);
+                let rows = broken.shown(from);
                 (copy_text(&rows, all_external), rows.len())
             };
             actions.push(RunAction::Copy {
@@ -1445,6 +1520,7 @@ fn broken_table(ui: &mut Ui, view: &RunView<'_>, broken: &mut BrokenUi, actions:
     let mut sort_click = None;
     let count = broken.view.rows().len();
     let result_ready = matches!(view.result, Some(ResultLoad::Loaded(_)));
+    let unknown = UnknownPage::of(view, result_ready, broken.index.sources_reported);
     let all_external = broken.filter.scope == Scope::AllExternal;
     let scope = broken.filter.scope;
     // Rows are selected for a retry once the crawl has ended.
@@ -1501,11 +1577,12 @@ fn broken_table(ui: &mut Ui, view: &RunView<'_>, broken: &mut BrokenUi, actions:
                 // The Kind column becomes State (Retry queue).
                 let second = if scope == Scope::RetryQueue { 104.0 } else { 70.0 };
                 let fixed = status_width + second + 110.0;
+                // Found on gets the largest share: the page and where it references the link.
                 builder = builder
                     .column(Column::exact(second))
                     .column(Column::exact(110.0))
-                    .column(text_column(share(fixed, 0.36)))
-                    .column(text_column(share(fixed, 0.25)))
+                    .column(text_column(share(fixed, 0.31)))
+                    .column(text_column(share(fixed, 0.22)))
                     .column(Column::remainder().at_least(90.0).clip(true));
                 match scope {
                     Scope::RetryQueue => &[
@@ -1563,7 +1640,7 @@ fn broken_table(ui: &mut Ui, view: &RunView<'_>, broken: &mut BrokenUi, actions:
                         }
                         row.col(|ui| {
                             let chip = widgets::chip(ui, item.status_text(), item.tone());
-                            if let Item::Link(link) = &item
+                            if let Item::Link(link, _) = &item
                                 && let Some(error) = &link.error
                             {
                                 chip.on_hover_text(error);
@@ -1589,7 +1666,7 @@ fn broken_table(ui: &mut Ui, view: &RunView<'_>, broken: &mut BrokenUi, actions:
                         row.col(|ui| {
                             link_text_cell(ui, view, item.link_text(view.links.texts), !item.sources().is_empty())
                         });
-                        row.col(|ui| found_on_cell(ui, view, &item, result_ready));
+                        row.col(|ui| found_on_cell(ui, view, &item, unknown));
                         let response = row.response();
                         if response.double_clicked() {
                             actions.push(RunAction::OpenUrl(item.url().to_string()));
@@ -1650,13 +1727,7 @@ fn page_table(ui: &mut Ui, view: &RunView<'_>, broken: &mut BrokenUi, actions: &
     let links = broken.view.rows().len();
     let selection = &broken.selection;
     let selected = || selection.in_view_order(&broken.view, &context);
-    let unknown = if view.live {
-        "Pages known when the crawl finishes"
-    } else if !result_ready {
-        "Page not available"
-    } else {
-        "Page not reported by the crawler"
-    };
+    let unknown = UnknownPage::of(view, result_ready, broken.index.sources_reported);
     egui::Frame::new()
         .fill(p.surface)
         .stroke(egui::Stroke::new(1.0, p.border))
@@ -1723,7 +1794,7 @@ fn page_table(ui: &mut Ui, view: &RunView<'_>, broken: &mut BrokenUi, actions: &
                                     .groups
                                     .get(*at as usize)
                                     .map_or((None, 0), |(page, links)| (page.as_deref(), *links));
-                                row.col(|ui| page_heading(ui, across, page, links, unknown));
+                                row.col(|ui| page_heading(ui, across, page, links, unknown.heading));
                                 let response = row.response();
                                 match page {
                                     Some(page) => {
@@ -1734,9 +1805,7 @@ fn page_table(ui: &mut Ui, view: &RunView<'_>, broken: &mut BrokenUi, actions: &
                                         response.context_menu(|ui| page_menu(ui, page, actions));
                                     }
                                     None => {
-                                        response.on_hover_text(
-                                            "The crawler reports the page a URL was found on only for a 404, and only the first page that links to it.",
-                                        );
+                                        response.on_hover_text(unknown.tip);
                                     }
                                 }
                             }
@@ -1756,7 +1825,7 @@ fn page_table(ui: &mut Ui, view: &RunView<'_>, broken: &mut BrokenUi, actions: &
                                 }
                                 row.col(|ui| {
                                     let chip = widgets::chip(ui, item.status_text(), item.tone());
-                                    if let Item::Link(link) = &item
+                                    if let Item::Link(link, _) = &item
                                         && let Some(error) = &link.error
                                     {
                                         chip.on_hover_text(error);
@@ -1774,8 +1843,8 @@ fn page_table(ui: &mut Ui, view: &RunView<'_>, broken: &mut BrokenUi, actions: &
                                 row.col(|ui| url_cell(ui, &item));
                                 row.col(|ui| {
                                     let position = page
-                                        .and_then(|page| view.links.texts.position(item.url(), own_source(&item, page)));
-                                    line_cell(ui, position);
+                                        .and_then(|page| item.referrer_on(page).position(view.links.texts, item.url()));
+                                    line_cell(ui, position.as_ref());
                                 });
                                 row.col(|ui| {
                                     let text = page_text(view.links.texts, &item, page);
@@ -1792,7 +1861,14 @@ fn page_table(ui: &mut Ui, view: &RunView<'_>, broken: &mut BrokenUi, actions: &
                                         } else {
                                             0
                                         };
-                                        retry::menu_entries(ui, &view.retry, item.url(), &selected, in_selection, actions);
+                                        retry::menu_entries(
+                                            ui,
+                                            &view.retry,
+                                            item.url(),
+                                            &selected,
+                                            in_selection,
+                                            actions,
+                                        );
                                     }
                                     row_menu(ui, &item, actions)
                                 });
@@ -1893,7 +1969,7 @@ fn middle_cell(ui: &mut Ui, text: &str, color: egui::Color32, tip: Option<String
 fn title_cell(ui: &mut Ui, item: &Item<'_>) {
     let p = theme::palette(ui);
     match item {
-        Item::Link(link) => match &link.title {
+        Item::Link(link, _) => match &link.title {
             Some(title) => {
                 middle_cell(ui, title, p.text, None);
             }
@@ -1915,7 +1991,7 @@ fn title_cell(ui: &mut Ui, item: &Item<'_>) {
 fn url_cell(ui: &mut Ui, item: &Item<'_>) {
     let p = theme::palette(ui);
     let mut tip = Vec::new();
-    if let Item::Link(link) = item {
+    if let Item::Link(link, _) = item {
         if let Some(title) = &link.title {
             tip.push(title.clone());
         }
@@ -1989,39 +2065,84 @@ fn link_text_cell(ui: &mut Ui, view: &RunView<'_>, lookup: TextLookup<'_>, has_s
     }
 }
 
-fn found_on_cell(ui: &mut Ui, view: &RunView<'_>, item: &Item<'_>, result_ready: bool) {
-    let sources = item.sources();
-    match sources.first() {
-        Some(source) => {
-            let texts = view.links.texts;
-            let position = texts.position(item.url(), source);
-            // With a position, the cell ends with `.css:1929`: the chip would only take its room.
-            if is_stylesheet(source) && position.is_none() {
-                widgets::chip(ui, "CSS", Tone::Accent)
-                    .on_hover_text("Referenced from a stylesheet (e.g. a background image)");
+/// What the tab says where the page a link was found on is not known.
+#[derive(Debug, Clone, Copy)]
+struct UnknownPage {
+    /// In the *Found on* cell.
+    cell: &'static str,
+    /// The heading of the last group by page.
+    heading: &'static str,
+    tip: &'static str,
+}
+
+impl UnknownPage {
+    /// `sources_reported`: the crawler names the referring page of each URL as it arrives.
+    fn of(view: &RunView<'_>, result_ready: bool, sources_reported: bool) -> Self {
+        if sources_reported {
+            Self {
+                cell: "not reported by the crawler",
+                heading: "Page not reported by the crawler",
+                tip: "The crawler reports no referring page for a start URL (--url, --url-list).",
             }
-            if sources.len() > 1 {
-                // The chip first: the URL is cut at the column's edge.
-                let all: Vec<String> = sources
-                    .iter()
-                    .map(|source| texts.found_on_with_position(item.url(), source))
-                    .collect();
-                widgets::chip(ui, format!("+{} more", sources.len() - 1), Tone::Neutral).on_hover_text(all.join("\n"));
+        } else if view.live {
+            Self {
+                cell: "available when the crawl finishes",
+                heading: "Pages known when the crawl finishes",
+                tip: "This crawler reports the page a URL was found on in its result file, for 404 responses only.",
             }
-            source_cell(ui, source, position);
-        }
-        None if view.live => {
-            ui.label(widgets::weak(ui, "available when the crawl finishes"));
-        }
-        None if !result_ready => {
-            ui.label(widgets::weak(ui, "not available"))
-                .on_hover_text("This run has no readable result file.");
-        }
-        None => {
-            ui.label(widgets::weak(ui, "not reported by the crawler"))
-                .on_hover_text("The crawler records the referring page for 404 responses only.");
+        } else if !result_ready {
+            Self {
+                cell: "not available",
+                heading: "Page not available",
+                tip: "This run has no readable result file.",
+            }
+        } else {
+            Self {
+                cell: "not reported by the crawler",
+                heading: "Page not reported by the crawler",
+                tip: "The crawler of this run reports the page a URL was found on only for a 404, and only the first page that links to it.",
+            }
         }
     }
+}
+
+fn found_on_cell(ui: &mut Ui, view: &RunView<'_>, item: &Item<'_>, unknown: UnknownPage) {
+    let referrers = item.referrers();
+    let Some(first) = referrers.first() else {
+        ui.label(widgets::weak(ui, unknown.cell)).on_hover_text(unknown.tip);
+        return;
+    };
+    let texts = view.links.texts;
+    let position = first.position(texts, item.url());
+    // With a position, the cell ends with `.css:1929`: the chip would only take its room.
+    if is_stylesheet(first.page) && position.is_none() {
+        widgets::chip(ui, "CSS", Tone::Accent).on_hover_text("Referenced from a stylesheet (e.g. a background image)");
+    }
+    let total = item.total();
+    if total > 1 {
+        // The chip first: the URL is cut at the column's edge. Every known page with where it
+        // references the link; the ones beyond (the crawler keeps 50 per URL) counted.
+        let mut all: Vec<String> = referrers
+            .iter()
+            .map(|referrer| match referrer.position(texts, item.url()) {
+                Some(position) => format!("{}{}", referrer.page, position.suffix()),
+                None => referrer.page.to_string(),
+            })
+            .collect();
+        let more = total.saturating_sub(referrers.len());
+        if more > 0 {
+            all.push(format!("{} (the crawler lists 50 pages per URL)", more_pages(more)));
+        }
+        // In a narrow column the chip says only the number: the page needs the room.
+        let others = format::count(total as u64 - 1);
+        let label = if ui.available_width() < 260.0 {
+            format!("+{others}")
+        } else {
+            format!("+{others} more")
+        };
+        widgets::chip(ui, label, Tone::Neutral).on_hover_text(all.join("\n"));
+    }
+    source_cell(ui, first.page, position.as_ref());
 }
 
 /// The width of the *Line* column of the by-page layout.
@@ -2029,10 +2150,7 @@ const LINE_WIDTH: f32 = 84.0;
 
 /// Where a page references a link, in words, for a tooltip.
 fn position_tip(position: &RefPosition) -> String {
-    format!(
-        "Referenced at {} in the file as fetched after the crawl.",
-        position.describe()
-    )
+    position.tip()
 }
 
 /// A page a link was found on, cut in the middle to the cell's width — never its position
@@ -2070,7 +2188,7 @@ fn line_cell(ui: &mut Ui, position: Option<&RefPosition>) {
         }
         None => {
             ui.label(widgets::weak(ui, "—")).on_hover_text(
-                "No position: the page was not read, or it does not reference this URL now (it changed, or a script builds the link).",
+                "No position: the crawler gave none (a reference in a script or a sitemap, a page rendered in Chromium) and the page was not read, or it does not reference this URL now (it changed, or a script builds the link).",
             );
         }
     }
@@ -2083,7 +2201,7 @@ fn row_menu(ui: &mut Ui, item: &Item<'_>, actions: &mut Vec<RunAction>) {
         actions.push(RunAction::OpenUrl(url.clone()));
         ui.close();
     }
-    if let Item::Link(link) = item
+    if let Item::Link(link, _) = item
         && let Some(final_url) = &link.final_url
         && widgets::button(ui, Some(icons::ICON_OPEN_IN_NEW), "Open where it redirects").clicked()
     {
@@ -2127,14 +2245,7 @@ mod tests {
     use crate::model::run_state::ContentKind;
 
     fn row(url: &str, status: i32, kind: ContentKind) -> UrlRow {
-        UrlRow {
-            url: url.into(),
-            status,
-            kind,
-            time_ms: 1,
-            size: 1,
-            cached: false,
-        }
+        UrlRow::new(url, status, kind, 1, 1, false)
     }
 
     fn link(url: &str, outcome: Outcome, status: Option<u16>) -> LinkResult {
@@ -2229,6 +2340,7 @@ mod tests {
                 rows: &rows,
                 entries: &index.entries,
                 found_on: None,
+                graph: None,
                 links,
                 texts: &texts,
                 retries: &no_retries,
@@ -2247,6 +2359,7 @@ mod tests {
                 rows: &rows,
                 entries: &index.entries,
                 found_on: None,
+                graph: None,
                 links: &links,
                 texts: &texts,
                 retries: &no_retries,
@@ -2265,6 +2378,7 @@ mod tests {
             rows: &rows,
             entries: &index.entries,
             found_on: None,
+            graph: None,
             links: &links,
             texts: &texts,
             retries: &no_retries,
@@ -2285,6 +2399,7 @@ mod tests {
             rows: &rows,
             entries: &index.entries,
             found_on: None,
+            graph: None,
             links: &fresh,
             texts: &texts,
             retries: &no_retries,
@@ -2310,12 +2425,14 @@ mod tests {
                 "https://site.example/b".to_string(),
             ],
             positions: vec![":212".to_string(), String::new()],
+            more: 312,
             checked: true,
         }];
-        // Each page with where it references the link, when it is known.
+        // Each page with where it references the link, when it is known; the pages beyond the
+        // crawler's 50 counted.
         assert_eq!(
             copy_text(&rows, false),
-            "Status\tWhere\tURL\tLink text\tFound on\nRefused 403\tExternal\thttps://refused.example/\tOur partner\thttps://site.example/a:212 | https://site.example/b\n"
+            "Status\tWhere\tURL\tLink text\tFound on\nRefused 403\tExternal\thttps://refused.example/\tOur partner\thttps://site.example/a:212 | https://site.example/b | and 312 more pages\n"
         );
         assert!(copy_text(&rows, true).contains("\tForbidden\t\n"));
     }
@@ -2333,6 +2450,7 @@ mod tests {
             rows,
             entries: &index.entries,
             found_on: None,
+            graph: None,
             links: &[],
             texts: &texts,
             retries,
@@ -2413,6 +2531,7 @@ mod tests {
             rows: &rows,
             entries: &index.entries,
             found_on: None,
+            graph: None,
             links: &[],
             texts: &texts,
             retries: &retries,
@@ -2505,6 +2624,7 @@ mod tests {
             rows: &rows,
             entries: &index.entries,
             found_on: Some(&found_on),
+            graph: None,
             links: &links,
             texts: &texts,
             retries: &retries,
@@ -2575,6 +2695,7 @@ mod tests {
                 link_text: "Gone".to_string(),
                 sources: vec!["https://site.example/b/".to_string()],
                 positions: vec![":1:20345".to_string()],
+                more: 0,
                 checked: false,
             }],
         )];

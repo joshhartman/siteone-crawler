@@ -161,7 +161,9 @@ fn external_links_are_checked_by_the_app_after_the_crawl_and_not_by_the_crawler(
     let ok = row(&all, "/ok");
     assert_eq!((ok.status.as_str(), ok.title.as_deref()), ("200", Some("OK & Alive")));
     assert_eq!(ok.link_text, "Partner site");
-    assert!(first.join("external-links.json").is_file() && first.join("link-texts.json").is_file());
+    assert!(first.join("external-links.json").is_file());
+    // The crawler reported every link text and line (`--link-details`): no page was read again.
+    assert!(!first.join("link-texts.json").exists());
 
     // 2. Switch on: the check runs by itself after the crawl — never during it.
     harness.state_mut().run_ui.broken.filter.scope = Scope::AllBroken;

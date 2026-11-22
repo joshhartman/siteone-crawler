@@ -20,16 +20,27 @@
 //! URLs, fragments dropped, de-duplicated, sources merged (at most [`MAX_SOURCES`]), links capped at
 //! [`MAX_LINKS`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
 use super::coverage::CrawlScope;
+use super::link_data::{CrawlerRef, LinkGraph, TargetRefs};
 use super::link_text::LinkTexts;
 use super::results::{ResultData, ResultTable};
+use super::run_state::{StatusClass, UrlRow};
 use super::storage::{self, LoadError};
+
+/// 4xx, 5xx or no answer.
+fn is_broken_status(status: i32) -> bool {
+    matches!(
+        StatusClass::of(i64::from(status)),
+        StatusClass::ClientError | StatusClass::ServerError | StatusClass::Error
+    )
+}
 
 /// The file of a run that keeps its check.
 pub const LINKS_FILE: &str = "external-links.json";
@@ -190,9 +201,47 @@ fn looks_like_file(url: &str) -> bool {
         )
 }
 
+/// The external links of a run from the crawler's `links` table (`--link-details`): every URL on
+/// another host that a page links to with `<a href>`, with every kept referring page and the total
+/// (`inLinks`), most referring pages first; the others are external files.
+fn link_list_of_graph(graph: &LinkGraph) -> LinkList {
+    let mut external: Vec<&TargetRefs> = graph
+        .targets()
+        .iter()
+        .filter(|target| target.external && request_url(&target.url).is_some())
+        .collect();
+    // Stable: the crawler's order among links found on as many pages.
+    external.sort_by_key(|target| std::cmp::Reverse(target.in_links));
+    let mut list = LinkList::default();
+    for target in external {
+        if !target.is_link() {
+            list.files += 1;
+        } else if list.links.len() >= MAX_LINKS {
+            list.truncated += 1;
+        } else {
+            let mut sources: Vec<String> = Vec::with_capacity(target.refs.len());
+            for reference in &target.refs {
+                if !sources.iter().any(|known| **known == *reference.source) {
+                    sources.push(reference.source.to_string());
+                }
+            }
+            list.links.push(ExternalLink {
+                url: target.url.to_string(),
+                count: u64::from(target.in_links).max(sources.len() as u64).max(1),
+                sources,
+            });
+        }
+    }
+    list
+}
+
 /// The external links of a run from its result JSON (see the module documentation). `site_url` is
-/// the run's start URL, against which `skipped` resolves its source pages.
+/// the run's start URL, against which `skipped` resolves its source pages. With the crawler's
+/// `links` table (`--link-details`) the links and all their referring pages come from it.
 pub fn link_list(data: &ResultData, site_url: &str) -> LinkList {
+    if let Some(graph) = data.links.as_deref().filter(|graph| graph.rows() > 0) {
+        return link_list_of_graph(graph);
+    }
     let base = url::Url::parse(site_url.trim()).ok();
     let mut entries: Vec<Entry> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
@@ -464,6 +513,8 @@ pub struct RunLinks {
     pub texts_settled: bool,
     /// The crawl's scope and limits (`None` until the result JSON is loaded).
     pub scope: Option<CrawlScope>,
+    /// The crawler's `links` table and link facts (`--link-details`), shared with the result.
+    pub graph: Option<Arc<LinkGraph>>,
 }
 
 impl RunLinks {
@@ -487,7 +538,55 @@ impl RunLinks {
             texts,
             texts_settled: false,
             scope: data.map(CrawlScope::from_result),
+            graph: data.and_then(|data| data.links.clone()),
         }
+    }
+
+    /// `(broken crawled URL, page it was found on)` whose link text or position the app has to read
+    /// on the page itself (GUI-SPEC §4.8): for the URL rows the crawler gave link data for, the
+    /// referrers without a position ([`CrawlerRef::needs_fetch`]: a run without `--link-details`,
+    /// a page rendered with `--browser`); for a run whose crawler gave none (an older one), the
+    /// `404` table as before. A run with complete crawler data has none.
+    pub fn crawled_pairs(&self, rows: &[UrlRow]) -> Vec<(String, String)> {
+        let mut pairs = Vec::new();
+        let mut reported = HashSet::new();
+        for row in rows {
+            let target = self.graph.as_deref().and_then(|graph| graph.target(&row.url));
+            if target.is_none() && row.link.is_none() {
+                continue;
+            }
+            reported.insert(&*row.url);
+            if !is_broken_status(row.status) {
+                continue;
+            }
+            let references: Vec<&CrawlerRef> = match target {
+                Some(target) => target.refs.iter().collect(),
+                None => row.link.as_deref().into_iter().collect(),
+            };
+            for reference in references {
+                if reference.needs_fetch() {
+                    pairs.push((row.url.to_string(), reference.source.to_string()));
+                }
+            }
+        }
+        // The crawler named no page for these rows: the `404` table (crawlers before link data).
+        pairs.extend(
+            self.internal
+                .iter()
+                .filter(|(url, _)| !reported.contains(url.as_str()))
+                .cloned(),
+        );
+        pairs
+    }
+
+    /// Whether the crawler's data answers for the reference of `page` to the external link `url`
+    /// (no fetch needed for it).
+    fn crawler_answers(&self, url: &str, page: &str) -> bool {
+        self.graph
+            .as_deref()
+            .and_then(|graph| graph.target(url))
+            .and_then(|target| target.on(page))
+            .is_some_and(CrawlerRef::is_complete)
     }
 
     /// Links found that the stored check does not cover (no check, or a stopped one).
@@ -500,9 +599,10 @@ impl RunLinks {
         }
     }
 
-    /// Every URL whose link text is read on a fetched page: the 404s and the external links.
-    pub fn text_targets(&self) -> Vec<String> {
-        let mut targets: Vec<String> = self.internal.iter().map(|(target, _)| target.clone()).collect();
+    /// Every URL whose link text is read on a fetched page: the broken crawled URLs of `crawled`
+    /// ([`Self::crawled_pairs`]) and the external links.
+    pub fn text_targets(&self, crawled: &[(String, String)]) -> Vec<String> {
+        let mut targets: Vec<String> = crawled.iter().map(|(target, _)| target.clone()).collect();
         if let Some(list) = &self.list {
             targets.extend(list.links.iter().map(|link| link.url.clone()));
         }
@@ -511,22 +611,24 @@ impl RunLinks {
         targets
     }
 
-    /// The source pages not handled yet: those of the 404s (with `internal`) and, once the external
-    /// link check has run, those of the external links — each once, in order.
-    pub fn wanted_pages(&self, internal: bool) -> Vec<String> {
+    /// The source pages not handled yet: those of `crawled` ([`Self::crawled_pairs`]) and, once the
+    /// external link check has run, those of the external links the crawler gave no position for —
+    /// each once, in order.
+    pub fn wanted_pages(&self, crawled: &[(String, String)]) -> Vec<String> {
         let mut pages: Vec<String> = Vec::new();
         let mut seen = std::collections::HashSet::new();
-        let internal_sources = self
-            .internal
-            .iter()
-            .filter(|_| internal)
-            .map(|(_, source)| source.as_str());
+        let internal_sources = crawled.iter().map(|(_, source)| source.as_str());
         let external_sources = self
             .list
             .iter()
             .filter(|_| self.texts_external)
             .flat_map(|list| list.links.iter())
-            .flat_map(|link| link.sources.iter().map(String::as_str));
+            .flat_map(|link| {
+                link.sources
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|page| !self.crawler_answers(&link.url, page))
+            });
         for page in internal_sources.chain(external_sources) {
             if !page.is_empty() && !self.texts.pages.contains_key(page) && seen.insert(page) {
                 pages.push(page.to_string());
@@ -726,6 +828,112 @@ mod tests {
     }
 
     #[test]
+    fn with_the_crawlers_links_table_every_referrer_counts_and_nothing_is_fetched() {
+        use crate::model::link_data::{LinkRow, UrlFacts};
+        use crate::model::run_state::{ContentKind, RunState};
+        let row = |url: &str, source: &str, attr: &str, line: Option<u32>, in_links: u32| LinkRow {
+            url: url.to_string(),
+            source_url: source.to_string(),
+            source_attr: attr.to_string(),
+            link_text: "Text".to_string(),
+            source_line: line,
+            source_column: line.map(|_| 3),
+            in_links: Some(in_links),
+            external: !url.contains("site.example"),
+        };
+        let mut rows: Vec<LinkRow> = (0..50)
+            .map(|n| {
+                row(
+                    "https://partner.example/",
+                    &format!("https://site.example/p{n}"),
+                    "<a href>",
+                    Some(4),
+                    80,
+                )
+            })
+            .collect();
+        rows.push(row(
+            "https://cdn.example/app.js",
+            "https://site.example/",
+            "<script src>",
+            Some(2),
+            1,
+        ));
+        rows.push(row(
+            "https://site.example/gone",
+            "https://site.example/",
+            "<a href>",
+            Some(9),
+            2,
+        ));
+        rows.push(row(
+            "https://site.example/gone",
+            "https://site.example/b",
+            "<a href>",
+            Some(5),
+            2,
+        ));
+        let data = ResultData {
+            links: Some(Arc::new(LinkGraph::build(rows, Vec::<(String, UrlFacts)>::new()))),
+            ..ResultData::default()
+        };
+        let list = link_list(&data, "https://site.example/");
+        assert_eq!((list.links.len(), list.files), (1, 1));
+        let partner = &list.links[0];
+        assert_eq!(
+            (partner.sources.len(), partner.count),
+            (50, 80),
+            "every kept page, the total"
+        );
+
+        // The crawled 404 from the crawler's events: its pages come with their positions.
+        let mut state = RunState::new();
+        state.apply(
+            crate::model::events::parse_line(
+                r#"{"type":"url","url":"https://site.example/gone","status":404,"contentType":"HTML","source":"https://site.example/","sourceAttr":"<a href>","linkText":"Text","sourceLine":9,"sourceColumn":3}"#,
+            )
+            .expect("event"),
+            std::time::Instant::now(),
+        );
+        let mut links = RunLinks::load(Path::new("no-such-run"), Some(&data), "https://site.example/");
+        assert!(
+            links.crawled_pairs(&state.urls).is_empty(),
+            "complete crawler data: no fetch"
+        );
+        links.texts_external = true;
+        assert!(
+            links.wanted_pages(&[]).is_empty(),
+            "the external links' positions are known"
+        );
+
+        // Without link details (the event has no position): the page is read, as before.
+        let bare = RunState::replay(
+            [
+                r#"{"type":"url","url":"https://site.example/gone","status":404,"contentType":"HTML","source":"https://site.example/","sourceAttr":"<a href>"}"#,
+            ],
+            std::time::Instant::now(),
+        );
+        let plain = RunLinks::default();
+        assert_eq!(
+            plain.crawled_pairs(&bare.urls),
+            [(
+                "https://site.example/gone".to_string(),
+                "https://site.example/".to_string()
+            )]
+        );
+        // A row that is not broken needs nothing; a start URL is not reported by the crawler.
+        let ok = vec![UrlRow::new(
+            "https://site.example/",
+            200,
+            ContentKind::Html,
+            1,
+            1,
+            false,
+        )];
+        assert!(plain.crawled_pairs(&ok).is_empty());
+    }
+
+    #[test]
     fn statuses_are_classified_and_labelled() {
         assert_eq!(classify_status(200), Outcome::Ok);
         assert_eq!(classify_status(204), Outcome::Ok);
@@ -817,13 +1025,23 @@ mod tests {
             )]
         );
         assert!(!links.texts_external);
-        assert_eq!(links.wanted_pages(false), Vec::<String>::new());
+        assert_eq!(links.wanted_pages(&[]), Vec::<String>::new());
+        // An older crawler names no page on its URL rows: the `404` table, as before.
+        let crawled = links.crawled_pairs(&[UrlRow::new(
+            "https://crawler.siteone.io/docs/features/content-type-analysis",
+            404,
+            crate::model::run_state::ContentKind::Html,
+            1,
+            1,
+            false,
+        )]);
+        assert_eq!(crawled, links.internal);
         assert_eq!(
-            links.wanted_pages(true),
+            links.wanted_pages(&crawled),
             ["https://crawler.siteone.io/features/performance-metrics/"]
         );
         links.texts_external = true;
-        let wanted = links.wanted_pages(true);
+        let wanted = links.wanted_pages(&crawled);
         let mut unique = wanted.clone();
         unique.sort();
         unique.dedup();
@@ -835,9 +1053,9 @@ mod tests {
         );
         assert!(
             !links
-                .wanted_pages(true)
+                .wanted_pages(&crawled)
                 .contains(&"https://crawler.siteone.io/features/performance-metrics/".to_string())
         );
-        assert_eq!(links.text_targets().len(), 89);
+        assert_eq!(links.text_targets(&crawled).len(), 89);
     }
 }

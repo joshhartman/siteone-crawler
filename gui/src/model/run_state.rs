@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use super::console::{ConsoleBuffer, StyledLine};
 use super::events::{self, AiRequest, AiUsage, Event, Issue, RunFinished, RunStarted, UrlEvent};
+use super::link_data::{CrawlerRef, Interner};
 
 /// The window of the URLs-per-second rate.
 pub const RATE_WINDOW: Duration = Duration::from_secs(5);
@@ -124,6 +125,28 @@ pub struct UrlRow {
     pub time_ms: u32,
     pub size: u64,
     pub cached: bool,
+    /// Link distance from a start URL as known when the URL was crawled (`None` from a crawler
+    /// before link data).
+    pub depth: Option<u32>,
+    /// The page whose reference queued the URL, as the event names it (`None` for a start URL and
+    /// from a crawler before link data). Its strings are shared between rows.
+    pub link: Option<Box<CrawlerRef>>,
+}
+
+impl UrlRow {
+    /// A row without link data (tests, scripted runs).
+    pub fn new(url: &str, status: i32, kind: ContentKind, time_ms: u32, size: u64, cached: bool) -> Self {
+        Self {
+            url: url.into(),
+            status,
+            kind,
+            time_ms,
+            size,
+            cached,
+            depth: None,
+            link: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -276,6 +299,8 @@ pub struct RunState {
     pub killed: bool,
     /// Counts the rows changed in place ([`Self::replace_answer`]); views rebuild on it.
     pub revision: u64,
+    /// Shares the referring pages and attributes of the URL rows.
+    strings: Interner,
 }
 
 impl RunState {
@@ -370,6 +395,26 @@ impl RunState {
         {
             self.recent.pop_front();
         }
+        let link = url
+            .source
+            .as_deref()
+            .map(str::trim)
+            .filter(|source| !source.is_empty())
+            .map(|source| {
+                let small = |value: Option<u64>| value.and_then(|value| u32::try_from(value).ok()).filter(|v| *v > 0);
+                Box::new(CrawlerRef {
+                    source: self.strings.get(source),
+                    attr: self.strings.get(url.source_attr.as_deref().unwrap_or("").trim()),
+                    text: url
+                        .link_text
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|text| !text.is_empty())
+                        .map(Box::from),
+                    line: small(url.source_line),
+                    column: small(url.source_column),
+                })
+            });
         self.urls.push(UrlRow {
             url: url.url.into_boxed_str(),
             status: i32::try_from(url.status).unwrap_or(i32::MIN),
@@ -377,6 +422,8 @@ impl RunState {
             time_ms: u32::try_from(url.time_ms).unwrap_or(u32::MAX),
             size: url.size,
             cached: url.cached,
+            depth: url.depth.and_then(|depth| u32::try_from(depth).ok()),
+            link,
         });
     }
 
@@ -392,14 +439,14 @@ impl RunState {
         size: u64,
         cached: bool,
     ) -> bool {
-        let new = UrlRow {
-            url: Box::from(""),
-            status: i32::try_from(status).unwrap_or(i32::MIN),
-            kind: ContentKind::parse(content_type),
-            time_ms: u32::try_from(time_ms).unwrap_or(u32::MAX),
+        let new = UrlRow::new(
+            "",
+            i32::try_from(status).unwrap_or(i32::MIN),
+            ContentKind::parse(content_type),
+            u32::try_from(time_ms).unwrap_or(u32::MAX),
             size,
             cached,
-        };
+        );
         let Some(row) = self.urls.get_mut(index) else {
             return false;
         };
@@ -408,8 +455,19 @@ impl RunState {
         {
             return false;
         }
+        // The answer changes; where the URL was found does not.
         let url = std::mem::take(&mut row.url);
-        let old = std::mem::replace(row, UrlRow { url, ..new });
+        let link = row.link.take();
+        let depth = row.depth;
+        let old = std::mem::replace(
+            row,
+            UrlRow {
+                url,
+                link,
+                depth,
+                ..new
+            },
+        );
         self.status_counts.remove(StatusClass::of(i64::from(old.status)));
         self.status_counts.add(StatusClass::of(status));
         if let Some(count) = self.content_counts.get_mut(&old.kind) {
@@ -546,6 +604,7 @@ mod tests {
             cached: false,
             done,
             total: done + 5,
+            ..UrlEvent::default()
         })
     }
 
@@ -611,6 +670,59 @@ mod tests {
         assert_eq!(state.urls_per_second(start + Duration::from_secs(7)), 3.0 / 5.0);
         assert_eq!(state.urls_per_second(start + Duration::from_secs(60)), 0.0);
         assert_eq!(state.urls[2].status, -2);
+    }
+
+    #[test]
+    fn url_rows_keep_where_the_crawler_found_them_and_a_retry_keeps_it_too() {
+        use crate::model::test_support::DOC_LINK_DETAIL_LINES;
+        let now = Instant::now();
+        let mut lines: Vec<&str> = DOC_LINES.to_vec();
+        lines.extend(DOC_LINK_DETAIL_LINES);
+        lines.push(r#"{"type":"url","url":"http://127.0.0.1:8891/","status":200,"depth":0}"#);
+        let mut state = RunState::replay(lines, now);
+        let rows = &state.urls;
+        // Without link details: the page and how it referenced the URL.
+        let first = rows[0].link.as_deref().expect("a source");
+        assert_eq!(
+            (&*first.source, &*first.attr, first.text.as_deref(), first.line),
+            ("http://127.0.0.1:8888/", "<a href>", None, None)
+        );
+        assert_eq!(rows[0].depth, Some(1));
+        // With: the link text and where the page references it.
+        let page = rows[1].link.as_deref().expect("a source");
+        assert_eq!(
+            (page.text.as_deref(), page.line, page.column),
+            (Some("article 141"), Some(45), Some(257))
+        );
+        let image = rows[2].link.as_deref().expect("a source");
+        assert_eq!(
+            (
+                &*image.attr,
+                image.text.as_deref(),
+                image.position().map(|p| p.suffix())
+            ),
+            ("css url()", None, Some(":1".to_string()))
+        );
+        assert_eq!(rows[2].depth, Some(2));
+        // The referring pages are shared, not copied per row.
+        assert!(std::sync::Arc::ptr_eq(
+            &page.source,
+            &state.urls[1].link.as_ref().expect("source").source
+        ));
+        // A start URL has none.
+        assert_eq!((rows[3].link.is_none(), rows[3].depth), (true, Some(0)));
+        // An older crawler's event: no link data at all.
+        assert!(
+            RunState::replay([r#"{"type":"url","url":"/a","status":404}"#], now).urls[0]
+                .link
+                .is_none()
+        );
+        assert!(state.replace_answer(1, 404, "HTML", 1, 1, false));
+        assert_eq!(
+            state.urls[1].link.as_deref().and_then(|link| link.text.as_deref()),
+            Some("article 141")
+        );
+        assert_eq!(state.urls[1].depth, Some(1));
     }
 
     #[test]

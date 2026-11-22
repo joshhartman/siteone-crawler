@@ -28,11 +28,13 @@ use crate::backend::shell;
 use crate::model::coverage::CrawlScope;
 use crate::model::history::{RecordedOutcome, RunRecord};
 use crate::model::link_check::{CheckReport, LinkList, LinkResult, RunLinks};
+use crate::model::link_data::LinkGraph;
 use crate::model::link_text::LinkTexts;
 use crate::model::results::{ResultLoad, Severity};
 use crate::model::retry::{self, RetryState};
 use crate::model::run_state::{RunOutcome, RunState, StatusClass};
 use crate::theme;
+use crate::ui::widgets::modal::{ButtonKind, Dialog};
 use crate::ui::widgets::tabs::{self, TabSpec};
 use crate::ui::widgets::{self, Tone, progress};
 
@@ -195,6 +197,8 @@ pub struct LinksView<'a> {
     pub texts_pending: bool,
     /// The crawl's scope and limits (from the result JSON).
     pub scope: Option<&'a CrawlScope>,
+    /// The crawler's `links` table and link facts (`--link-details`, from the result JSON).
+    pub graph: Option<&'a LinkGraph>,
 }
 
 impl<'a> LinksView<'a> {
@@ -237,6 +241,7 @@ impl<'a> LinksView<'a> {
             texts: &links.texts,
             texts_pending: false,
             scope: links.scope.as_ref(),
+            graph: links.graph.as_deref(),
         }
     }
 
@@ -288,52 +293,41 @@ fn link_results<'a>(links: &'a RunLinks, active: Option<&'a ActiveCheck>) -> &'a
     }
 }
 
+/// What the Link checker tab reads for the run on the Run page.
+fn shown_from(app: &App) -> Option<broken::ShownFrom<'_>> {
+    let active_for = |run_dir: &Path| app.link_check.as_ref().filter(|active| active.run_dir == run_dir);
+    let (state, links, retries, run_dir) = match &app.viewed_run {
+        ViewedRun::Current => {
+            let run = app.current_run.as_ref()?;
+            (&run.state, &run.links, &run.retries, run.plan.run_dir.as_path())
+        }
+        ViewedRun::Past { .. } => match app.past_run.as_ref().map(|past| (past, &past.load)) {
+            Some((past, PastLoad::Ready(data))) => (&data.state, &data.links, &data.retries, past.run_dir.as_path()),
+            _ => return None,
+        },
+    };
+    Some(broken::ShownFrom {
+        urls: &state.urls,
+        links: link_results(links, active_for(run_dir)),
+        texts: &links.texts,
+        graph: links.graph.as_deref(),
+        retries,
+    })
+}
+
 /// The rows the Link checker tab shows for the run on the Run page, as of the last frame.
 pub fn broken_rows(app: &App) -> Vec<broken::ShownRow> {
-    let active_for = |run_dir: &Path| app.link_check.as_ref().filter(|active| active.run_dir == run_dir);
-    match &app.viewed_run {
-        ViewedRun::Current => app.current_run.as_ref().map_or_else(Vec::new, |run| {
-            let links = link_results(&run.links, active_for(&run.plan.run_dir));
-            app.run_ui
-                .broken
-                .shown(&run.state.urls, links, &run.links.texts, &run.retries)
-        }),
-        ViewedRun::Past { .. } => match app.past_run.as_ref() {
-            Some(past) => match &past.load {
-                PastLoad::Ready(data) => {
-                    let links = link_results(&data.links, active_for(&past.run_dir));
-                    app.run_ui
-                        .broken
-                        .shown(&data.state.urls, links, &data.links.texts, &data.retries)
-                }
-                _ => Vec::new(),
-            },
-            None => Vec::new(),
-        },
-    }
+    shown_from(app).map_or_else(Vec::new, |from| app.run_ui.broken.shown(from))
 }
 
 /// The groups the Link checker tab shows by page for the run on the Run page, as of the last frame
 /// (empty while it is laid out by link): `(page, its rows)`.
 pub fn broken_pages(app: &App) -> Vec<(Option<String>, Vec<broken::ShownRow>)> {
-    let active_for = |run_dir: &Path| app.link_check.as_ref().filter(|active| active.run_dir == run_dir);
     let broken = &app.run_ui.broken;
     if !broken.shows_by_page() {
         return Vec::new();
     }
-    match &app.viewed_run {
-        ViewedRun::Current => app.current_run.as_ref().map_or_else(Vec::new, |run| {
-            let links = link_results(&run.links, active_for(&run.plan.run_dir));
-            broken.shown_by_page(&run.state.urls, links, &run.links.texts, &run.retries)
-        }),
-        ViewedRun::Past { .. } => match app.past_run.as_ref().map(|past| (past, &past.load)) {
-            Some((past, PastLoad::Ready(data))) => {
-                let links = link_results(&data.links, active_for(&past.run_dir));
-                broken.shown_by_page(&data.state.urls, links, &data.links.texts, &data.retries)
-            }
-            _ => Vec::new(),
-        },
-    }
+    shown_from(app).map_or_else(Vec::new, |from| broken.shown_by_page(from))
 }
 
 impl RunView<'_> {
@@ -393,6 +387,8 @@ pub enum RunAction {
     StopRetry,
     /// Writes the link report of the run and opens it (`true`: shows it in Explorer).
     OpenLinkReport(PathBuf, bool),
+    /// Lists the pages linking to a URL in a dialog (the URLs tab's row menu).
+    ShowLinkingPages(urls::LinkingPages),
     /// Checks which artifact files exist (on a worker).
     CheckFiles {
         run_dir: PathBuf,
@@ -721,7 +717,27 @@ fn perform(app: &mut App, action: RunAction, past_record: Option<&RunRecord>) {
         RunAction::ClearQueue => app.clear_retry_queue(),
         RunAction::StopRetry => app.stop_retry(),
         RunAction::OpenLinkReport(run_dir, reveal) => app.open_link_report(run_dir, reveal),
+        RunAction::ShowLinkingPages(pages) => show_linking_pages(app, &pages),
     }
+}
+
+/// The dialog of *Pages linking here* (the URLs tab's row menu): the pages, Copy list, Close.
+pub fn show_linking_pages(app: &mut App, pages: &urls::LinkingPages) {
+    let copy = crate::app::Action::CopyText {
+        text: pages.copy_text(),
+        what: format!("the pages linking to {}", pages.url),
+    };
+    let mut lines = pages.lines.clone();
+    if pages.more > 0 {
+        lines.push(broken::more_pages(pages.more));
+    }
+    app.open_dialog(
+        Dialog::new("Pages linking here")
+            .message(pages.message())
+            .details(lines)
+            .button("Copy list", ButtonKind::Secondary, copy)
+            .cancel("Close"),
+    );
 }
 
 /// Puts text on the clipboard (through egui, at the end of the frame).

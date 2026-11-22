@@ -438,6 +438,8 @@ pub const NOT_REQUEST_OPTIONS: &[&str] = &[
     "--keep-query-param",
     "--force-relative-urls",
     "--ignore-html-comments",
+    // What the crawler records about the links it finds; a retry reads only the answer.
+    "--link-details",
     "--max-queue-length",
     "--max-skipped-urls",
     "--max-non200-responses-per-basename",
@@ -723,6 +725,7 @@ mod tests {
                     cached: false,
                     done: 1,
                     total: 3,
+                    ..crate::model::events::UrlEvent::default()
                 }),
                 now,
             );

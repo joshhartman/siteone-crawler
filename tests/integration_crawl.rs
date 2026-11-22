@@ -997,6 +997,324 @@ fn no_events_file_means_no_events() {
     assert!(!tmp.path.join("events.ndjson").exists());
 }
 
+// ---------------------------------------------------------------------------
+// Link data (--link-details): referring pages, link text, positions, depth
+// ---------------------------------------------------------------------------
+
+/// `--config-file` that exists on every platform (`/dev/null` does not on Windows).
+fn no_config_file() -> String {
+    format!("--config-file={}", if cfg!(windows) { "NUL" } else { "/dev/null" })
+}
+
+/// 1-based line and character column of the first `needle` in `text`.
+fn line_and_column(text: &str, needle: &str) -> (u64, u64) {
+    let offset = text.find(needle).unwrap_or_else(|| panic!("{needle} in the page"));
+    let before = &text[..offset];
+    let line = before.matches('\n').count() as u64 + 1;
+    let line_start = before.rfind('\n').map_or(0, |i| i + 1);
+    (line, before[line_start..].chars().count() as u64 + 1)
+}
+
+/// Pages linked from the start page, each of which links to the hub: more than the 50
+/// referring pages that are kept.
+const LINKING_PAGES: usize = 55;
+
+struct LinkSite {
+    index: String,
+    style: String,
+    minified: String,
+    based: String,
+}
+
+fn write_link_site(dir: &Path) -> LinkSite {
+    for sub in ["", "img", "base", "other"] {
+        std::fs::create_dir_all(dir.join(sub)).expect("site dir");
+    }
+    let pages: String = (1..=LINKING_PAGES)
+        .map(|n| format!("<li><a href=\"/p{n}.html\">Page <b>{n}</b></a></li>\n"))
+        .collect();
+    let index = format!(
+        concat!(
+            "<!DOCTYPE html>\n<html>\n<head>\n<title>Home</title>\n",
+            "<link rel=\"stylesheet\" href=\"/style.css\">\n<link rel=\"stylesheet\" href=\"/min.css\">\n",
+            "</head>\n<body>\n",
+            "<a href=\"/logo-link.html\"><img src=\"/img/logo.png\" alt=\"Our  logo\"></a>\n",
+            "<p>Visit <a href=\"https://external.invalid/x\">the external <em>site</em></a>.</p>\n",
+            "<a href=\"/base/page.html\">Based page</a>\n<ul>\n{}</ul>\n</body>\n</html>\n"
+        ),
+        pages
+    );
+    let style = "body {\n  color: black;\n  background: url('/img/bg.png') no-repeat;\n}\n".to_string();
+    let minified = ".a{background:url(/img/a.png)}.b{background:url(/img/b.png)}".to_string();
+    let based =
+        "<html><head><base href=\"/other/\"></head>\n<body>\n  <a href=\"target.html\">Relative</a>\n</body></html>\n"
+            .to_string();
+    let simple = |title: &str| format!("<html><head><title>{title}</title></head><body><p>{title}</p></body></html>");
+    std::fs::write(dir.join("index.html"), &index).unwrap();
+    std::fs::write(dir.join("style.css"), &style).unwrap();
+    std::fs::write(dir.join("min.css"), &minified).unwrap();
+    std::fs::write(dir.join("base/page.html"), &based).unwrap();
+    std::fs::write(dir.join("other/target.html"), simple("Target")).unwrap();
+    std::fs::write(dir.join("hub.html"), simple("Hub")).unwrap();
+    std::fs::write(dir.join("logo-link.html"), simple("Logo")).unwrap();
+    for image in ["logo.png", "bg.png", "a.png", "b.png"] {
+        std::fs::write(dir.join("img").join(image), b"\x89PNG\r\n\x1a\n").unwrap();
+    }
+    for n in 1..=LINKING_PAGES {
+        std::fs::write(
+            dir.join(format!("p{n}.html")),
+            "<html><body><a href=\"/hub.html\">To the hub</a> <a href=\"https://external.invalid/x\">Ext</a></body></html>",
+        )
+        .unwrap();
+    }
+    LinkSite {
+        index,
+        style,
+        minified,
+        based,
+    }
+}
+
+fn read_events(path: &Path) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(path)
+        .expect("the event file exists")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("one JSON object per line"))
+        .collect()
+}
+
+/// The `url` event of `url`.
+fn url_event<'a>(events: &'a [serde_json::Value], url: &str) -> &'a serde_json::Value {
+    events
+        .iter()
+        .find(|e| e["type"] == "url" && e["url"] == url)
+        .unwrap_or_else(|| panic!("a url event for {url}"))
+}
+
+#[test]
+fn link_details_record_every_referrer_with_text_position_and_depth() {
+    let tmp = TempDir::new("link-details");
+    let site_dir = tmp.path.join("site");
+    let site = write_link_site(&site_dir);
+    let server = LocalServer::start(&site_dir);
+    let base = server.url();
+    let url = |path: &str| format!("{base}{path}");
+    let events_file = tmp.path.join("events.ndjson");
+    let json_file = tmp.path.join("out.json");
+
+    let output = run_crawler(&[
+        &no_config_file(),
+        &format!("--url={base}"),
+        LOCAL_ANALYZERS,
+        "--http-cache-dir=",
+        // One worker: pages commit their links in the order of their url events
+        "--workers=1",
+        "--max-reqs-per-sec=1000",
+        "--link-details",
+        &format!("--events-file={}", events_file.display()),
+        &format!("--output-json-file={}", json_file.display()),
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let events = read_events(&events_file);
+    let json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&json_file).unwrap()).unwrap();
+
+    // --- url events -------------------------------------------------------
+    let home = url_event(&events, &base);
+    assert!(home.get("source").is_none(), "the start URL has no referrer: {home}");
+    assert_eq!(home["depth"], 0);
+    assert_eq!(home["external"], false);
+
+    let page1 = url_event(&events, &url("p1.html"));
+    let (line, column) = line_and_column(&site.index, "/p1.html");
+    assert_eq!(page1["source"], base.as_str());
+    assert_eq!(page1["sourceAttr"], "<a href>");
+    assert_eq!(page1["linkText"], "Page 1");
+    assert_eq!(
+        (page1["sourceLine"].as_u64(), page1["sourceColumn"].as_u64()),
+        (Some(line), Some(column))
+    );
+    assert_eq!(page1["depth"], 1);
+    assert_eq!(page1["external"], false);
+
+    let logo_link = url_event(&events, &url("logo-link.html"));
+    assert_eq!(logo_link["linkText"], "Our logo", "a link with only an image: its alt");
+    let logo = url_event(&events, &url("img/logo.png"));
+    assert_eq!(logo["sourceAttr"], "<img src>");
+    assert_eq!(logo["linkText"], "Our logo");
+
+    let bg = url_event(&events, &url("img/bg.png"));
+    let (line, column) = line_and_column(&site.style, "/img/bg.png");
+    assert_eq!(bg["source"], url("style.css").as_str());
+    assert_eq!(bg["sourceAttr"], "css url()");
+    assert_eq!(
+        (bg["sourceLine"].as_u64(), bg["sourceColumn"].as_u64()),
+        (Some(3), Some(column))
+    );
+    assert_eq!(line, 3);
+    assert!(bg.get("linkText").is_none(), "CSS references have no text");
+    assert_eq!(bg["depth"], 2);
+
+    let minified_image = url_event(&events, &url("img/b.png"));
+    let (_, column) = line_and_column(&site.minified, "/img/b.png");
+    assert_eq!(
+        (
+            minified_image["sourceLine"].as_u64(),
+            minified_image["sourceColumn"].as_u64()
+        ),
+        (Some(1), Some(column))
+    );
+    assert_eq!(column, 49);
+
+    // <base href>: the URL resolves against the base, the source is the page itself, and the
+    // position is that of the attribute value in the page as received
+    let target = url_event(&events, &url("other/target.html"));
+    let (line, column) = line_and_column(&site.based, "target.html");
+    assert_eq!(target["source"], url("base/page.html").as_str());
+    assert_eq!(target["linkText"], "Relative");
+    assert_eq!(
+        (target["sourceLine"].as_u64(), target["sourceColumn"].as_u64()),
+        (Some(line), Some(column))
+    );
+    assert_eq!(target["depth"], 2);
+
+    // --- results keys -----------------------------------------------------
+    let results = json["results"].as_array().unwrap();
+    let result = |path: &str| {
+        results
+            .iter()
+            .find(|r| r["url"] == url(path).as_str())
+            .unwrap_or_else(|| panic!("a result for {path}"))
+    };
+    let home = result("");
+    assert_eq!(home["depth"], 0);
+    assert!(home.get("source").is_none());
+    assert_eq!(home["inLinks"], 0);
+    // p1..p55, the logo link and its image, two stylesheets, the based page, the external link
+    assert_eq!(home["outLinks"], LINKING_PAGES as u64 + 6);
+    let hub = result("hub.html");
+    assert_eq!(hub["inLinks"], LINKING_PAGES as u64);
+    assert_eq!(hub["outLinks"], 0);
+    assert_eq!(hub["depth"], 2);
+    assert_eq!(hub["linkText"], "To the hub");
+    assert_eq!(result("p7.html")["outLinks"], 2);
+    assert_eq!(result("img/b.png")["sourceColumn"], 49);
+    assert_eq!(result("other/target.html")["source"], url("base/page.html").as_str());
+
+    // --- the links table --------------------------------------------------
+    let table = &json["tables"]["links"];
+    assert_eq!(table["aplCode"], "links");
+    let rows = table["rows"].as_array().unwrap();
+    assert!(
+        rows.iter()
+            .all(|row| row.as_object().unwrap().values().all(|v| v.is_string())),
+        "all row values are strings, as in every table"
+    );
+    let rows_of = |target: &str| -> Vec<&serde_json::Value> { rows.iter().filter(|r| r["url"] == target).collect() };
+
+    let hub_rows = rows_of(&url("hub.html"));
+    assert_eq!(hub_rows.len(), 50, "at most 50 referrers are kept");
+    assert!(
+        hub_rows
+            .iter()
+            .all(|r| r["inLinks"] == LINKING_PAGES.to_string().as_str())
+    );
+    assert!(
+        hub_rows
+            .iter()
+            .all(|r| r["linkText"] == "To the hub" && r["sourceAttr"] == "<a href>")
+    );
+    assert_eq!(
+        hub_rows[0]["sourceUrl"], hub["source"],
+        "the first referrer is the page that queued it"
+    );
+    // Discovery order: the order in which the referring pages were crawled
+    let crawl_order: Vec<&str> = events
+        .iter()
+        .filter(|e| e["type"] == "url")
+        .filter_map(|e| e["url"].as_str())
+        .collect();
+    let positions: Vec<usize> = hub_rows
+        .iter()
+        .map(|r| crawl_order.iter().position(|u| *u == r["sourceUrl"]).unwrap())
+        .collect();
+    assert!(
+        positions.windows(2).all(|w| w[0] < w[1]),
+        "rows follow the crawl order: {positions:?}"
+    );
+
+    let external_rows = rows_of("https://external.invalid/x");
+    assert_eq!(external_rows.len(), 50);
+    assert_eq!(external_rows[0]["inLinks"], (LINKING_PAGES + 1).to_string().as_str());
+    assert!(external_rows.iter().all(|r| r["external"] == "1"));
+    let from_home = external_rows.iter().find(|r| r["sourceUrl"] == base.as_str()).unwrap();
+    assert_eq!(from_home["linkText"], "the external site");
+    let (line, column) = line_and_column(&site.index, "https://external.invalid/x");
+    assert_eq!(from_home["sourceLine"], line.to_string().as_str());
+    assert_eq!(from_home["sourceColumn"], column.to_string().as_str());
+    assert!(
+        results.iter().all(|r| r["url"] != "https://external.invalid/x"),
+        "the external link is recorded but not requested"
+    );
+
+    let css_rows = rows_of(&url("img/bg.png"));
+    assert_eq!(css_rows.len(), 1);
+    assert_eq!(css_rows[0]["sourceAttr"], "css url()");
+    assert_eq!(css_rows[0]["linkText"], "");
+    assert_eq!(css_rows[0]["external"], "0");
+}
+
+#[test]
+fn without_link_details_the_output_has_no_link_data() {
+    let tmp = TempDir::new("link-details-off");
+    let site_dir = tmp.path.join("site");
+    write_link_site(&site_dir);
+    let server = LocalServer::start(&site_dir);
+    let events_file = tmp.path.join("events.ndjson");
+    let json_file = tmp.path.join("out.json");
+
+    let output = run_crawler(&[
+        &no_config_file(),
+        &format!("--url={}", server.url()),
+        LOCAL_ANALYZERS,
+        "--http-cache-dir=",
+        "--max-reqs-per-sec=1000",
+        &format!("--events-file={}", events_file.display()),
+        &format!("--output-json-file={}", json_file.display()),
+    ]);
+    assert_eq!(output.status.code(), Some(0));
+    let json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&json_file).unwrap()).unwrap();
+    assert!(json["tables"].get("links").is_none());
+    for result in json["results"].as_array().unwrap() {
+        for key in [
+            "source",
+            "depth",
+            "inLinks",
+            "outLinks",
+            "linkText",
+            "sourceLine",
+            "external",
+        ] {
+            assert!(result.get(key).is_none(), "{key} only with --link-details: {result}");
+        }
+    }
+
+    // The event still names the referring page, its attribute, the host and the depth
+    let events = read_events(&events_file);
+    let page1 = url_event(&events, &format!("{}p1.html", server.url()));
+    assert_eq!(page1["source"], server.url().as_str());
+    assert_eq!(page1["sourceAttr"], "<a href>");
+    assert_eq!(page1["depth"], 1);
+    assert_eq!(page1["external"], false);
+    for key in ["linkText", "sourceLine", "sourceColumn"] {
+        assert!(page1.get(key).is_none(), "{key} only with --link-details");
+    }
+}
+
 /// `stop` on stdin winds the crawl down like Ctrl+C: the reports for what was already
 /// crawled still get written, and the stream says the run was cancelled rather than failed.
 #[test]

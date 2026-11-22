@@ -1,8 +1,11 @@
-//! Link texts as the app drives them (GUI-SPEC §4.8): after a crawl, the source pages of its
-//! internal 404s — HTML pages and stylesheets — are fetched (pages of the crawled site only) to
-//! read the text of the broken link and where the page references it; once the external link
-//! check of a run has run, so are the source pages of its external links. Every page is fetched
-//! once per run: what it says about every target the run knows is kept in
+//! Link texts as the app drives them (GUI-SPEC §4.8). Where the crawler reported the link text and
+//! position of a reference (`--link-details`), nothing is fetched. The fallback: after a crawl, the
+//! source pages of its broken URLs that the crawler gave no position for — a run without link
+//! details, a page rendered with `--browser`, a run of an older crawler (its `404` table) — HTML
+//! pages and stylesheets, are fetched (pages of the crawled site only) to read the text of the
+//! broken link and where the page references it; once the external link check of a run has run,
+//! so are the source pages of its external links (again only those without a crawler position).
+//! Every page is fetched once per run: what it says about every target the run knows is kept in
 //! `<run>/link-texts.json`.
 //!
 //! One fetch at a time ([`App::text_job`]). Like the link check it belongs to a run folder: it goes
@@ -155,14 +158,15 @@ impl App {
             && !run.links.texts_settled
             && matches!(run.result.ready(), Some(ResultLoad::Loaded(_)))
         {
-            let pages = run.links.wanted_pages(true);
+            let crawled = run.links.crawled_pairs(&run.state.urls);
+            let pages = run.links.wanted_pages(&crawled);
             if pages.is_empty() {
                 run.links.texts_settled = true;
             } else {
                 return Some(Candidate {
                     run_dir: run.plan.run_dir.clone(),
                     pages,
-                    targets: run.links.text_targets(),
+                    targets: run.links.text_targets(&crawled),
                     texts: run.links.texts.clone(),
                     config: run.config.clone(),
                     site_url: run
@@ -182,8 +186,13 @@ impl App {
             && !data.links.texts_settled
         {
             // A past run fetches only when asked (its external links were checked now).
+            let crawled = if data.links.texts_external {
+                data.links.crawled_pairs(&data.state.urls)
+            } else {
+                Vec::new()
+            };
             let pages = if data.links.texts_external {
-                data.links.wanted_pages(true)
+                data.links.wanted_pages(&crawled)
             } else {
                 Vec::new()
             };
@@ -193,7 +202,7 @@ impl App {
                 return Some(Candidate {
                     run_dir: past.run_dir.clone(),
                     pages,
-                    targets: data.links.text_targets(),
+                    targets: data.links.text_targets(&crawled),
                     texts: data.links.texts.clone(),
                     config: data.record.config.clone(),
                     site_url: data.record.url.clone(),

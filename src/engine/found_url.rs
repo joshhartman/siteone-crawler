@@ -93,6 +93,12 @@ pub struct FoundUrl {
     pub source_url: String,
     /// Source type (where in HTML/CSS the URL was found)
     pub source: UrlSource,
+    /// Byte offset of the URL text in the content it was extracted from, when the extraction
+    /// knows it (HTML and CSS processors). Read only with `--link-details`.
+    pub offset: Option<usize>,
+    /// Link text: the visible text of an `<a>` (or the `alt` of its only image), the `alt` of an
+    /// `<img>`. Collected only with `--link-details`.
+    pub text: Option<Box<str>>,
 }
 
 impl FoundUrl {
@@ -102,7 +108,16 @@ impl FoundUrl {
             url: normalized,
             source_url: source_url.to_string(),
             source,
+            offset: None,
+            text: None,
         }
+    }
+
+    /// Adds where the URL text starts in the extracted content and the link text.
+    pub fn with_details(mut self, offset: Option<usize>, text: Option<Box<str>>) -> Self {
+        self.offset = offset;
+        self.text = text;
+        self
     }
 
     /// Is this URL an included asset (img src, script src, link href) and not linked by href?

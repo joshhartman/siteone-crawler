@@ -50,6 +50,11 @@ const SCOPE: &[Field] = &[
     ("--single-page", "Crawl only the start page", ""),
     ("--max-depth", "Maximum link depth", "0 = no limit"),
     ("--max-visited-urls", "Maximum number of URLs", ""),
+    (
+        "--link-details",
+        "Record every referring page",
+        "link text and line · larger result on big sites",
+    ),
     ("--allowed-domain-for-crawling", "Also crawl these domains", ""),
     ("--include-regex", "Only URLs matching", ""),
     ("--ignore-regex", "Skip URLs matching", ""),

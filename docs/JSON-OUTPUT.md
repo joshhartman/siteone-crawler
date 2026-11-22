@@ -43,6 +43,7 @@
     *   [5.26. `content-processors-stats` (Content processor stats)](#526-content-processors-stats-content-processor-stats)
     *   [5.27. `external-urls` (External URLs)](#527-external-urls-external-urls)
     *   [5.28. `technologies` (Technologies)](#528-technologies-technologies)
+    *   [5.29. `links` (Links, with `--link-details`)](#529-links-links)
 *   [6. Note on Text Output](#6-note-on-text-output)
 
 
@@ -165,6 +166,17 @@ An array of objects, where each object represents a single visited URL.
 *   `cacheTypeFlags` (Integer): Bitmask representing detected caching mechanisms (e.g., Cache-Control, ETag, Last-Modified). For example, `31` typically means Cache-Control + ETag + Last-Modified are all present. `32768` might indicate no caching headers found.
 *   `cacheLifetime` (Integer): Cache lifetime in seconds derived from `Cache-Control: max-age` or `Expires` header. `0` if no lifetime could be determined.
 *   `extras` (Array): Contains additional data from specific analyzers run on this URL. Typically an empty array `[]`.
+
+With `--link-details` each row also has the link facts of its URL (native JSON types, unlike the table rows; an optional key is left out when unknown):
+
+*   `source` (String, optional): The page (or stylesheet, script, sitemap, redirecting URL) whose reference queued this URL, as its own `results` row names it — the page itself, also when it has a `<base href>`. Absent for a start URL (`--url`, `--url-list`). It is the first row of this URL in the [`links`](#529-links-links) table.
+*   `sourceAttr` (String, optional): How `source` referenced it: `<a href>`, `<img src>`, `<img srcset>`, `<input src>`, `<source src>`, `<video src>`, `<audio src>`, `<script src>`, `inline <script src>`, `<link href>`, `css url()`, `js url`, `redirect` or `sitemap`.
+*   `linkText` (String, optional): The text of that link: for `<a>` its visible text (tags removed, entities decoded, whitespace collapsed; without text, the `alt` of its image), for `<img>` its `alt`. At most 120 characters, the last one `…` when cut. Absent for CSS/script references, redirects and an empty `alt`.
+*   `sourceLine`, `sourceColumn` (Integer, optional): 1-based line and column (in characters) in `source` where the URL text of that reference starts, in the body as received (decoded, before any rewriting). Absent for references found by the JavaScript, Next.js, Astro and XML processors, for pages rendered with `--browser`, and for a body a processor rewrote before extraction (Next.js query parameters).
+*   `external` (Boolean): Not on the initial host or its www/non-www variant.
+*   `depth` (Integer, optional): Shortest link distance from a start URL over all links recorded in the crawl: `0` for a start URL, each link `+1`, a redirect `+0`. It does not depend on the crawl order (unlike the `depth` of the `url` event, which is the best value known when the URL was crawled). Absent only for a URL no recorded path leads to.
+*   `inLinks` (Integer): Number of distinct crawled pages (or stylesheets, …) that reference this URL, the URL itself included if it links to itself.
+*   `outLinks` (Integer): Number of distinct URLs this page references, as far as the crawler extracts them (see [`links`](#529-links-links) for what is recorded); `0` for a URL whose body is not parsed for links.
 
 ### 3.6. `stats` (Object)
 
@@ -320,7 +332,16 @@ This is a draft JSON schema based on the actual output. It may need refinement f
           "extras": {
             "type": "array",
             "description": "Additional analysis data for this URL (typically empty)"
-          }
+          },
+          "source": { "type": "string", "description": "--link-details: the page whose reference queued this URL" },
+          "sourceAttr": { "type": "string", "description": "--link-details: how source referenced it" },
+          "linkText": { "type": "string", "description": "--link-details: text of that link" },
+          "sourceLine": { "type": "integer", "description": "--link-details: 1-based line of the reference in source" },
+          "sourceColumn": { "type": "integer", "description": "--link-details: 1-based column (characters)" },
+          "external": { "type": "boolean", "description": "--link-details: not on the initial host" },
+          "depth": { "type": "integer", "description": "--link-details: shortest link distance from a start URL" },
+          "inLinks": { "type": "integer", "description": "--link-details: distinct pages referencing this URL" },
+          "outLinks": { "type": "integer", "description": "--link-details: distinct URLs this page references" }
         },
         "required": ["url", "status", "elapsedTime", "size", "type", "cacheTypeFlags", "cacheLifetime", "extras"]
       }
@@ -757,6 +778,31 @@ Technologies recognized passively from response headers, cookie names, `<meta>` 
 | `version` | Versions seen, comma-separated in ascending order; empty when the site does not reveal one. |
 | `evidence` | The first signal that matched, e.g. `"server: nginx/1.25.3"`, `"cookie __cf_bm"`, `"meta generator: WordPress 6.5.2"`, `"script https://code.jquery.com/jquery-3.7.1.min.js"`. Cookie values are never shown. |
 | `pages` | Number of crawled HTML pages (redirects not counted) on which the technology was recognized. |
+
+### 5.29. `links` (Links)
+
+Only with `--link-details`. Every link the crawler found, as one row per kept (target URL, referring page) pair. It is in the JSON output only: the text output and the HTML report do not show it, and no other table changes. A URL that several pages reference has one row per referring page, up to **50**; `inLinks` gives the total, so a consumer can say "and 312 more". Rows are grouped by target URL (targets in the order they were first found); within a target, referring pages come in discovery order (the order in which the crawler finished extracting the links of those pages), except that the page that queued a crawled URL — its `source` in `results` — always comes first. Flat rows keep the table shaped like every other one (string values, one object per row); to get the referrers of a URL, take its rows in order.
+
+| Column | Description |
+|--------|-------------|
+| `url` | The target URL: for a crawled URL as its `results` row names it; for a URL that was not crawled (another host, robots.txt, `--ignore-regex`, a limit, …) as the crawler normalized it — for a skipped URL the same string as the `url` of the `skipped` table (external links included, which `external-urls` lists with at most 5 pages). |
+| `sourceUrl` | The referring page, as its `results` row names it. |
+| `sourceAttr` | How it referenced the target (`<a href>`, `<img src>`, `css url()`, `redirect`, `sitemap`, …; see `results`). A page that references the same URL several times has one row: its redirect if it redirects there, otherwise the occurrence earliest in the document. |
+| `linkText` | Link text as in `results` (`""` when there is none). |
+| `sourceLine` | 1-based line of the URL text in the referring page as received (`""` when unknown, see `results`). |
+| `sourceColumn` | 1-based column, in characters (`""` when unknown). |
+| `inLinks` | Total number of distinct pages referencing the target, also beyond the 50 rows kept (the same on every row of the target). |
+| `external` | `"1"` when the target is not on the initial host (or its www/non-www variant), else `"0"`. |
+
+Recorded are the links the crawler extracts from the pages it parses (HTML, CSS, JavaScript and XML sitemaps) and the redirects it follows, also when the target is already known or is not crawled: on another host, disallowed by robots.txt, matching `--ignore-regex` (or not `--include-regex`), longer than `--max-url-length`, beyond `--max-visited-urls` / `--max-queue-length`, a basename with too many non-200 answers, or a file left out because only HTML is crawled. Not recorded: `mailto:`, `tel:`, `javascript:`, `data:` and other non-HTTP references, bare `#fragment` links, values with `{`, `<` or `&#` (template code), links the extraction itself leaves out (`--max-depth`, `--disable-*`, `--single-page`, comments with `--ignore-html-comments`), and the links of pages whose body is not parsed (responses other than HTML, CSS, JS and XML; pages of hosts not allowed for crawling; HTML pages in sitemap-only mode). URLs are normalized as the crawler normalizes them for its queue (absolute, without `#fragment`, with `--remove-query-params` / `--keep-query-param` / `--force-relative-urls` applied). A link to a URL that redirects is a link to that URL; the redirect is a row of its own (`sourceAttr` `redirect`) from the redirecting URL to its target.
+
+Example row:
+
+```json
+{"external": "0", "inLinks": "18", "linkText": "article 141", "sourceAttr": "<a href>", "sourceColumn": "257", "sourceLine": "45", "sourceUrl": "http://127.0.0.1:8891/", "url": "http://127.0.0.1:8891/page-141.html"}
+```
+
+Size: the table has at most 50 rows per target. On a generated 3,000-page site with about 60 links per page it had 63,000 rows (of 185,000 links found) and made the JSON file 22 MB instead of 0.9 MB, which is why it is opt-in.
 
 ## 6. Note on Text Output
 

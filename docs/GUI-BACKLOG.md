@@ -1,27 +1,50 @@
 # GUI backlog — crawler-side changes
 
-Changes to the crawler (`src/`) that would improve the GUI. None of them is made: the GUI is
-built on the crawler as it is. Each entry says what the GUI does instead today.
+Changes to the crawler (`src/`) that would improve the GUI. Items 1–3 are done on both sides
+(additive in the crawler: new event fields, new JSON keys and table, the `--link-details` option;
+the GUI uses them and passes `--link-details` by default). For the others the GUI is built on the
+crawler as it is. Each entry says what the GUI does instead today.
 
 ## Link data
 
-1. **Referring page on every crawled URL.** Add `source` (URL of the page or stylesheet that
-   referenced it), `sourceAttr` (`<a href>`, `<img src>`, `css url()`, …) and `external` to the
-   `url` event (additive, protocol 1). The crawler already has them per URL
-   (`VisitedUrl::source_uq_id`, `source_attr`, `is_external`).
-   *Today:* "Found on" is joined from the result JSON's `404` table, so it exists for 404s only
-   and only after the crawl. A 403, 5xx, timeout or connection failure on the site has none.
+1. **Referring page on every crawled URL.** *Done in the crawler.* Every `url` event has
+   `source` (the page, stylesheet, script, sitemap or redirecting URL whose reference queued the
+   URL — the page itself, not its `<base href>`; absent for a start URL), `sourceAttr`
+   (`<a href>`, `<img src>`, `css url()`, `redirect`, …), `external` and `depth`, also without
+   `--link-details` ([EVENTS.md](EVENTS.md#url)). With `--link-details` the result JSON's
+   `results` rows carry the same facts.
+   *Done in the GUI:* "Found on" (and *By page*) comes from the event as each URL arrives, for
+   every status (timeouts, 403, 5xx, connection failures); the URLs tab has a *Depth* column from
+   it. The `404` table join stays as the fallback for runs of a crawler without the field, so "Page
+   not reported by the crawler" remains only for start URLs and those runs.
 
-2. **All referring pages, link counts and depth per URL.** The crawler keeps only the first
-   page a URL was found on. Reporting every referrer, the number of in-links and out-links, and
-   the crawl depth would allow a "pages linking to this one" list and In links / Out links /
-   Level columns (as in Xenu's Link Sleuth), and a site map view.
-   *Today:* not available for internal URLs. External links carry the sources the
-   `external-urls` table lists.
+2. **All referring pages, link counts and depth per URL.** *Done in the crawler, with
+   `--link-details`.* The result JSON's `links` table has one row per (target, referring page),
+   up to 50 per target in discovery order (the page that queued it first) with `inLinks`, the
+   total, on every row — for crawled URLs and for those that were not crawled (external links,
+   skipped files, robots.txt, ignore regex, limits). `results` rows get `inLinks`, `outLinks` and
+   `depth` (shortest link distance from the start URL, exact after the crawl; the event's `depth`
+   is the value known when the URL was crawled). See [JSON-OUTPUT.md](JSON-OUTPUT.md#529-links-links).
+   *Done in the GUI:* `--link-details` is an option with an app default of on (Setup → Scope,
+   "Record every referring page"; `--link-details=true` in every command, like `--timeout=30`).
+   Every referring page of a broken link in the Link checker ("+N more", the kept pages in the
+   tooltip, "and N more pages" = `inLinks` − rows), under each of its pages *by page*, in Copy list
+   and the link report; *Pages linking here…* in the URLs tab's row menu; *Depth* (exact) and *In
+   links* columns. The app's external link check takes its links and all their referrers from
+   `links` — `external-urls` lists at most 5 pages per URL and stays the source for runs without
+   the table. Out links is not shown.
 
-3. **Link text.** Capture the anchor text (or image alt) when a link is extracted.
-   *Today:* the GUI requests the referring page again after the crawl and reads the link text
-   from it — extra requests to the crawled site.
+3. **Link text.** *Done in the crawler, with `--link-details`.* Each `links` row has `linkText`
+   (visible text of an `<a>`, or its image's `alt`; an `<img>`'s `alt`; ≤ 120 characters) and the
+   position of the reference in the source as received (`sourceLine`, `sourceColumn`; none for a
+   `--browser`-rendered page, sitemap or JavaScript references). The first reference is on the
+   `url` event too (`linkText`, `sourceLine`, `sourceColumn`).
+   *Done in the GUI:* the Link text column and the `:line` suffix of Found on come from the crawler
+   (the event live, `links` for every referrer); a column beyond 500 is shown as well
+   (`:1:20345`), since the crawler reports no line length. The app reads a referring page itself
+   only for a reference without a crawler position that it can locate (an HTML attribute or a
+   stylesheet `url()`: runs without link details, `--browser`-rendered pages) and for runs of an
+   older crawler (their `404` table); a run with complete crawler data adds no request.
 
 4. **A link-check mode for external links.** Request each external link once without parsing
    the page (optionally reading its title), instead of `--allowed-domain-for-crawling=*` +
@@ -30,8 +53,15 @@ built on the crawler as it is. Each entry says what the GUI does instead today.
    third-party scripts.
    *Today:* the GUI checks external links itself after the crawl; the CLI has no equivalent.
 
-   A list of URLs to request (`--url-list` or several `--url`) would also serve the retry queue,
-   which today starts one crawler process per retried URL.
+   The retry queue still starts one crawler process per retried URL. `--url-list` exists and was
+   tested for it (`gui/tests/core_retry.rs`): one process with `--url-list`,
+   `--max-visited-urls=N`, `--single-page`, `--workers=1` does send exactly one request per URL (no
+   robots.txt, asset, link or redirect target) with a `url` event each, but it keeps neither rule of
+   a pass: `--max-reqs-per-sec` spaces the *starts* of requests, so the request after a slow answer
+   follows it at once (a pass waits 500 ms after the end of a request to a host), and it requests
+   every URL of a host that does not answer (a pass gives it up after two failures). A link-check
+   mode, or a per-host delay measured from the end of a request plus giving up a dead host, would
+   make one process per pass possible.
 
 5. **Reports that follow a retry.** The crawler can only report the crawl it has just made: there
    is no way to rebuild the HTML report, the JSON and the scores from stored results with a few
@@ -42,7 +72,10 @@ built on the crawler as it is. Each entry says what the GUI does instead today.
 
 6. **Content type of a failed asset.** A missing image is reported with `contentType` "HTML"
    (the server's 404 page).
-   *Today:* the GUI classifies pages and assets by the URL's file extension.
+   *Today:* the GUI classifies pages and assets by the URL's file extension. With link data the
+   `sourceAttr` of the referrers could decide instead (`<img src>` → image, `<script src>` →
+   script, `<link href>` → stylesheet or other, `css url()` → image or font, `<a href>` → page or
+   download); the extension would still be needed for `<a href>` to a file and for `<link href>`.
 
 ## Coverage
 
@@ -56,12 +89,23 @@ built on the crawler as it is. Each entry says what the GUI does instead today.
     *Today:* the link report's *Not checked* names these gaps without a count, and infers the URL
     limit from "URLs crawled ≥ `--max-visited-urls`".
 
-16. **Schemes with a hyphen, a plus sign, a dot or a digit.** The filter for non-http links
-    (`NON_HTTP_SCHEME_RE` in `src/engine/found_urls.rs`) accepts letters only in the scheme, so
-    `android-app://…`, `ms-windows-store://…`, `fb-messenger://…` or `web+app:…` is taken for a
-    relative path, requested as `<page>/android-app://…` and reported as a 404 that no visitor
-    can meet. RFC 3986 allows `[a-z][a-z0-9+.-]*`.
-    *Today:* such a link shows as a broken internal page; the user adds an `--ignore-regex`.
+16. **Schemes with a hyphen, a plus sign, a dot or a digit.** *Done in the crawler.* The filter
+    for non-http links follows RFC 3986 (`[a-z][a-z0-9+.-]*:`), so `android-app://…`,
+    `ms-windows-store://…` or `web+app:…` is no longer taken for a relative path and requested.
+    Fixed together with four other link defects: whitespace around a URL attribute
+    (`href=" /x"` was requested as `%20/x`), `<base href>` recorded as the source page of a link,
+    a race that could queue a URL twice, and the `<a href>` pattern matching other tags whose
+    name starts with "a".
+
+17. **Link defects left in the crawler** (seen while fixing 16, not fixed):
+    - `utils::is_href_for_requestable_resource` and `RE_NON_HTTP_SCHEME` in the HTML processor
+      still accept letters and digits only in a scheme; they are used by the offline export,
+      which may rewrite an `android-app://` link as a file.
+    - `base_processor::convert_url_to_relative` does not trim whitespace, so the offline and
+      Markdown exports may not match `href=" /x"` with the crawled `/x` (not verified).
+    - `url(" /x.png")` with whitespace inside the quotes in an inline `<style>` is not found.
+    - `href = "…"` with spaces around `=` is not found.
+    - The `queue + visited` limit checks are not atomic, so the URL limits are approximate.
 
 ## Requests
 

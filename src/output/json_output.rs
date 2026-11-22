@@ -10,6 +10,8 @@ use serde_json::{Value, json};
 
 use crate::components::summary::summary::Summary;
 use crate::components::super_table::SuperTable;
+use crate::components::super_table_column::SuperTableColumn;
+use crate::engine::link_graph::{LinkReport, RowRef};
 use crate::extra_column::ExtraColumn;
 use crate::output::output::{BasicStats, CrawlerInfo, Output};
 use crate::output::output_type::OutputType;
@@ -62,8 +64,9 @@ impl JsonOutput {
     }
 
     pub fn get_json(&self) -> String {
-        let value = Value::Object(self.json.clone());
-        serde_json::to_string_pretty(&value)
+        // Serialized in place: a clone of the whole document (with `--link-details`, its `links`
+        // table may have many thousands of rows) would double the memory at the end of the run.
+        serde_json::to_string_pretty(&self.json)
             .unwrap_or_else(|e| format!("{{\"error\": \"unable to serialize JSON: {}\"}}", e))
     }
 }
@@ -321,6 +324,48 @@ impl Output for JsonOutput {
         }
     }
 
+    fn add_link_details(&mut self, report: &LinkReport) {
+        if let Some(Value::Array(results)) = self.json.get_mut("results") {
+            for result in results.iter_mut() {
+                let Some(row) = result.as_object_mut() else { continue };
+                let Some(facts) = row
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .and_then(|url| report.urls.get(url))
+                else {
+                    continue;
+                };
+                let mut keys = serde_json::Map::new();
+                if let Some(first) = &facts.first {
+                    keys.insert("source".to_string(), json!(first.source));
+                    keys.insert("sourceAttr".to_string(), json!(first.source_attr));
+                    if let Some(text) = &first.text {
+                        keys.insert("linkText".to_string(), json!(text));
+                    }
+                    if let (Some(line), Some(column)) = (first.line, first.column) {
+                        keys.insert("sourceLine".to_string(), json!(line));
+                        keys.insert("sourceColumn".to_string(), json!(column));
+                    }
+                }
+                keys.insert("external".to_string(), json!(facts.external));
+                if let Some(depth) = facts.depth {
+                    keys.insert("depth".to_string(), json!(depth));
+                }
+                keys.insert("inLinks".to_string(), json!(facts.in_links));
+                keys.insert("outLinks".to_string(), json!(facts.out_links));
+                row.extend(keys);
+            }
+        }
+
+        if !self.json.contains_key("tables") {
+            self.json
+                .insert("tables".to_string(), Value::Object(serde_json::Map::new()));
+        }
+        if let Some(Value::Object(tables)) = self.json.get_mut("tables") {
+            tables.insert(LINKS_TABLE.to_string(), links_table(report));
+        }
+    }
+
     fn get_type(&self) -> OutputType {
         OutputType::Json
     }
@@ -337,6 +382,77 @@ impl Output for JsonOutput {
     fn get_json_content(&self) -> Option<String> {
         Some(self.get_json())
     }
+}
+
+/// Key of the `--link-details` table in `tables`.
+pub const LINKS_TABLE: &str = "links";
+
+/// The `links` table, shaped like the other tables (all row values are strings): one row per kept
+/// (URL, referring page) pair, grouped by URL.
+fn links_table(report: &LinkReport) -> Value {
+    let column = |code: &str, name: &str, width: i32| {
+        SuperTableColumn::new(
+            code.to_string(),
+            name.to_string(),
+            width,
+            None,
+            None,
+            false,
+            false,
+            false,
+            true,
+            None,
+        )
+    };
+    let columns = vec![
+        column("url", "URL", 60),
+        column("sourceUrl", "Found on", 60),
+        column("sourceAttr", "Source", 12),
+        column("linkText", "Link text", 40),
+        column("sourceLine", "Line", 6),
+        column("sourceColumn", "Column", 6),
+        column("inLinks", "In links", 8),
+        column("external", "External", 8),
+    ];
+    let table = SuperTable::new(
+        LINKS_TABLE.to_string(),
+        "Links".to_string(),
+        "No links found.".to_string(),
+        columns,
+        false,
+        None,
+        "ASC".to_string(),
+        None,
+        None,
+        None,
+    );
+    let mut json = table.get_json_output().unwrap_or_else(|| json!({}));
+    let optional = |value: Option<u32>| value.map(|v| v.to_string()).unwrap_or_default();
+    let rows: Vec<Value> = report
+        .rows
+        .iter()
+        .map(|row| {
+            let RowRef {
+                source,
+                source_attr,
+                line,
+                column,
+                text,
+            } = &row.reference;
+            json!({
+                "url": row.url,
+                "sourceUrl": source,
+                "sourceAttr": source_attr,
+                "linkText": text.as_deref().unwrap_or_default(),
+                "sourceLine": optional(*line),
+                "sourceColumn": optional(*column),
+                "inLinks": row.in_links.to_string(),
+                "external": if row.external { "1" } else { "0" },
+            })
+        })
+        .collect();
+    json["rows"] = Value::Array(rows);
+    json
 }
 
 #[cfg(test)]

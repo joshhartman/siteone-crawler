@@ -44,6 +44,31 @@ impl FoundUrls {
         }
     }
 
+    /// Add one URL with the byte offset of its text in the extracted content (leading whitespace
+    /// of the value skipped) and its link text, filtering out invalid ones like
+    /// `add_urls_from_text_array`. The first occurrence of a URL keeps its details.
+    pub fn add_url_with_details(
+        &mut self,
+        url: &str,
+        offset: usize,
+        text: Option<Box<str>>,
+        source_url: &str,
+        source: UrlSource,
+    ) {
+        if is_url_valid_for_crawling(url) {
+            let offset = offset + (url.len() - url.trim_start().len());
+            self.add_url(FoundUrl::new(url, source_url, source).with_details(Some(offset), text));
+        }
+    }
+
+    /// Replace every known offset by `map(offset)`, e.g. to refer to the content before something
+    /// was cut out of it.
+    pub fn map_offsets(&mut self, map: impl Fn(usize) -> usize) {
+        for found_url in self.found_urls.values_mut() {
+            found_url.offset = found_url.offset.map(&map);
+        }
+    }
+
     /// Get all found URLs
     pub fn get_urls(&self) -> &HashMap<String, FoundUrl> {
         &self.found_urls

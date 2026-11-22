@@ -6,6 +6,7 @@ use std::collections::HashMap;
 
 use crate::components::summary::summary::Summary;
 use crate::components::super_table::SuperTable;
+use crate::engine::link_graph::LinkReport;
 use crate::extra_column::ExtraColumn;
 use crate::output::output::{BasicStats, Output};
 use crate::output::output_type::OutputType;
@@ -155,6 +156,12 @@ impl Output for MultiOutput {
     ) {
         for output in &mut self.outputs {
             output.set_export_file_paths(offline_paths, markdown_paths);
+        }
+    }
+
+    fn add_link_details(&mut self, report: &LinkReport) {
+        for output in &mut self.outputs {
+            output.add_link_details(report);
         }
     }
 

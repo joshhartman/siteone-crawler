@@ -602,6 +602,37 @@ fn skipping_cart_and_action_links_is_on_by_default_and_says_so_in_the_command() 
 }
 
 #[test]
+fn recording_every_referring_page_is_on_by_default_and_in_the_command() {
+    let env = Env::new();
+    let mut harness = harness(env.app(), LARGE, egui::Theme::Light);
+    settle(&mut harness);
+    let details = |argv: &[String]| -> Vec<String> {
+        argv.iter()
+            .filter(|arg| arg.starts_with("--link-details"))
+            .cloned()
+            .collect()
+    };
+    // On by default: the command says so; nothing counts as changed.
+    assert_eq!(details(&preview(harness.state())), ["--link-details=true"]);
+    assert!(!harness.state().is_modified());
+    let switch = "Record every referring page";
+    harness.get_by_role_and_label(Role::CheckBox, switch).scroll_to_me();
+    settle(&mut harness);
+    assert!(is_on(&harness, Role::CheckBox, switch));
+    assert!(shows_text(&harness, "larger result on big sites"));
+    {
+        let _gpu = ui_common::gpu_lock();
+        ui_common::snapshot(&mut harness, "setup-link-details-1280x820-light");
+    }
+    // Off: `=false` in the command, counted as a change.
+    harness.get_by_role_and_label(Role::CheckBox, switch).click();
+    settle(&mut harness);
+    assert_eq!(details(&preview(harness.state())), ["--link-details=false"]);
+    assert!(shows_text(&harness, "1 changed"));
+    assert!(harness.state().is_modified());
+}
+
+#[test]
 fn turning_ai_on_shows_the_panel_and_a_failing_model_list_is_reported() {
     let env = Env::new();
     let mut harness = harness(env.app(), LARGE, egui::Theme::Light);

@@ -62,6 +62,20 @@ pub struct UrlEvent {
     pub cached: bool,
     pub done: u64,
     pub total: u64,
+    /// The page (stylesheet, script, sitemap, redirecting URL) whose reference queued this URL;
+    /// absent for a start URL and in the streams of crawlers before link data.
+    pub source: Option<String>,
+    /// How `source` referenced it: `<a href>`, `<img src>`, `css url()`, `redirect`, …
+    pub source_attr: Option<String>,
+    /// `--link-details` only: the text of that link.
+    pub link_text: Option<String>,
+    /// `--link-details` only: 1-based line and column (characters) of the reference in `source`.
+    pub source_line: Option<u64>,
+    pub source_column: Option<u64>,
+    /// Not on the initial host (`www.` aside).
+    pub external: Option<bool>,
+    /// Link distance from a start URL as known when the URL was crawled.
+    pub depth: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -197,6 +211,11 @@ mod tests {
                 cached: false,
                 done: 2,
                 total: 2,
+                source: Some("http://127.0.0.1:8888/".to_string()),
+                source_attr: Some("<a href>".to_string()),
+                external: Some(false),
+                depth: Some(1),
+                ..UrlEvent::default()
             })
         );
         let Event::AiRequest(request) = &events[3] else {

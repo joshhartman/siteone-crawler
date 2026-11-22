@@ -146,6 +146,10 @@ pub fn minified_stylesheet() -> String {
     css
 }
 
+/// `/ld/`: links to three pages on lines 6–8, to a page that answers 500 on line 9; its stylesheet
+/// on line 3.
+pub const LINK_DATA_INDEX: &str = "<!DOCTYPE html>\n<html><head><title>Link data</title>\n<link rel=\"stylesheet\" href=\"/ld/style.css\">\n</head>\n<body>\n<a href=\"/ld/a\">Page A</a>\n<a href=\"/ld/b\">Page B</a>\n<a href=\"/ld/c\">Page C</a>\n<a href=\"/ld/error\">Broken page</a>\n</body></html>\n";
+
 fn page(title: &str, body: &str) -> String {
     format!("<!DOCTYPE html><html><head><title>{title}</title></head><body>{body}</body></html>")
 }
@@ -303,6 +307,28 @@ fn serve(mut stream: TcpStream, shared: &Shared) {
             )
             .as_bytes(),
         ),
+        // A small site for the crawler's link data: three pages link to a missing page and to a
+        // partner on another host (`localhost`), the start page to a page that answers 500, and its
+        // stylesheet to a missing image.
+        "/ld/" => respond(&mut stream, "200 OK", &html, LINK_DATA_INDEX.as_bytes()),
+        "/ld/a" | "/ld/b" | "/ld/c" => {
+            let port = shared.port.load(Ordering::SeqCst);
+            let name = path.trim_start_matches("/ld/").to_ascii_uppercase();
+            let body = format!(
+                "<!DOCTYPE html>\n<html><head><title>Page {name}</title></head>\n<body>\n<h1>Page {name}</h1>\n<p>Read <a href=\"/ld/missing\">the missing page</a>.</p>\n<p><a href=\"http://localhost:{port}/partner\">Our partner</a></p>\n</body></html>\n"
+            );
+            respond(&mut stream, "200 OK", &html, body.as_bytes());
+        }
+        "/ld/style.css" => respond(
+            &mut stream,
+            "200 OK",
+            &[("Content-Type", "text/css")],
+            b"body { margin: 0; }\n.hero { background: url(/ld/img/missing.png); }\n",
+        ),
+        "/ld/error" => respond(&mut stream, "500 Internal Server Error", &html, page("Error", "").as_bytes()),
+        "/ld/missing" | "/ld/img/missing.png" => {
+            respond(&mut stream, "404 Not Found", &html, page("Not found", "").as_bytes())
+        }
         "/notitle" => respond(&mut stream, "200 OK", &[("Content-Type", "text/plain")], b"plain text"),
         "/big" => {
             let head = format!(

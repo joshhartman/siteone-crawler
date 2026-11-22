@@ -423,3 +423,47 @@ fn run_broken_links_with_positions() {
         },
     );
 }
+
+/// A run of a crawler with link data (`--link-details`): Found on for every status with its line,
+/// "+N more" for a link on many pages, the external links with all their pages — by link and by
+/// page; the URLs tab with Depth and In links; the pages linking to a URL.
+#[test]
+fn run_with_link_data() {
+    let checked = |harness: &mut Harness<'_, App>| {
+        runs::with_check(harness.state_mut(), 88, false);
+        harness.get_by_role_and_label(Role::Tab, "Link checker").click();
+    };
+    each_variant(
+        "run-link-data-broken",
+        |_, app| keep(runs::finished_with_link_data(app)),
+        checked,
+    );
+    each_variant(
+        "run-link-data-by-page",
+        |_, app| keep(runs::finished_with_link_data(app)),
+        |harness| {
+            checked(harness);
+            harness.run();
+            harness.get_by_role_and_label(Role::CheckBox, "By page").click();
+        },
+    );
+    each_variant(
+        "run-link-data-urls",
+        |_, app| keep(runs::finished_with_link_data(app)),
+        tab("URLs"),
+    );
+    each_variant(
+        "run-link-data-linking-pages",
+        |_, app| keep(runs::finished_with_link_data(app)),
+        |harness| {
+            harness.get_by_role_and_label(Role::Tab, "URLs").click();
+            harness.run();
+            let app = harness.state_mut();
+            let run = app.current_run.as_ref().expect("run");
+            let graph = run.links.graph.clone().expect("links table");
+            let pages = siteone_crawler_gui::ui::run::urls::linking_pages(runs::FIXTURE_404, Some(&graph), None, false)
+                .expect("pages");
+            siteone_crawler_gui::ui::run::show_linking_pages(app, &pages);
+        },
+    );
+}

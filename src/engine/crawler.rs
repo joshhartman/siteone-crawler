@@ -63,6 +63,7 @@ use crate::engine::fetcher::Fetcher;
 use crate::engine::found_url::UrlSource;
 use crate::engine::found_urls::FoundUrls;
 use crate::engine::http_response::HttpResponse;
+use crate::engine::link_graph::{self, FirstRef, LinkGraph, PageLinks};
 use crate::engine::parsed_url::ParsedUrl;
 use crate::engine::robots_txt::RobotsTxt;
 use crate::error::{CrawlerError, CrawlerResult};
@@ -82,6 +83,10 @@ pub struct QueueEntry {
     pub uq_id: String,
     pub source_uq_id: String,
     pub source_attr: i32,
+    /// Link distance from a start URL when queued (0 for a start URL).
+    pub depth: u32,
+    /// The reference that queued the URL; none for a start URL.
+    pub first: Option<Box<FirstRef>>,
 }
 
 /// Entry for a visited URL in the visited table
@@ -159,6 +164,9 @@ pub struct Crawler {
     compiled_include_regex: Arc<Vec<FilterRegex>>,
     /// Pre-compiled ignore regex patterns
     compiled_ignore_regex: Arc<Vec<FilterRegex>>,
+
+    /// Every link found, with `--link-details`
+    link_graph: Option<Arc<Mutex<LinkGraph>>>,
 }
 
 impl Crawler {
@@ -213,6 +221,8 @@ impl Crawler {
             }
         }
 
+        let link_graph = options.link_details.then(|| Arc::new(Mutex::new(LinkGraph::new())));
+
         Ok(Crawler {
             options,
             http_client,
@@ -238,6 +248,7 @@ impl Crawler {
             resolve_cache: Arc::new(resolve_cache),
             compiled_include_regex: Arc::new(compiled_include_regex),
             compiled_ignore_regex: Arc::new(compiled_ignore_regex),
+            link_graph,
         })
     }
 
@@ -332,6 +343,7 @@ impl Crawler {
             let optimal_delay = self.optimal_delay_between_requests;
             let compiled_include_regex = self.compiled_include_regex.clone();
             let compiled_ignore_regex = self.compiled_ignore_regex.clone();
+            let link_graph = self.link_graph.clone();
 
             let handle = tokio::spawn(async move {
                 let _permit = permit; // Hold permit until task completes
@@ -366,6 +378,7 @@ impl Crawler {
                     optimal_delay,
                     &compiled_include_regex,
                     &compiled_ignore_regex,
+                    &link_graph,
                 )
                 .await;
             });
@@ -475,6 +488,7 @@ impl Crawler {
         optimal_delay: f64,
         compiled_include_regex: &Arc<Vec<FilterRegex>>,
         compiled_ignore_regex: &Arc<Vec<FilterRegex>>,
+        link_graph: &Option<Arc<Mutex<LinkGraph>>>,
     ) {
         let parsed_url = ParsedUrl::parse(&entry.url, None);
         let parsed_url_uq_id = Self::compute_url_uq_id(&parsed_url);
@@ -732,6 +746,33 @@ impl Crawler {
             cpm.apply_content_changes_before_url_parsing(&mut body_for_parsing, content_type, &parsed_url);
         }
 
+        let is_external = Self::is_external_host(parsed_url.host.as_deref(), initial_parsed_url);
+
+        // The links of this page. Its depth is the best known now (a later link may be shorter).
+        let mut page_depth = entry.depth;
+        if let Some(graph) = link_graph
+            && let Ok(mut graph) = graph.lock()
+            && let Some(known_depth) = graph.visit(&entry.url, &absolute_url, is_external, entry.first.as_deref())
+        {
+            page_depth = page_depth.min(known_depth);
+        }
+        // Positions refer to the body as received: not to a DOM rendered by --browser, nor to a
+        // body a processor rewrote before the URLs were extracted.
+        let body_is_rendered = is_html_body
+            && http_response
+                .browser_diagnostics
+                .as_ref()
+                .is_some_and(|diagnostics| diagnostics.render_error.is_none());
+        let positions_valid =
+            link_graph.is_some() && !body_is_rendered && body_text.as_deref().unwrap_or_default() == body_for_parsing;
+        let page_key: Arc<str> = Arc::from(entry.url.as_str());
+        let page_url: Arc<str> = if absolute_url == entry.url {
+            page_key.clone()
+        } else {
+            Arc::from(absolute_url.as_str())
+        };
+        let mut page_links = PageLinks::new(page_key, page_url, page_depth, link_graph.is_some(), positions_valid);
+
         // Parse body and fill queue with new URLs
         if !body_for_parsing.is_empty() && is_html_body && is_allowed_for_crawling {
             let html_extras = Self::parse_html_body_and_fill_queue(
@@ -755,6 +796,7 @@ impl Crawler {
                 terminated,
                 compiled_include_regex,
                 compiled_ignore_regex,
+                &mut page_links,
             );
             for (k, v) in html_extras {
                 extra_parsed_content.insert(k, v);
@@ -781,6 +823,7 @@ impl Crawler {
                 terminated,
                 compiled_include_regex,
                 compiled_ignore_regex,
+                &mut page_links,
             );
         }
 
@@ -805,7 +848,18 @@ impl Crawler {
                 terminated,
                 compiled_include_regex,
                 compiled_ignore_regex,
+                &mut page_links,
             );
+        }
+
+        // With --link-details: every link found on this page
+        if let Some(graph) = link_graph {
+            let links = page_links.take_links();
+            if !links.is_empty()
+                && let Ok(mut graph) = graph.lock()
+            {
+                graph.add_page_links(&entry.url, page_depth, links);
+            }
         }
 
         // Set extras from headers
@@ -827,12 +881,6 @@ impl Crawler {
         };
 
         // Create VisitedUrl and update status
-        let is_external = parsed_url
-            .host
-            .as_deref()
-            .map(|h| !Self::hosts_are_www_equivalent(h, initial_parsed_url.host.as_deref().unwrap_or("")))
-            .unwrap_or(false);
-
         let visited_url = VisitedUrl::new(
             parsed_url_uq_id.clone(),
             entry.source_uq_id.clone(),
@@ -894,6 +942,25 @@ impl Crawler {
                 cached: http_response.is_loaded_from_cache(),
                 done: done_count,
                 total: total_count,
+                source: entry.first.as_ref().map(|first| first.source_url.to_string()),
+                source_attr: entry
+                    .first
+                    .as_ref()
+                    .map(|first| link_graph::source_attr_label(first.attr)),
+                link_text: entry
+                    .first
+                    .as_ref()
+                    .and_then(|first| first.text.as_deref().map(str::to_string)),
+                source_line: entry
+                    .first
+                    .as_ref()
+                    .and_then(|first| (first.line > 0).then_some(first.line)),
+                source_column: entry
+                    .first
+                    .as_ref()
+                    .and_then(|first| (first.column > 0).then_some(first.column)),
+                external: is_external,
+                depth: page_depth,
             });
         }
 
@@ -937,6 +1004,7 @@ impl Crawler {
         terminated: &Arc<AtomicBool>,
         compiled_include_regex: &[FilterRegex],
         compiled_ignore_regex: &[FilterRegex],
+        page: &mut PageLinks,
     ) -> HashMap<String, String> {
         let mut result = HashMap::new();
 
@@ -965,6 +1033,7 @@ impl Crawler {
                 terminated,
                 compiled_include_regex,
                 compiled_ignore_regex,
+                page,
             );
         }
 
@@ -1029,6 +1098,7 @@ impl Crawler {
         terminated: &Arc<AtomicBool>,
         compiled_include_regex: &[FilterRegex],
         compiled_ignore_regex: &[FilterRegex],
+        page: &mut PageLinks,
     ) {
         // Detect <base href="..."> in HTML content to use as base URL for resolving relative URLs
         let effective_base_url = if content_type == ContentTypeId::Html {
@@ -1060,6 +1130,12 @@ impl Crawler {
             Ok(mut cpm) => cpm.find_urls(content, content_type, source_url),
             _ => Vec::new(),
         };
+        page.locate(
+            content,
+            found_urls_list
+                .iter()
+                .flat_map(|found_urls| found_urls.get_urls().values().filter_map(|found_url| found_url.offset)),
+        );
 
         // <base href> only changes how the found URLs resolve: they were found on this page
         let source_url_uq_id = Self::compute_url_uq_id(url);
@@ -1084,6 +1160,7 @@ impl Crawler {
                 terminated,
                 compiled_include_regex,
                 compiled_ignore_regex,
+                page,
             );
         }
     }
@@ -1111,6 +1188,7 @@ impl Crawler {
         terminated: &Arc<AtomicBool>,
         compiled_include_regex: &[FilterRegex],
         compiled_ignore_regex: &[FilterRegex],
+        page: &mut PageLinks,
     ) {
         for found_url in found_urls.get_urls().values() {
             if terminated.load(Ordering::SeqCst) {
@@ -1124,6 +1202,8 @@ impl Crawler {
             if !utils::is_href_for_requestable_resource(&url_for_queue) {
                 continue;
             }
+            let source_attr = found_url.source as i32;
+            let link_text = found_url.text.as_deref();
 
             // Check if URL is on same host or allowed host
             let is_url_on_same_host = parsed_url_for_queue.host.is_none()
@@ -1166,10 +1246,32 @@ impl Crawler {
                 if is_url_on_same_host && is_page && !visited.contains_key(&url_key) && !queue.contains_key(&url_key) {
                     BASENAME_SKIPPED.store(true, Ordering::SeqCst);
                 }
+                if page.collects()
+                    && let Some(target) = Self::queue_form(&url_for_queue, source_url, options, initial_parsed_url)
+                {
+                    let external = Self::is_external_host(target.host.as_deref(), initial_parsed_url);
+                    page.record(
+                        target.get_full_url(true, false),
+                        external,
+                        source_attr,
+                        found_url.offset,
+                        link_text,
+                    );
+                }
                 continue;
             }
 
             if !is_url_on_same_host && !is_url_on_allowed_host {
+                if page.collects() {
+                    let external = Self::is_external_host(parsed_url_for_queue.host.as_deref(), initial_parsed_url);
+                    page.record(
+                        parsed_url_for_queue.get_full_url(true, false),
+                        external,
+                        source_attr,
+                        found_url.offset,
+                        link_text,
+                    );
+                }
                 // Add to skipped
                 let url_key = Self::compute_url_key(&parsed_url_for_queue);
                 if !skipped.contains_key(&url_key) {
@@ -1193,6 +1295,16 @@ impl Crawler {
                     .as_deref()
                     .unwrap_or(initial_parsed_url.host.as_deref().unwrap_or(""));
                 if !Self::is_url_allowed_by_robots_txt_cached(check_host, &url_for_queue, robots_txt_cache) {
+                    if page.collects() {
+                        let external = Self::is_external_host(parsed_url_for_queue.host.as_deref(), initial_parsed_url);
+                        page.record(
+                            parsed_url_for_queue.get_full_url(true, false),
+                            external,
+                            source_attr,
+                            found_url.offset,
+                            link_text,
+                        );
+                    }
                     let url_key = Self::compute_url_key(&parsed_url_for_queue);
                     if !skipped.contains_key(&url_key) {
                         skipped.insert(
@@ -1209,41 +1321,11 @@ impl Crawler {
                 }
             }
 
-            // Build absolute URL
-            let source_full_url = source_url.get_full_url(true, false);
-            let absolute_url = utils::get_absolute_url_by_base_url(&source_full_url, &url_for_queue);
-
-            if absolute_url.is_empty() {
+            // Build the absolute URL as the queue knows it, and check suitability
+            let Some(parsed_url_for_queue) = Self::queue_form(&url_for_queue, source_url, options, initial_parsed_url)
+            else {
                 continue;
-            }
-
-            // Remove fragment
-            let absolute_url = if let Some(hash_pos) = absolute_url.find('#') {
-                absolute_url[..hash_pos].to_string()
-            } else {
-                absolute_url
             };
-
-            // Filter query params if configured
-            let absolute_url = if options.remove_query_params {
-                if let Some(q_pos) = absolute_url.find('?') {
-                    absolute_url[..q_pos].to_string()
-                } else {
-                    absolute_url
-                }
-            } else if !options.keep_query_params.is_empty() {
-                filter_query_params(&absolute_url, &options.keep_query_params)
-            } else {
-                absolute_url
-            };
-
-            // Re-parse and check suitability
-            let mut parsed_url_for_queue = ParsedUrl::parse(&absolute_url, Some(source_url));
-
-            // Force relative URLs: normalize host/scheme variants to match initial URL
-            if options.force_relative_urls {
-                Self::normalize_url_to_initial(&mut parsed_url_for_queue, initial_parsed_url);
-            }
 
             let suitable = Self::is_url_suitable_for_queue_static(
                 &parsed_url_for_queue,
@@ -1253,11 +1335,23 @@ impl Crawler {
                 compiled_include_regex,
                 compiled_ignore_regex,
             );
+            if page.collects() {
+                let external = Self::is_external_host(parsed_url_for_queue.host.as_deref(), initial_parsed_url);
+                page.record(
+                    parsed_url_for_queue.get_full_url(true, false),
+                    external,
+                    source_attr,
+                    found_url.offset,
+                    link_text,
+                );
+            }
             if suitable {
                 Self::add_url_to_queue_static(
                     &parsed_url_for_queue,
                     Some(source_url_uq_id),
-                    found_url.source as i32,
+                    source_attr,
+                    page.depth.saturating_add(1),
+                    Some(page.first_ref(source_attr, found_url.offset, link_text)),
                     queue,
                     queue_order,
                     visited,
@@ -1268,18 +1362,79 @@ impl Crawler {
         }
     }
 
+    /// A found URL as the queue knows it: absolute, without its fragment, with the query
+    /// parameters that `--remove-query-params` / `--keep-query-param` leave, and with
+    /// `--force-relative-urls` normalized to the initial origin. `None` when it cannot be resolved.
+    fn queue_form(
+        url_for_queue: &str,
+        source_url: &ParsedUrl,
+        options: &CoreOptions,
+        initial_parsed_url: &ParsedUrl,
+    ) -> Option<ParsedUrl> {
+        // Build absolute URL
+        let source_full_url = source_url.get_full_url(true, false);
+        let absolute_url = utils::get_absolute_url_by_base_url(&source_full_url, url_for_queue);
+
+        if absolute_url.is_empty() {
+            return None;
+        }
+
+        // Remove fragment
+        let absolute_url = if let Some(hash_pos) = absolute_url.find('#') {
+            absolute_url[..hash_pos].to_string()
+        } else {
+            absolute_url
+        };
+
+        // Filter query params if configured
+        let absolute_url = if options.remove_query_params {
+            if let Some(q_pos) = absolute_url.find('?') {
+                absolute_url[..q_pos].to_string()
+            } else {
+                absolute_url
+            }
+        } else if !options.keep_query_params.is_empty() {
+            filter_query_params(&absolute_url, &options.keep_query_params)
+        } else {
+            absolute_url
+        };
+
+        // Re-parse
+        let mut parsed_url_for_queue = ParsedUrl::parse(&absolute_url, Some(source_url));
+
+        // Force relative URLs: normalize host/scheme variants to match initial URL
+        if options.force_relative_urls {
+            Self::normalize_url_to_initial(&mut parsed_url_for_queue, initial_parsed_url);
+        }
+
+        Some(parsed_url_for_queue)
+    }
+
+    /// Whether `host` is not the initial host or its www/non-www variant (a relative URL has none).
+    fn is_external_host(host: Option<&str>, initial_parsed_url: &ParsedUrl) -> bool {
+        host.is_some_and(|h| !Self::hosts_are_www_equivalent(h, initial_parsed_url.host.as_deref().unwrap_or("")))
+    }
+
     /// Add URL to the queue
     fn add_url_to_queue(&self, url: &ParsedUrl, source_uq_id: Option<&str>, source_attr: i32) {
         Self::add_url_to_queue_static(
             url,
             source_uq_id,
             source_attr,
+            0,
+            None,
             &self.queue,
             &self.queue_order,
             &self.visited,
             &self.options,
             &self.terminated,
         );
+        // Only start URLs come this way: they are at depth 0.
+        if let Some(graph) = &self.link_graph
+            && let Ok(mut graph) = graph.lock()
+        {
+            graph.add_seed(&url.get_full_url(true, false));
+        }
     }
 
     /// Static version of add_url_to_queue for use in async contexts
@@ -1288,6 +1443,8 @@ impl Crawler {
         url: &ParsedUrl,
         source_uq_id: Option<&str>,
         source_attr: i32,
+        depth: u32,
+        first: Option<Box<FirstRef>>,
         queue: &DashMap<String, QueueEntry>,
         queue_order: &Mutex<VecDeque<String>>,
         visited: &DashMap<String, VisitedEntry>,
@@ -1317,6 +1474,8 @@ impl Crawler {
             uq_id,
             source_uq_id: source_uq_id.unwrap_or("").to_string(),
             source_attr,
+            depth,
+            first,
         };
 
         // Insert only a URL that is neither queued nor visited, atomically: two workers may both have
@@ -1490,10 +1649,11 @@ impl Crawler {
         queue_order: &Arc<Mutex<VecDeque<String>>>,
         visited: &Arc<DashMap<String, VisitedEntry>>,
         _skipped: &Arc<DashMap<String, SkippedEntry>>,
-        _initial_parsed_url: &ParsedUrl,
+        initial_parsed_url: &ParsedUrl,
         terminated: &Arc<AtomicBool>,
         compiled_include_regex: &[FilterRegex],
         compiled_ignore_regex: &[FilterRegex],
+        page: &mut PageLinks,
     ) {
         let redirect_url = if redirect_location.starts_with("//") {
             format!("{}:{}", scheme, redirect_location)
@@ -1509,6 +1669,16 @@ impl Crawler {
         };
 
         let parsed_redirect_url = ParsedUrl::parse(&redirect_url, Some(source_url));
+        if page.collects() {
+            let external = Self::is_external_host(parsed_redirect_url.host.as_deref(), initial_parsed_url);
+            page.record(
+                parsed_redirect_url.get_full_url(true, false),
+                external,
+                UrlSource::Redirect as i32,
+                None,
+                None,
+            );
+        }
 
         if Self::is_url_suitable_for_queue_static(
             &parsed_redirect_url,
@@ -1518,10 +1688,13 @@ impl Crawler {
             compiled_include_regex,
             compiled_ignore_regex,
         ) {
+            // Following a redirect is not a link hop: the target keeps the page's depth.
             Self::add_url_to_queue_static(
                 &parsed_redirect_url,
                 Some(source_uq_id),
                 UrlSource::Redirect as i32,
+                page.depth,
+                Some(page.first_ref(UrlSource::Redirect as i32, None, None)),
                 queue,
                 queue_order,
                 visited,
@@ -2102,6 +2275,11 @@ impl Crawler {
 
     pub fn get_done_urls_count(&self) -> usize {
         self.done_urls_count.load(Ordering::SeqCst)
+    }
+
+    /// Every link found, with `--link-details`.
+    pub fn get_link_graph(&self) -> Option<&Arc<Mutex<LinkGraph>>> {
+        self.link_graph.as_ref()
     }
 }
 
@@ -2689,6 +2867,7 @@ mod tests {
             &crawler.terminated,
             &crawler.compiled_include_regex,
             &crawler.compiled_ignore_regex,
+            &mut PageLinks::new(Arc::from(page_url), Arc::from(page_url), 0, false, true),
         );
     }
 
@@ -2751,6 +2930,8 @@ mod tests {
                 &url,
                 Some(source),
                 UrlSource::AHref as i32,
+                1,
+                None,
                 &crawler.queue,
                 &crawler.queue_order,
                 &crawler.visited,
@@ -2812,6 +2993,8 @@ mod tests {
                                     url,
                                     Some(&source),
                                     UrlSource::AHref as i32,
+                                    1,
+                                    None,
                                     &crawler.queue,
                                     &crawler.queue_order,
                                     &crawler.visited,

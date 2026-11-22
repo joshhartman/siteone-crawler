@@ -1,6 +1,8 @@
 //! A typed view of the result JSON (`--output-json-file`, `docs/JSON-OUTPUT.md`): quality scores,
-//! stats, summary findings, analysis tables and the run's `options`. Fields the GUI does not use
-//! (the per-URL `results`, …) are skipped while reading, so memory stays small for large runs.
+//! stats, summary findings, analysis tables and the run's `options` — and, with `--link-details`,
+//! the `links` table and the link facts of the per-URL `results` rows, read into a compact
+//! [`LinkGraph`]. Fields the GUI does not use (the rest of each `results` row, …) are skipped while
+//! reading, so memory stays small for large runs.
 //!
 //! Table columns keep the order of the file. The crawler may not depend on `serde_json`'s
 //! `preserve_order` (GUI-SPEC §2), so maps are read with a visitor into `Vec<(key, value)>`.
@@ -10,9 +12,12 @@ use std::fs::File;
 use std::io::{self, BufReader};
 use std::marker::PhantomData;
 use std::path::Path;
+use std::sync::Arc;
 
 use serde::Deserialize;
-use serde::de::{Deserializer, MapAccess, Visitor};
+use serde::de::{DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
+
+use super::link_data::{LinkGraph, LinkGraphBuilder, LinkRow, UrlFacts};
 
 /// A JSON object read in file order.
 #[derive(Debug, Clone, PartialEq)]
@@ -173,10 +178,14 @@ pub struct ResultData {
     pub scores: Option<QualityScores>,
     pub stats: Option<Stats>,
     pub summary: Vec<SummaryItem>,
+    /// The analysis tables — not the `links` table, which is read into [`Self::links`].
     pub tables: Vec<ResultTable>,
     /// The run's options as the crawler applied them (`options`: `maxVisitedUrls`, `ignoreRegex`,
     /// …), kept as JSON so that a value of an unexpected type never makes the file unreadable.
     pub options: Option<serde_json::Value>,
+    /// With `--link-details`: the `links` table (every referring page of every URL) and the link
+    /// facts of the `results` rows (depth, in and out links). Shared: the run's links keep it too.
+    pub links: Option<Arc<LinkGraph>>,
 }
 
 impl ResultData {
@@ -209,8 +218,335 @@ struct RawResult {
     quality_scores: Option<QualityScores>,
     stats: Option<Stats>,
     summary: Option<RawSummary>,
-    tables: Option<OrderedMap<RawTable>>,
+    tables: Option<RawTables>,
     options: Option<serde_json::Value>,
+    /// Only the link facts of each row are read (`--link-details`); the rest is skipped.
+    results: RawUrlFactsList,
+}
+
+/// `tables`, in file order; the `links` table (`--link-details`, possibly tens of thousands of
+/// rows) is read into typed rows instead of a generic table.
+#[derive(Default)]
+struct RawTables {
+    tables: Vec<(String, RawTable)>,
+    /// The `links` table, built into the graph row by row as it is read.
+    links: Option<LinkGraphBuilder>,
+}
+
+impl<'de> Deserialize<'de> for RawTables {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct TablesVisitor;
+
+        impl<'de> Visitor<'de> for TablesVisitor {
+            type Value = RawTables;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a JSON object of tables")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut tables = RawTables::default();
+                while let Some(key) = map.next_key::<String>()? {
+                    if key == LINKS_TABLE {
+                        tables.links = Some(map.next_value::<RawLinksTable>()?.0);
+                    } else {
+                        let table = map.next_value::<RawTable>()?;
+                        tables.tables.push((key, table));
+                    }
+                }
+                Ok(tables)
+            }
+        }
+
+        deserializer.deserialize_map(TablesVisitor)
+    }
+}
+
+/// The key of the `--link-details` table in `tables`.
+pub const LINKS_TABLE: &str = "links";
+
+/// The `links` table: its `rows` go into the graph one by one (the other keys are skipped).
+struct RawLinksTable(LinkGraphBuilder);
+
+impl<'de> Deserialize<'de> for RawLinksTable {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct TableVisitor;
+
+        impl<'de> Visitor<'de> for TableVisitor {
+            type Value = RawLinksTable;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("the links table")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut builder = LinkGraphBuilder::default();
+                while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+                    if key == "rows" {
+                        map.next_value_seed(RowsSeed(&mut builder))?;
+                    } else {
+                        map.next_value::<IgnoredAny>()?;
+                    }
+                }
+                Ok(RawLinksTable(builder))
+            }
+        }
+
+        deserializer.deserialize_map(TableVisitor)
+    }
+}
+
+/// Reads the rows of the `links` table into the graph as they come.
+struct RowsSeed<'a>(&'a mut LinkGraphBuilder);
+
+impl<'de> DeserializeSeed<'de> for RowsSeed<'_> {
+    type Value = ();
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        struct RowsVisitor<'a>(&'a mut LinkGraphBuilder);
+
+        impl<'de> Visitor<'de> for RowsVisitor<'_> {
+            type Value = ();
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("the rows of the links table")
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+                while let Some(row) = seq.next_element::<RawLinkRow>()? {
+                    self.0.add(row.into());
+                }
+                Ok(())
+            }
+        }
+
+        deserializer.deserialize_seq(RowsVisitor(self.0))
+    }
+}
+
+/// A row of the `links` table: string cells (any other JSON value is read as text).
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+struct RawLinkRow {
+    url: Lenient,
+    source_url: Lenient,
+    source_attr: Lenient,
+    link_text: Lenient,
+    source_line: Lenient,
+    source_column: Lenient,
+    in_links: Lenient,
+    external: Lenient,
+}
+
+impl From<RawLinkRow> for LinkRow {
+    fn from(raw: RawLinkRow) -> Self {
+        let number = |cell: &Lenient| cell.0.trim().parse::<u32>().ok();
+        LinkRow {
+            source_line: number(&raw.source_line),
+            source_column: number(&raw.source_column),
+            in_links: number(&raw.in_links),
+            external: matches!(raw.external.0.trim(), "1" | "true"),
+            url: raw.url.0,
+            source_url: raw.source_url.0,
+            source_attr: raw.source_attr.0,
+            link_text: raw.link_text.0,
+        }
+    }
+}
+
+/// A value read as text whatever its JSON type (`null`, an object or an array: empty), so that
+/// an unexpected value never makes the file unreadable.
+#[derive(Default)]
+struct Lenient(String);
+
+impl<'de> Deserialize<'de> for Lenient {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct LenientVisitor;
+
+        impl<'de> Visitor<'de> for LenientVisitor {
+            type Value = Lenient;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("any JSON value")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Lenient, E> {
+                Ok(Lenient(value.to_string()))
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Lenient, E> {
+                Ok(Lenient(value))
+            }
+
+            fn visit_bool<E>(self, value: bool) -> Result<Lenient, E> {
+                Ok(Lenient(value.to_string()))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Lenient, E> {
+                Ok(Lenient(value.to_string()))
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Lenient, E> {
+                Ok(Lenient(value.to_string()))
+            }
+
+            fn visit_f64<E>(self, value: f64) -> Result<Lenient, E> {
+                Ok(Lenient(value.to_string()))
+            }
+
+            fn visit_unit<E>(self) -> Result<Lenient, E> {
+                Ok(Lenient::default())
+            }
+
+            fn visit_none<E>(self) -> Result<Lenient, E> {
+                Ok(Lenient::default())
+            }
+
+            fn visit_some<D: Deserializer<'de>>(self, deserializer: D) -> Result<Lenient, D::Error> {
+                Lenient::deserialize(deserializer)
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Lenient, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(Lenient::default())
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Lenient, A::Error> {
+                while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                Ok(Lenient::default())
+            }
+        }
+
+        deserializer.deserialize_any(LenientVisitor)
+    }
+}
+
+/// The link facts of the `results` rows (`--link-details`): `(url, facts)`; any other value of
+/// `results` (or of a row) is skipped.
+#[derive(Default)]
+struct RawUrlFactsList(Vec<(String, UrlFacts)>);
+
+impl<'de> Deserialize<'de> for RawUrlFactsList {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ListVisitor;
+
+        impl<'de> Visitor<'de> for ListVisitor {
+            type Value = RawUrlFactsList;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("the results rows")
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut rows = Vec::new();
+                while let Some(row) = seq.next_element::<RawUrlFacts>()? {
+                    if let Some(row) = row.0 {
+                        rows.push(row);
+                    }
+                }
+                Ok(RawUrlFactsList(rows))
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                Ok(RawUrlFactsList::default())
+            }
+
+            fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+                Ok(RawUrlFactsList::default())
+            }
+
+            fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(RawUrlFactsList::default())
+            }
+
+            fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+                Ok(RawUrlFactsList::default())
+            }
+
+            fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+                Ok(RawUrlFactsList::default())
+            }
+
+            fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(RawUrlFactsList::default())
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(RawUrlFactsList::default())
+            }
+        }
+
+        deserializer.deserialize_any(ListVisitor)
+    }
+}
+
+/// One `results` row: its URL and link facts when it has any.
+struct RawUrlFacts(Option<(String, UrlFacts)>);
+
+impl<'de> Deserialize<'de> for RawUrlFacts {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct RowVisitor;
+
+        impl<'de> Visitor<'de> for RowVisitor {
+            type Value = RawUrlFacts;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a results row")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut url = None;
+                let mut facts = UrlFacts::default();
+                let number = |cell: Lenient| cell.0.trim().parse::<u32>().ok();
+                while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+                    match key.as_ref() {
+                        "url" => url = Some(map.next_value::<Lenient>()?.0),
+                        "depth" => facts.depth = number(map.next_value()?),
+                        "inLinks" => facts.in_links = number(map.next_value()?),
+                        "outLinks" => facts.out_links = number(map.next_value()?),
+                        _ => {
+                            map.next_value::<IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(RawUrlFacts(
+                    url.filter(|_| facts != UrlFacts::default()).map(|url| (url, facts)),
+                ))
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(RawUrlFacts(None))
+            }
+
+            fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+                Ok(RawUrlFacts(None))
+            }
+
+            fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(RawUrlFacts(None))
+            }
+
+            fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+                Ok(RawUrlFacts(None))
+            }
+
+            fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+                Ok(RawUrlFacts(None))
+            }
+
+            fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(RawUrlFacts(None))
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(RawUrlFacts(None))
+            }
+        }
+
+        deserializer.deserialize_any(RowVisitor)
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -260,11 +596,17 @@ impl From<RawResult> for ResultData {
                     .collect()
             })
             .unwrap_or_default();
-        let tables = raw
+        let (tables, link_rows) = raw
             .tables
+            .map(|tables| (tables.tables, tables.links))
+            .unwrap_or_default();
+        let links = (link_rows.is_some() || !raw.results.0.is_empty())
+            .then(|| link_rows.unwrap_or_default().finish(raw.results.0))
+            .filter(|graph| !graph.is_empty())
+            .map(Arc::new);
+        let tables = Some(tables)
             .map(|tables| {
                 tables
-                    .0
                     .into_iter()
                     .map(|(key, table)| {
                         let columns: Vec<Column> = table
@@ -315,6 +657,7 @@ impl From<RawResult> for ResultData {
             summary,
             tables,
             options: raw.options,
+            links,
         }
     }
 }
@@ -408,6 +751,46 @@ mod tests {
         assert_eq!(columns, [("url", "URL"), ("b", "B"), ("a", "a")]);
         assert_eq!(table.rows, vec![vec!["/x", "", "1"], vec!["true", "2", ""]]);
         assert_eq!(data.scores, None);
+    }
+
+    #[test]
+    fn the_links_table_and_link_facts_are_read_into_the_link_graph() {
+        // As the crawler writes it with `--link-details` (string cells; numbers in `results`).
+        let json = r#"{"results":[
+              {"url":"https://site.example/","status":"200","depth":0,"inLinks":0,"outLinks":3},
+              {"url":"https://site.example/gone","status":"404","source":"https://site.example/","depth":1,"inLinks":2,"outLinks":0},
+              "not a row", {"url":"https://site.example/old"}],
+            "tables":{"links":{"title":"Links","columns":{"url":{"name":"URL"}},"rows":[
+              {"url":"https://site.example/gone","sourceUrl":"https://site.example/","sourceAttr":"<a href>","linkText":"Gone","sourceLine":"12","sourceColumn":"9","inLinks":"2","external":"0"},
+              {"url":"https://site.example/gone","sourceUrl":"https://site.example/a","sourceAttr":"<a href>","linkText":"","sourceLine":"","sourceColumn":"","inLinks":2,"external":"0"},
+              {"url":"https://other.example/","sourceUrl":"https://site.example/a","sourceAttr":"<a href>","linkText":{"odd":1},"sourceLine":null,"sourceColumn":"x","inLinks":"1","external":"1"}]},
+              "404":{"columns":{"url":{"name":"URL"}},"rows":[{"url":"https://site.example/gone"}]}}}"#;
+        let data = parse_result(json).expect("parses");
+        let keys: Vec<&str> = data.tables.iter().map(|table| table.key.as_str()).collect();
+        assert_eq!(keys, ["404"], "the links table is not an analysis table");
+        let graph = data.links.as_deref().expect("the link graph");
+        assert_eq!(graph.rows(), 3);
+        let gone = graph.target("https://site.example/gone").expect("target");
+        assert_eq!(gone.in_links, 2);
+        assert_eq!(
+            (gone.refs[0].text.as_deref(), gone.refs[0].line, gone.refs[0].column),
+            (Some("Gone"), Some(12), Some(9))
+        );
+        assert_eq!((gone.refs[1].text.as_deref(), gone.refs[1].line), (None, None));
+        let other = graph.target("https://other.example/").expect("external");
+        assert!(other.external && other.refs[0].text.is_none() && other.refs[0].line.is_none());
+        let facts = graph.facts("https://site.example/gone").expect("facts");
+        assert_eq!(
+            (facts.depth, facts.in_links, facts.out_links),
+            (Some(1), Some(2), Some(0))
+        );
+        assert!(graph.facts("https://site.example/old").is_none());
+
+        // Older files: no links table, no facts — no graph; an odd `results` never breaks the file.
+        assert_eq!(parse_result(FIXTURE).expect("fixture").links, None);
+        let odd = parse_result(r#"{"results":{"a":1},"tables":{"links":{"rows":[]}}}"#).expect("parses");
+        assert_eq!(odd.links, None);
+        assert!(parse_result(r#"{"results":"x"}"#).is_ok());
     }
 
     #[test]

@@ -5,6 +5,12 @@
 //! after the crawl, from the retry's answer. A retried row shows its newest answer, a queued one a
 //! mark; a failed row's menu retries it or queues it (GUI-SPEC §4.9).
 //!
+//! *Depth* is the link distance from a start URL: the `url` event's while the crawl runs, the
+//! result JSON's exact one with `--link-details`; *In links* (with `--link-details`) the number of
+//! pages that reference the URL ([`LinkColumns`], built once). Each column is shown only when the
+//! run has its data. The row menu lists the pages linking to a URL (*Pages linking here*): every
+//! kept referrer of the crawler's `links` table, or the page of its `url` event.
+//!
 //! It stays fluid with 100 000 rows: [`UrlIndex`] keeps the filtered and sorted row numbers. Rows
 //! that arrive are filtered and placed into it one by one; it is rebuilt only when the filter or the
 //! sort changes. A frame only formats the rows it shows.
@@ -15,6 +21,7 @@ use egui_material_icons::icons;
 
 use super::overview::failed_color;
 use super::{RunAction, RunView, padded};
+use crate::model::link_data::{CrawlerRef, LinkGraph};
 use crate::model::results::ResultData;
 use crate::model::run_state::{ContentKind, StatusClass, UrlRow};
 use crate::theme;
@@ -37,6 +44,8 @@ pub enum SortKey {
     Time,
     Size,
     Cached,
+    Depth,
+    InLinks,
     Url,
     Title,
 }
@@ -172,14 +181,77 @@ impl PageTitles {
     }
 }
 
+/// *Depth* and *In links* of each URL row from the crawler's link facts (`--link-details`, the
+/// result JSON's `results` rows), built once when the result is loaded; without them *Depth* is the
+/// `url` event's.
+#[derive(Debug, Default)]
+pub struct LinkColumns {
+    /// Per URL row: the exact depth, or [`NONE`].
+    depth: Vec<u32>,
+    /// Per URL row: pages referencing it, or [`NONE`].
+    in_links: Vec<u32>,
+    /// The result has link facts (the In links column is shown).
+    pub has_in_links: bool,
+}
+
+const NONE: u32 = u32::MAX;
+
+impl LinkColumns {
+    pub fn build(graph: Option<&LinkGraph>, rows: &[UrlRow]) -> Self {
+        let Some(graph) = graph else {
+            return Self::default();
+        };
+        let mut columns = Self {
+            depth: Vec::with_capacity(rows.len()),
+            in_links: Vec::with_capacity(rows.len()),
+            has_in_links: false,
+        };
+        for row in rows {
+            let facts = graph.facts(&row.url);
+            let in_links = facts
+                .and_then(|facts| facts.in_links)
+                .or_else(|| graph.target(&row.url).map(|target| target.in_links));
+            columns.has_in_links |= in_links.is_some();
+            columns.depth.push(facts.and_then(|facts| facts.depth).unwrap_or(NONE));
+            columns.in_links.push(in_links.unwrap_or(NONE));
+        }
+        columns
+    }
+
+    /// The depth of URL row `index`: the exact one, else the event's.
+    pub fn depth(&self, rows: &[UrlRow], index: usize) -> Option<u32> {
+        self.depth
+            .get(index)
+            .copied()
+            .filter(|depth| *depth != NONE)
+            .or_else(|| rows.get(index).and_then(|row| row.depth))
+    }
+
+    pub fn in_links(&self, index: usize) -> Option<u32> {
+        self.in_links.get(index).copied().filter(|count| *count != NONE)
+    }
+
+    /// Whether it was built from link facts.
+    fn is_built(&self) -> bool {
+        !self.depth.is_empty()
+    }
+}
+
+/// What rows are sorted by besides their own fields.
+#[derive(Clone, Copy)]
+pub struct RowExtras<'a> {
+    pub titles: &'a PageTitles,
+    pub links: &'a LinkColumns,
+}
+
 /// The filtered and sorted row numbers of the URL rows.
 #[derive(Debug, Default)]
 pub struct UrlIndex {
     rows: Vec<u32>,
     /// How many URL rows have been looked at.
     scanned: usize,
-    /// What the index was built for (and whether titles were known).
-    built_for: Option<(UrlFilter, SortKey, bool, bool)>,
+    /// What the index was built for (and whether titles and link facts were known).
+    built_for: Option<(UrlFilter, SortKey, bool, bool, bool)>,
     /// How often the index was rebuilt (tests check that new rows do not rebuild it).
     pub rebuilds: u64,
 }
@@ -196,15 +268,21 @@ impl UrlIndex {
     }
 
     /// Brings the index up to date with `rows`.
-    pub fn sync(&mut self, rows: &[UrlRow], titles: &PageTitles, filter: &UrlFilter, sort: SortKey, ascending: bool) {
+    pub fn sync(&mut self, rows: &[UrlRow], extras: RowExtras<'_>, filter: &UrlFilter, sort: SortKey, ascending: bool) {
+        let titles = extras.titles;
         let titled = !titles.is_empty();
+        let faceted = extras.links.is_built();
         // Compared in place: an unchanged frame allocates nothing.
-        let current = self
-            .built_for
-            .as_ref()
-            .is_some_and(|(built, built_sort, built_ascending, built_titled)| {
-                built == filter && *built_sort == sort && *built_ascending == ascending && *built_titled == titled
-            });
+        let current =
+            self.built_for
+                .as_ref()
+                .is_some_and(|(built, built_sort, built_ascending, built_titled, built_faceted)| {
+                    built == filter
+                        && *built_sort == sort
+                        && *built_ascending == ascending
+                        && *built_titled == titled
+                        && *built_faceted == faceted
+                });
         if current && rows.len() == self.scanned {
             return;
         }
@@ -216,8 +294,8 @@ impl UrlIndex {
                 .filter_map(|index| u32::try_from(index).ok())
                 .collect();
             self.scanned = rows.len();
-            self.built_for = Some((filter.clone(), sort, ascending, titled));
-            sort_rows(&mut self.rows, rows, titles, sort, ascending);
+            self.built_for = Some((filter.clone(), sort, ascending, titled, faceted));
+            sort_rows(&mut self.rows, rows, extras, sort, ascending);
             return;
         }
         let new: Vec<u32> = (self.scanned..rows.len())
@@ -229,22 +307,32 @@ impl UrlIndex {
             self.rows.extend(new);
         } else if new.len() > INCREMENTAL_LIMIT {
             self.rows.extend(new);
-            sort_rows(&mut self.rows, rows, titles, sort, ascending);
+            sort_rows(&mut self.rows, rows, extras, sort, ascending);
         } else {
             for index in new {
                 let at = self
                     .rows
-                    .partition_point(|&other| compare(rows, titles, other, index, sort, ascending).is_lt());
+                    .partition_point(|&other| compare(rows, extras, other, index, sort, ascending).is_lt());
                 self.rows.insert(at, index);
             }
         }
     }
 }
 
-fn compare(rows: &[UrlRow], titles: &PageTitles, a: u32, b: u32, sort: SortKey, ascending: bool) -> std::cmp::Ordering {
+fn compare(
+    rows: &[UrlRow],
+    extras: RowExtras<'_>,
+    a: u32,
+    b: u32,
+    sort: SortKey,
+    ascending: bool,
+) -> std::cmp::Ordering {
     let (Some(row_a), Some(row_b)) = (rows.get(a as usize), rows.get(b as usize)) else {
         return a.cmp(&b);
     };
+    let (titles, links) = (extras.titles, extras.links);
+    // A row without a value sorts after the rows with one.
+    let value = |value: Option<u32>| value.unwrap_or(NONE);
     let ordering = match sort {
         SortKey::Index => std::cmp::Ordering::Equal,
         SortKey::Status => row_a.status.cmp(&row_b.status),
@@ -252,6 +340,8 @@ fn compare(rows: &[UrlRow], titles: &PageTitles, a: u32, b: u32, sort: SortKey, 
         SortKey::Time => row_a.time_ms.cmp(&row_b.time_ms),
         SortKey::Size => row_a.size.cmp(&row_b.size),
         SortKey::Cached => row_a.cached.cmp(&row_b.cached),
+        SortKey::Depth => value(links.depth(rows, a as usize)).cmp(&value(links.depth(rows, b as usize))),
+        SortKey::InLinks => value(links.in_links(a as usize)).cmp(&value(links.in_links(b as usize))),
         SortKey::Url => row_a.url.cmp(&row_b.url),
         SortKey::Title => titles.get(a as usize).cmp(titles.get(b as usize)),
     }
@@ -260,11 +350,11 @@ fn compare(rows: &[UrlRow], titles: &PageTitles, a: u32, b: u32, sort: SortKey, 
     if ascending { ordering } else { ordering.reverse() }
 }
 
-fn sort_rows(index: &mut [u32], rows: &[UrlRow], titles: &PageTitles, sort: SortKey, ascending: bool) {
+fn sort_rows(index: &mut [u32], rows: &[UrlRow], extras: RowExtras<'_>, sort: SortKey, ascending: bool) {
     if sort == SortKey::Index && ascending {
         return;
     }
-    index.sort_unstable_by(|a, b| compare(rows, titles, *a, *b, sort, ascending));
+    index.sort_unstable_by(|a, b| compare(rows, extras, *a, *b, sort, ascending));
 }
 
 /// UI state of the URLs tab.
@@ -278,6 +368,8 @@ pub struct UrlsUi {
     pub index: UrlIndex,
     /// Page titles, built once the result JSON is loaded.
     pub titles: Option<PageTitles>,
+    /// Depth and In links from the crawler's link facts, built once the result JSON is loaded.
+    pub links: Option<LinkColumns>,
     /// The revisions of the rows and the retries the titles and the index were built for.
     revisions: (u64, u64),
     /// Where the table was drawn last frame (to tell a scroll in it).
@@ -295,6 +387,7 @@ impl Default for UrlsUi {
             follow: true,
             index: UrlIndex::default(),
             titles: None,
+            links: None,
             revisions: (0, 0),
             table_rect: None,
             followed: None,
@@ -313,6 +406,110 @@ impl UrlsUi {
         }
         self.follow = false;
     }
+}
+
+/// The width of the *Depth* column.
+const DEPTH_WIDTH: f32 = 54.0;
+/// The width of the *In links* column.
+const IN_LINKS_WIDTH: f32 = 66.0;
+
+/// The pages linking to a URL, as the row menu's dialog lists them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkingPages {
+    pub url: String,
+    /// One line per referring page: the page with where it references the URL, how, and the link
+    /// text (`https://site.example/a.html:45 · <a href> · “Gone”`).
+    pub lines: Vec<String>,
+    /// Pages beyond the listed ones (the crawler lists 50 per URL).
+    pub more: usize,
+    /// Every referring page is known (`--link-details`), not only the one that queued the URL.
+    pub complete: bool,
+    /// The crawl is still running.
+    pub live: bool,
+}
+
+impl LinkingPages {
+    /// The dialog's text above the list.
+    pub fn message(&self) -> String {
+        let total = self.lines.len() + self.more;
+        let mut message = format!(
+            "{} {} {}.",
+            format::plural(total as u64, "page"),
+            if total == 1 { "references" } else { "reference" },
+            self.url
+        );
+        if self.more > 0 {
+            message.push_str(&format!(
+                " The crawler lists the first {} of them.",
+                format::count(self.lines.len() as u64)
+            ));
+        }
+        if !self.complete && self.live {
+            message.push_str(
+                " While the crawl runs, only the page that queued the URL is known; with “Record every referring page” on (--link-details), every page is listed when it finishes.",
+            );
+        } else if !self.complete {
+            message.push_str(
+                " This run names only the page that queued the URL; with “Record every referring page” on (--link-details), the crawler lists all of them.",
+            );
+        }
+        message
+    }
+
+    /// The list as text for the clipboard (one page per line, the count of the others last).
+    pub fn copy_text(&self) -> String {
+        let mut text = self.lines.join("\n");
+        if self.more > 0 {
+            text.push_str(&format!("\n{}", super::broken::more_pages(self.more)));
+        }
+        text.push('\n');
+        text
+    }
+}
+
+/// The pages linking to `url`: every kept referrer of the crawler's `links` table, else the page of
+/// its `url` event (`row_link`); `None` when neither names one. `live`: the crawl is running.
+pub fn linking_pages(
+    url: &str,
+    graph: Option<&LinkGraph>,
+    row_link: Option<&CrawlerRef>,
+    live: bool,
+) -> Option<LinkingPages> {
+    let line = |reference: &CrawlerRef| {
+        let mut line = reference.source.to_string();
+        if let Some(position) = reference.position() {
+            line.push_str(&position.suffix());
+        }
+        if !reference.attr.is_empty() {
+            line.push_str(&format!(" · {}", reference.attr));
+        }
+        if let Some(text) = &reference.text {
+            line.push_str(&format!(" · “{text}”"));
+        }
+        line
+    };
+    if let Some(target) = graph
+        .and_then(|graph| graph.target(url))
+        .filter(|target| !target.refs.is_empty())
+    {
+        return Some(LinkingPages {
+            url: url.to_string(),
+            lines: target.refs.iter().map(line).collect(),
+            more: target.more(),
+            complete: true,
+            live,
+        });
+    }
+    let reference = row_link?;
+    Some(LinkingPages {
+        url: url.to_string(),
+        lines: vec![line(reference)],
+        more: 0,
+        // With `--link-details` the result's `links` table has every page (a run whose result is
+        // not loaded yet, or has none, knows only this one).
+        complete: false,
+        live,
+    })
 }
 
 /// The tone of a status code's chip.
@@ -342,7 +539,11 @@ pub fn show(ui: &mut Ui, view: &RunView<'_>, urls: &mut UrlsUi, focus: bool, act
     if urls.revisions != revisions {
         urls.revisions = revisions;
         urls.titles = None;
+        urls.links = None;
         urls.index.invalidate();
+    }
+    if urls.links.is_none() && !view.live && view.data().is_some() {
+        urls.links = Some(LinkColumns::build(view.links.graph, rows));
     }
     if urls.titles.is_none()
         && !view.live
@@ -372,14 +573,14 @@ pub fn show(ui: &mut Ui, view: &RunView<'_>, urls: &mut UrlsUi, focus: bool, act
         urls.titles = Some(titles);
     }
     let titles = urls.titles.take();
+    let links = urls.links.take();
     let no_titles = PageTitles::default();
-    urls.index.sync(
-        rows,
-        titles.as_ref().unwrap_or(&no_titles),
-        &urls.filter,
-        urls.sort,
-        urls.ascending,
-    );
+    let no_links = LinkColumns::default();
+    let extras = RowExtras {
+        titles: titles.as_ref().unwrap_or(&no_titles),
+        links: links.as_ref().unwrap_or(&no_links),
+    };
+    urls.index.sync(rows, extras, &urls.filter, urls.sort, urls.ascending);
     padded(ui, |ui| {
         toolbar(ui, view, urls, focus);
         ui.add_space(theme::GRID);
@@ -413,9 +614,10 @@ pub fn show(ui: &mut Ui, view: &RunView<'_>, urls: &mut UrlsUi, focus: bool, act
             }
             return;
         }
-        url_table(ui, view, urls, titles.as_ref().unwrap_or(&no_titles), actions);
+        url_table(ui, view, urls, extras, actions);
     });
     urls.titles = titles;
+    urls.links = links;
 }
 
 fn toolbar(ui: &mut Ui, view: &RunView<'_>, urls: &mut UrlsUi, focus: bool) {
@@ -514,9 +716,14 @@ fn kind_combo(ui: &mut Ui, view: &RunView<'_>, urls: &mut UrlsUi) {
         .on_hover_text("Show only one content type");
 }
 
-fn url_table(ui: &mut Ui, view: &RunView<'_>, urls: &mut UrlsUi, titles: &PageTitles, actions: &mut Vec<RunAction>) {
+fn url_table(ui: &mut Ui, view: &RunView<'_>, urls: &mut UrlsUi, extras: RowExtras<'_>, actions: &mut Vec<RunAction>) {
     let p = theme::palette(ui);
     let rows = &view.state.urls;
+    let (titles, links) = (extras.titles, extras.links);
+    // Each link column only when the run has its data: Depth from a crawler that reports it (the
+    // `url` event's, then the exact one), In links with `--link-details`.
+    let show_depth = rows.first().is_some_and(|row| row.depth.is_some()) || links.is_built();
+    let show_in_links = links.has_in_links;
     // A scroll up in the table (wheel, or a press on its scroll bar) releases Follow.
     if urls.follow
         && let Some(rect) = urls.table_rect
@@ -549,25 +756,48 @@ fn url_table(ui: &mut Ui, view: &RunView<'_>, urls: &mut UrlsUi, titles: &PageTi
         // A click on a row's text selects the row, not the text.
         ui.style_mut().interaction.selectable_labels = false;
         // URL and Title share the room the fixed columns leave.
-        let url_room = ui.available_width() - (64.0 + 96.0 + 78.0 + 78.0 + 84.0 + 64.0);
+        let link_columns =
+            if show_depth { DEPTH_WIDTH } else { 0.0 } + if show_in_links { IN_LINKS_WIDTH } else { 0.0 };
+        // #, Status, Type, Time, Size, Cached: a little narrower next to the link columns.
+        let fixed: [f32; 6] = if link_columns > 0.0 {
+            [64.0, 96.0, 70.0, 70.0, 76.0, 58.0]
+        } else {
+            [64.0, 96.0, 78.0, 78.0, 84.0, 64.0]
+        };
+        let url_room = ui.available_width() - (fixed.iter().sum::<f32>() + link_columns);
+        let spacing = ui.spacing().item_spacing.x;
         let mut builder = TableBuilder::new(ui)
             .id_salt("run-urls-table")
             .striped(true)
             .sense(Sense::click())
-            .cell_layout(Layout::left_to_right(Align::Center))
-            .column(Column::exact(64.0))
-            .column(Column::exact(96.0))
-            .column(Column::exact(78.0))
-            .column(Column::exact(78.0))
-            .column(Column::exact(84.0))
-            .column(Column::exact(64.0))
+            .cell_layout(Layout::left_to_right(Align::Center));
+        for width in fixed {
+            builder = builder.column(Column::exact(width));
+        }
+        if show_depth {
+            builder = builder.column(Column::exact(DEPTH_WIDTH));
+        }
+        if show_in_links {
+            builder = builder.column(Column::exact(IN_LINKS_WIDTH));
+        }
+        // With the link columns, URL and Title keep less room at least, so that a small window
+        // (1000 px) shows every column.
+        let (url_least, title_least) = if link_columns > 0.0 {
+            (120.0, 90.0)
+        } else {
+            (160.0, 120.0)
+        };
+        // The URL's share leaves the Title its least width and the gaps between the columns.
+        let gaps = spacing * if link_columns > 0.0 { 10.0 } else { 8.0 };
+        let url_width = (url_room * 0.55).min(url_room - title_least - gaps).max(url_least);
+        let mut builder = builder
             .column(
-                Column::initial((url_room * 0.55).max(200.0))
-                    .at_least(160.0)
+                Column::initial(url_width)
+                    .at_least(url_least)
                     .clip(true)
                     .resizable(true),
             )
-            .column(Column::remainder().at_least(120.0).clip(true))
+            .column(Column::remainder().at_least(title_least).clip(true))
             .min_scrolled_height(0.0)
             .auto_shrink([false, false])
             .animate_scrolling(false);
@@ -594,6 +824,12 @@ fn url_table(ui: &mut Ui, view: &RunView<'_>, urls: &mut UrlsUi, titles: &PageTi
                 header_cell(&mut header, "Time", SortKey::Time, true, &mut sort_click);
                 header_cell(&mut header, "Size", SortKey::Size, true, &mut sort_click);
                 header_cell(&mut header, "Cached", SortKey::Cached, false, &mut sort_click);
+                if show_depth {
+                    header_cell(&mut header, "Depth", SortKey::Depth, true, &mut sort_click);
+                }
+                if show_in_links {
+                    header_cell(&mut header, "In links", SortKey::InLinks, true, &mut sort_click);
+                }
                 header_cell(&mut header, "URL", SortKey::Url, false, &mut sort_click);
                 header_cell(&mut header, "Title", SortKey::Title, false, &mut sort_click);
             })
@@ -642,6 +878,35 @@ fn url_table(ui: &mut Ui, view: &RunView<'_>, urls: &mut UrlsUi, titles: &PageTi
                                 .on_hover_text("Served from the HTTP cache");
                         }
                     });
+                    let number_cell = |ui: &mut Ui, value: Option<u32>, tip: &str| {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| match value {
+                            Some(value) => {
+                                ui.label(RichText::new(format::count(u64::from(value))).color(p.text))
+                                    .on_hover_text(tip);
+                            }
+                            None => {
+                                ui.label(widgets::weak(ui, "—"));
+                            }
+                        });
+                    };
+                    if show_depth {
+                        row.col(|ui| {
+                            number_cell(
+                                ui,
+                                links.depth(rows, number as usize),
+                                "Link distance from a start URL (a redirect adds nothing)",
+                            )
+                        });
+                    }
+                    if show_in_links {
+                        row.col(|ui| {
+                            number_cell(
+                                ui,
+                                links.in_links(number as usize),
+                                "Pages that reference this URL; Pages linking here in the row menu lists them",
+                            )
+                        });
+                    }
                     row.col(|ui| {
                         // Cut in the middle: the end of a URL tells one page from another.
                         let font = egui::TextStyle::Body.resolve(ui.style());
@@ -673,6 +938,14 @@ fn url_table(ui: &mut Ui, view: &RunView<'_>, urls: &mut UrlsUi, titles: &PageTi
                             });
                             ui.close();
                         }
+                        if let Some(pages) = linking_pages(&url.url, view.links.graph, url.link.as_deref(), view.live)
+                            && widgets::button(ui, Some(icons::ICON_ACCOUNT_TREE), "Pages linking here…")
+                                .on_hover_text("The pages that reference this URL, with the link text and line")
+                                .clicked()
+                        {
+                            actions.push(RunAction::ShowLinkingPages(pages));
+                            ui.close();
+                        }
                     });
                 });
             });
@@ -691,14 +964,7 @@ mod tests {
     const FIXTURE: &str = include_str!("../../../../docs/OUTPUT-crawler.siteone.io.json");
 
     fn row(url: &str, kind: ContentKind) -> UrlRow {
-        UrlRow {
-            url: url.into(),
-            status: 200,
-            kind,
-            time_ms: 1,
-            size: 1,
-            cached: false,
-        }
+        UrlRow::new(url, 200, kind, 1, 1, false)
     }
 
     #[test]
@@ -728,14 +994,98 @@ mod tests {
             text: "caching •".to_string(),
             ..UrlFilter::default()
         };
-        index.sync(&rows, &PageTitles::default(), &filter, SortKey::Index, true);
+        let links = LinkColumns::default();
+        let no_titles = PageTitles::default();
+        let extras = |titles| RowExtras { titles, links: &links };
+        index.sync(&rows, extras(&no_titles), &filter, SortKey::Index, true);
         assert!(index.rows().is_empty());
-        index.sync(&rows, &titles, &filter, SortKey::Index, true);
+        index.sync(&rows, extras(&titles), &filter, SortKey::Index, true);
         assert_eq!(index.rows(), [0, 1]);
-        index.sync(&rows, &titles, &UrlFilter::default(), SortKey::Title, false);
+        index.sync(&rows, extras(&titles), &UrlFilter::default(), SortKey::Title, false);
         assert!(
             matches!(index.rows(), [1, 0, ..]),
             "titled rows first, ties reversed too"
         );
+    }
+
+    #[test]
+    fn depth_and_in_links_come_from_the_link_facts_and_the_linking_pages_from_the_links_table() {
+        use crate::model::link_data::{LinkRow, UrlFacts};
+        let link = |source: &str, text: &str, line: Option<u32>| LinkRow {
+            url: "https://site.example/a".to_string(),
+            source_url: source.to_string(),
+            source_attr: "<a href>".to_string(),
+            link_text: text.to_string(),
+            source_line: line,
+            source_column: line.map(|_| 7),
+            in_links: Some(53),
+            external: false,
+        };
+        let graph = LinkGraph::build(
+            [
+                link("https://site.example/", "A", Some(12)),
+                link("https://site.example/b", "", None),
+            ],
+            [(
+                "https://site.example/a".to_string(),
+                UrlFacts {
+                    depth: Some(1),
+                    in_links: Some(53),
+                    out_links: Some(0),
+                },
+            )],
+        );
+        let mut rows = vec![
+            row("https://site.example/", ContentKind::Html),
+            row("https://site.example/a", ContentKind::Html),
+            row("https://site.example/b", ContentKind::Html),
+        ];
+        rows[0].depth = Some(0);
+        rows[1].depth = Some(2);
+        rows[2].depth = Some(4);
+        let links = LinkColumns::build(Some(&graph), &rows);
+        assert!(links.has_in_links);
+        // The exact depth wins over the event's; without facts, the event's.
+        assert_eq!(
+            (links.depth(&rows, 0), links.depth(&rows, 1), links.depth(&rows, 2)),
+            (Some(0), Some(1), Some(4))
+        );
+        assert_eq!((links.in_links(0), links.in_links(1)), (None, Some(53)));
+        let titles = PageTitles::default();
+        let extras = RowExtras {
+            titles: &titles,
+            links: &links,
+        };
+        let mut index = UrlIndex::default();
+        index.sync(&rows, extras, &UrlFilter::default(), SortKey::InLinks, true);
+        assert_eq!(index.rows(), [1, 0, 2], "rows without a count last");
+        index.sync(&rows, extras, &UrlFilter::default(), SortKey::Depth, false);
+        assert_eq!(index.rows(), [2, 1, 0]);
+        // Without link facts: no In links, Depth from the events; an older run has neither.
+        assert!(!LinkColumns::build(None, &rows).has_in_links);
+
+        let pages = linking_pages("https://site.example/a", Some(&graph), None, false).expect("pages");
+        assert_eq!(
+            pages.lines,
+            [
+                "https://site.example/:12 · <a href> · “A”",
+                "https://site.example/b · <a href>"
+            ]
+        );
+        assert_eq!((pages.more, pages.complete), (51, true));
+        assert!(
+            pages
+                .message()
+                .starts_with("53 pages reference https://site.example/a.")
+        );
+        assert!(pages.copy_text().ends_with("\nand 51 more pages\n"));
+        // Only the event's page: said so; nothing known: no entry.
+        let first = graph
+            .target("https://site.example/a")
+            .map(|target| target.refs[0].clone());
+        let live = linking_pages("https://site.example/x", None, first.as_ref(), true).expect("one page");
+        assert_eq!((live.lines.len(), live.complete), (1, false));
+        assert!(live.message().contains("While the crawl runs"));
+        assert_eq!(linking_pages("https://site.example/", Some(&graph), None, false), None);
     }
 }

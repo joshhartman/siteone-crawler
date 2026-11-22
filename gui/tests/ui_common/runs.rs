@@ -725,6 +725,7 @@ pub fn position(line: u32, column: u32, count: u32) -> RefPosition {
         column,
         count,
         long_line: column > 500,
+        crawled: false,
     }
 }
 
@@ -814,6 +815,153 @@ pub fn finished_with_positions(app: &mut App) -> Control {
     );
     let run_dir = app.current_run.as_ref().expect("run").plan.run_dir.clone();
     texts.write(&run_dir).expect("link-texts.json");
+    control
+}
+
+/// The referring page the crawler reports for URL row `index` of [`site_urls`] (`--link-details`):
+/// `(source, attr, link text, line, column, depth)`; `None` for the start page.
+/// `(source, attr, link text, line, column, depth)`.
+type CrawlerSource = (String, &'static str, Option<String>, u32, u32, u32);
+
+fn crawler_source(index: usize, url: &str) -> Option<CrawlerSource> {
+    if url == SITE {
+        return None;
+    }
+    Some(if url == FIXTURE_404 {
+        (
+            FIXTURE_404_SOURCE.to_string(),
+            "<a href>",
+            Some("Content type analysis".to_string()),
+            212,
+            17,
+            2,
+        )
+    } else if url == HERO_IMAGE {
+        (STYLESHEET.to_string(), "css url()", None, 1, 20_345, 2)
+    } else if url.contains("/docs/api/") {
+        let version = url.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+        (
+            format!("{SITE}docs/changelog/"),
+            "<a href>",
+            Some(format!("API {version}")),
+            40 + index as u32,
+            9,
+            2,
+        )
+    } else if url.contains("twitter.example.net") {
+        (SITE.to_string(), "<a href>", Some("Follow us".to_string()), 88, 13, 1)
+    } else if url.ends_with(".css") || url.contains(".css?") {
+        (SITE.to_string(), "<link href>", None, 6, 29, 1)
+    } else if url.contains(".js") {
+        (SITE.to_string(), "<script src>", None, 7, 15, 1)
+    } else if url.contains("/images/") || url.contains("favicon") || url.contains("/fonts/") {
+        (
+            SITE.to_string(),
+            "<img src>",
+            Some("Screenshot".to_string()),
+            30 + index as u32,
+            11,
+            1,
+        )
+    } else {
+        (
+            SITE.to_string(),
+            "<a href>",
+            Some("Read more".to_string()),
+            10 + index as u32,
+            21,
+            1,
+        )
+    })
+}
+
+/// A finished crawl of 73 URLs by a crawler with link data (`--link-details`): every `url` event
+/// names its page, link text and line; the result JSON (the fixture) has a `links` table — the 404
+/// on 57 pages (three listed), every external link of the fixture on one page more than its
+/// `external-urls` row says.
+pub fn finished_with_link_data(app: &mut App) -> Control {
+    let control = attach(app, SITE);
+    run_started(&control, SITE);
+    phase(&control, "crawl", "started", None);
+    let mut links: Vec<serde_json::Value> = Vec::new();
+    let link_row =
+        |url: &str, source: &str, attr: &str, text: Option<&str>, line: u32, column: u32, in_links: usize| {
+            serde_json::json!({
+                "url": url, "sourceUrl": source, "sourceAttr": attr, "linkText": text.unwrap_or(""),
+                "sourceLine": line.to_string(), "sourceColumn": column.to_string(),
+                "inLinks": in_links.to_string(), "external": if url.starts_with(SITE) { "0" } else { "1" },
+            })
+        };
+    for (index, line) in site_urls(73, 73).into_iter().enumerate() {
+        let mut event: serde_json::Value = serde_json::from_str(&line).expect("url line");
+        let url = event["url"].as_str().unwrap_or("").to_string();
+        event["external"] = serde_json::json!(!url.starts_with(SITE));
+        match crawler_source(index, &url) {
+            Some((source, attr, text, line, column, depth)) => {
+                event["source"] = serde_json::json!(source);
+                event["sourceAttr"] = serde_json::json!(attr);
+                if let Some(text) = &text {
+                    event["linkText"] = serde_json::json!(text);
+                }
+                event["sourceLine"] = serde_json::json!(line);
+                event["sourceColumn"] = serde_json::json!(column);
+                event["depth"] = serde_json::json!(depth);
+                let in_links = if url == FIXTURE_404 { 57 } else { index % 7 + 1 };
+                links.push(link_row(&url, &source, attr, text.as_deref(), line, column, in_links));
+                if url == FIXTURE_404 {
+                    for (page, line) in [
+                        (format!("{SITE}docs/faq/"), 64),
+                        (format!("{SITE}introduction/overview/"), 118),
+                    ] {
+                        links.push(link_row(&url, &page, attr, text.as_deref(), line, 17, in_links));
+                    }
+                }
+            }
+            None => event["depth"] = serde_json::json!(0),
+        }
+        control.event(&event.to_string());
+    }
+    // The external links of the fixture, each on its pages and one more.
+    let legacy = siteone_crawler_gui::model::link_check::link_list(
+        &siteone_crawler_gui::model::results::parse_result(FIXTURE).expect("fixture"),
+        SITE,
+    );
+    for (index, link) in legacy.links.iter().enumerate() {
+        let mut pages = link.sources.clone();
+        pages.push(format!("{SITE}docs/faq/"));
+        for page in &pages {
+            links.push(link_row(
+                &link.url,
+                page,
+                "<a href>",
+                Some("Partner"),
+                50 + index as u32,
+                5,
+                pages.len(),
+            ));
+        }
+    }
+    links.push(link_row(
+        "https://cdn.example.net/analytics.js",
+        SITE,
+        "<script src>",
+        None,
+        8,
+        15,
+        1,
+    ));
+    let table = serde_json::json!({
+        "aplCode": "links", "title": "Links", "columns": {"url": {"name": "URL"}}, "rows": links,
+    });
+    let at = FIXTURE.find("\"tables\": {").expect("the fixture's tables") + "\"tables\": {".len();
+    let result = format!("{}\"links\": {table},{}", &FIXTURE[..at], &FIXTURE[at..]);
+    phase(&control, "crawl", "finished", Some(23_410));
+    phase(&control, "analysis", "started", None);
+    phase(&control, "analysis", "finished", Some(1_208));
+    write_outputs(&control, &result);
+    control.console(CONSOLE);
+    control.event(r#"{"type":"runFinished","outcome":"success","exitCode":0,"ms":25132,"interrupted":false}"#);
+    control.exit(Some(0));
     control
 }
 
