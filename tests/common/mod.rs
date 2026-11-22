@@ -15,6 +15,14 @@ pub fn binary_path() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_siteone-crawler"))
 }
 
+/// `--config-file` of an empty file that exists on every platform (`/dev/null` does not on
+/// Windows), so no user or system config file changes the test.
+pub const NO_CONFIG_FILE: &str = if cfg!(windows) {
+    "--config-file=NUL"
+} else {
+    "--config-file=/dev/null"
+};
+
 /// Run the crawler with given arguments and return Output.
 pub fn run_crawler(args: &[&str]) -> Output {
     Command::new(binary_path())

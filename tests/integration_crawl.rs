@@ -11,8 +11,8 @@
 mod common;
 
 use common::{
-    LocalServer, MockLlm, MockResponse, MockRoute, RecordingServer, Redirect, RedirectServer, Route, TempDir,
-    run_crawler, run_crawler_json,
+    LocalServer, MockLlm, MockResponse, MockRoute, NO_CONFIG_FILE, RecordingServer, Redirect, RedirectServer, Route,
+    TempDir, run_crawler, run_crawler_json,
 };
 use std::path::Path;
 use std::sync::Mutex;
@@ -899,7 +899,7 @@ fn events_file_records_the_whole_run() {
     let report = tmp.path.join("report.html");
 
     let output = run_crawler(&[
-        "--config-file=/dev/null",
+        NO_CONFIG_FILE,
         &format!("--url={}", server.url()),
         LOCAL_ANALYZERS,
         "--http-cache-dir=",
@@ -955,7 +955,7 @@ fn events_file_never_carries_the_credentials_of_the_url() {
         let events = tmp.path.join(format!("{name}.ndjson"));
         let url = server.url().replacen("http://", &format!("http://{userinfo}@"), 1);
         run_crawler(&[
-            "--config-file=/dev/null",
+            NO_CONFIG_FILE,
             &format!("--url={url}"),
             "--single-page",
             LOCAL_ANALYZERS,
@@ -986,7 +986,7 @@ fn no_events_file_means_no_events() {
     let report = tmp.path.join("report.html");
 
     let output = run_crawler(&[
-        "--config-file=/dev/null",
+        NO_CONFIG_FILE,
         &format!("--url={}", server.url()),
         "--single-page",
         LOCAL_ANALYZERS,
@@ -1332,7 +1332,7 @@ fn control_stdin_stops_the_crawl_but_keeps_the_reports() {
     // One request per second keeps most of the site queued when `stop` arrives.
     let mut child = Command::new(env!("CARGO_BIN_EXE_siteone-crawler"))
         .args([
-            "--config-file=/dev/null",
+            NO_CONFIG_FILE,
             &format!("--url={}", server.url()),
             "--workers=1",
             "--max-reqs-per-sec=1",
@@ -1386,7 +1386,7 @@ fn events_mark_only_local_http_cache_hits_as_cached() {
     let crawl = |name: &str| -> Vec<serde_json::Value> {
         let events = tmp.path.join(format!("{name}.ndjson"));
         let output = run_crawler(&[
-            "--config-file=/dev/null",
+            NO_CONFIG_FILE,
             &format!("--url={}", server.url()),
             "--single-page",
             LOCAL_ANALYZERS,
@@ -1449,7 +1449,7 @@ fn http_cache_hit_keeps_content_encoding_and_decoded_size() {
     let cache = tmp.path.join("cache");
     let crawl = || -> serde_json::Value {
         let output = run_crawler(&[
-            "--config-file=/dev/null",
+            NO_CONFIG_FILE,
             &format!("--url={}", server.url()),
             "--single-page",
             "--output=json",
@@ -1507,7 +1507,7 @@ fn brotli_response_keeps_content_encoding_and_passes_the_brotli_check() {
     }]);
 
     let output = run_crawler(&[
-        "--config-file=/dev/null",
+        NO_CONFIG_FILE,
         &format!("--url={}", server.url()),
         "--single-page",
         "--output=json",
@@ -1556,7 +1556,7 @@ fn dns_analysis_is_skipped_for_ip_literal_hosts() {
     let server = LocalServer::start(&site);
 
     let output = run_crawler(&[
-        "--config-file=/dev/null",
+        NO_CONFIG_FILE,
         &format!("--url={}", server.url()),
         "--single-page",
         "--output=json",
@@ -1647,7 +1647,7 @@ fn custom_headers_reach_the_crawled_host_only() {
     }]);
 
     let output = run_crawler(&[
-        "--config-file=/dev/null",
+        NO_CONFIG_FILE,
         &format!("--url={}", site.url()),
         "--single-page",
         "--output=json",
@@ -1721,7 +1721,7 @@ fn progress_interval_replaces_url_rows_on_stdout() {
     let text_report = tmp.path.join("report.txt");
 
     let output = run_crawler(&[
-        "--config-file=/dev/null",
+        NO_CONFIG_FILE,
         &format!("--url={}", server.url()),
         LOCAL_ANALYZERS,
         "--http-cache-dir=",
@@ -1783,7 +1783,7 @@ fn progress_interval_keeps_rows_of_failed_urls_on_stdout() {
     ]);
 
     let output = run_crawler(&[
-        "--config-file=/dev/null",
+        NO_CONFIG_FILE,
         &format!("--url={}", server.url()),
         LOCAL_ANALYZERS,
         "--http-cache-dir=",
@@ -1844,7 +1844,7 @@ fn json_progress_names_failed_urls_on_stderr() {
     ]);
 
     let output = run_crawler(&[
-        "--config-file=/dev/null",
+        NO_CONFIG_FILE,
         &format!("--url={}", server.url()),
         "--ci",
         "--output=json",
@@ -1877,7 +1877,7 @@ fn github_annotations_keep_json_stdout_parseable() {
 
     let output = std::process::Command::new(common::binary_path())
         .args([
-            "--config-file=/dev/null",
+            NO_CONFIG_FILE,
             &format!("--url={}", server.url()),
             "--ci",
             "--ci-min-pages=100",
@@ -1907,7 +1907,7 @@ fn hide_progress_bar_suppresses_progress_lines_in_json_mode() {
     let server = LocalServer::start(&site);
 
     let output = run_crawler(&[
-        "--config-file=/dev/null",
+        NO_CONFIG_FILE,
         &format!("--url={}", server.url()),
         LOCAL_ANALYZERS,
         "--http-cache-dir=",
@@ -1939,7 +1939,7 @@ fn progress_interval_prints_plain_lines_to_stderr_in_json_mode() {
     let server = LocalServer::start(&site);
 
     let output = run_crawler(&[
-        "--config-file=/dev/null",
+        NO_CONFIG_FILE,
         &format!("--url={}", server.url()),
         LOCAL_ANALYZERS,
         "--http-cache-dir=",
@@ -1986,7 +1986,7 @@ fn custom_headers_do_not_reach_other_sites_on_a_shared_public_suffix() {
     }]);
 
     let output = run_crawler(&[
-        "--config-file=/dev/null",
+        NO_CONFIG_FILE,
         &format!("--url=http://www.example.co.uk:{}/", site.port()),
         "--single-page",
         "--header=Cookie: session=SECRET_SUFFIX",
@@ -2041,7 +2041,7 @@ fn credentials_do_not_reach_another_port_of_an_ip_host() {
     }]);
 
     let output = run_crawler(&[
-        "--config-file=/dev/null",
+        NO_CONFIG_FILE,
         &format!("--url={}", site.url()),
         "--single-page",
         "--header=Cookie: session=SECRET_SUFFIX",
@@ -2083,7 +2083,7 @@ fn credentials_do_not_reach_another_port_of_an_ip_host() {
 #[test]
 fn sitemap_changefreq_rejects_unknown_values() {
     let output = run_crawler(&[
-        "--config-file=/dev/null",
+        NO_CONFIG_FILE,
         "--url=https://example.com/",
         "--sitemap-changefreq=sometimes",
     ]);
@@ -2125,7 +2125,7 @@ fn sitemap_lastmod_reads_every_http_date_format() {
         let tmp = TempDir::new(&format!("sitemap-lastmod-{storage}"));
         let sitemap = tmp.path.join("sitemap.xml");
         let output = run_crawler(&[
-            "--config-file=/dev/null",
+            NO_CONFIG_FILE,
             &format!("--url={}", server.url()),
             "--output=json",
             LOCAL_ANALYZERS,
@@ -2172,7 +2172,7 @@ fn sitemap_lastmod_reads_every_http_date_format() {
 /// Crawls `url` on a local server with JSON output and returns the visited URLs.
 fn crawled_urls(url: &str) -> Vec<String> {
     let output = run_crawler(&[
-        "--config-file=/dev/null",
+        NO_CONFIG_FILE,
         &format!("--url={url}"),
         "--output=json",
         LOCAL_ANALYZERS,
@@ -2276,7 +2276,7 @@ fn gzipped_xml_that_is_not_a_sitemap_keeps_its_bytes() {
     let export = tmp.path.join("export");
 
     let output = run_crawler(&[
-        "--config-file=/dev/null",
+        NO_CONFIG_FILE,
         &format!("--url={base}"),
         "--output=json",
         LOCAL_ANALYZERS,
@@ -2386,7 +2386,7 @@ fn sitemap_xml_gz_export_is_gzip_compressed() {
     let sitemap = tmp.path.join("out").join("sitemap.xml.gz");
 
     let output = run_crawler(&[
-        "--config-file=/dev/null",
+        NO_CONFIG_FILE,
         &format!("--url={}", server.url()),
         LOCAL_ANALYZERS,
         "--http-cache-dir=",
@@ -2434,7 +2434,7 @@ fn render_offline(tmp: &TempDir, url: &str, name: &str, extra: &[&str]) -> Strin
     let offline_arg = format!("--offline-export-dir={}", offline.display());
     let url_arg = format!("--url={url}");
     let mut args = vec![
-        "--config-file=/dev/null",
+        NO_CONFIG_FILE,
         url_arg.as_str(),
         "--single-page",
         "--browser",
@@ -2647,7 +2647,7 @@ fn browser_auto_scroll_waits_for_content_fetched_on_scroll() {
 #[test]
 fn screenshot_viewport_rejects_unknown_entries() {
     let output = run_crawler(&[
-        "--config-file=/dev/null",
+        NO_CONFIG_FILE,
         "--url=https://example.com/",
         "--browser",
         "--screenshot-viewport=desktop,phone",
@@ -2681,7 +2681,7 @@ fn screenshots_are_captured_in_every_viewport() {
     let shots = tmp.path.join("shots");
 
     let output = run_crawler(&[
-        "--config-file=/dev/null",
+        NO_CONFIG_FILE,
         &format!("--url={}", server.url()),
         "--single-page",
         "--browser",
@@ -2799,7 +2799,7 @@ fn banner_screenshot_colors(page: &str, options: &[&str]) -> ([u8; 3], [u8; 3]) 
     let url = format!("--url={}", server.url());
     let shots_dir = format!("--screenshots-dir={}", shots.display());
     let mut args = vec![
-        "--config-file=/dev/null",
+        NO_CONFIG_FILE,
         url.as_str(),
         "--single-page",
         "--browser",
@@ -2923,7 +2923,7 @@ fn force_relative_urls_fetches_scheme_variants_from_the_initial_port() {
     let export = tmp.path.join("export");
 
     let output = run_crawler(&[
-        "--config-file=/dev/null",
+        NO_CONFIG_FILE,
         &format!("--url={}", server.url()),
         LOCAL_ANALYZERS,
         "--http-cache-dir=",
@@ -3057,7 +3057,7 @@ fn force_relative_urls_exports_a_site_redirecting_to_its_www_twin() {
     let export = tmp.path.join("export");
 
     let output = run_crawler(&[
-        "--config-file=/dev/null",
+        NO_CONFIG_FILE,
         &format!("--url=http://site.test:{port}/"),
         &format!("--resolve=site.test:{port}:127.0.0.1"),
         &format!("--resolve=www.site.test:{port}:127.0.0.1"),
@@ -3134,7 +3134,7 @@ fn force_relative_urls_exports_www_and_scheme_variants_as_the_same_files() {
     let export = tmp.path.join("export");
 
     let output = run_crawler(&[
-        "--config-file=/dev/null",
+        NO_CONFIG_FILE,
         &format!("--url=http://site.test:{port}/"),
         &format!("--resolve=site.test:{port}:127.0.0.1"),
         LOCAL_ANALYZERS,
@@ -3213,7 +3213,7 @@ fn force_relative_urls_exports_redirects_to_the_www_twin_and_self_links() {
     let markdown = tmp.path.join("markdown");
 
     let output = run_crawler(&[
-        "--config-file=/dev/null",
+        NO_CONFIG_FILE,
         &format!("--url=http://site.test:{port}/"),
         &format!("--resolve=site.test:{port}:127.0.0.1"),
         &format!("--resolve=www.site.test:{port}:127.0.0.1"),
@@ -3322,7 +3322,7 @@ fn force_relative_urls_leads_links_of_a_redirected_www_twin_page_to_the_stored_f
     ] {
         let export = tmp.path.join(format!("export-{}", layout.is_some()));
         let mut args = vec![
-            "--config-file=/dev/null".to_string(),
+            NO_CONFIG_FILE.to_string(),
             format!("--url=http://site.test:{port}/"),
             format!("--resolve=site.test:{port}:127.0.0.1"),
             format!("--resolve=www.site.test:{port}:127.0.0.1"),
@@ -3375,7 +3375,7 @@ fn force_relative_urls_exports_variant_references_of_external_stylesheets() {
     let export = tmp.path.join("export");
 
     let output = run_crawler(&[
-        "--config-file=/dev/null",
+        NO_CONFIG_FILE,
         &format!("--url=http://site.test:{port}/"),
         &format!("--resolve=site.test:{port}:127.0.0.1"),
         &format!("--resolve=cdn.test:{port}:127.0.0.1"),
@@ -3438,7 +3438,7 @@ fn image_attributes_are_read_as_the_browser_reads_them() {
     let export = tmp.path.join("export");
 
     let output = run_crawler(&[
-        "--config-file=/dev/null",
+        NO_CONFIG_FILE,
         &format!("--url={}", server.url()),
         LOCAL_ANALYZERS,
         "--http-cache-dir=",
@@ -3499,7 +3499,7 @@ fn lazy_srcsets_of_allowed_extensionless_cdn_images_lead_to_the_saved_files() {
     let export = tmp.path.join("export");
 
     let output = run_crawler(&[
-        "--config-file=/dev/null",
+        NO_CONFIG_FILE,
         &format!("--url={}", site.url()),
         &format!("--resolve=cdn.test:{cdn_port}:127.0.0.1"),
         &format!("--resolve=denied.test:{cdn_port}:127.0.0.1"),
@@ -3615,7 +3615,7 @@ fn preserve_url_structure_links_resolve_to_exported_files() {
         let export = tmp.path.join(format!("offline-{name}"));
         let markdown = tmp.path.join(format!("markdown-{name}"));
         let mut owned_args = vec![
-            "--config-file=/dev/null".to_string(),
+            NO_CONFIG_FILE.to_string(),
             format!("--url={}", server.url()),
             LOCAL_ANALYZERS.to_string(),
             "--http-cache-dir=".to_string(),
@@ -3699,7 +3699,7 @@ fn preserve_url_structure_keeps_a_directory_index_over_its_redirect() {
         let export = tmp.path.join(format!("export-{name}"));
 
         let output = run_crawler(&[
-            "--config-file=/dev/null",
+            NO_CONFIG_FILE,
             &format!("--url=http://127.0.0.1:{}/", server.port()),
             LOCAL_ANALYZERS,
             "--http-cache-dir=",
@@ -3736,7 +3736,7 @@ fn preserve_url_structure_keeps_a_directory_index_over_its_redirect() {
     );
     let export = tmp.path.join("export-missing");
     let output = run_crawler(&[
-        "--config-file=/dev/null",
+        NO_CONFIG_FILE,
         &format!("--url=http://127.0.0.1:{}/", server.port()),
         LOCAL_ANALYZERS,
         "--http-cache-dir=",
@@ -3791,7 +3791,7 @@ fn preserve_url_structure_with_original_urls_serves_every_link() {
     let export = tmp.path.join("export");
 
     let output = run_crawler(&[
-        "--config-file=/dev/null",
+        NO_CONFIG_FILE,
         &format!("--url={}", server.url()),
         LOCAL_ANALYZERS,
         "--http-cache-dir=",
@@ -3872,7 +3872,7 @@ fn preserve_url_structure_keeps_extensionless_images_intact() {
     let markdown = tmp.path.join("markdown");
 
     let output = run_crawler(&[
-        "--config-file=/dev/null",
+        NO_CONFIG_FILE,
         &format!("--url={}", server.url()),
         LOCAL_ANALYZERS,
         "--http-cache-dir=",
@@ -4156,7 +4156,7 @@ fn crawl_with_ai_seo(server: &LocalServer, mock: &MockLlm, extra: &[&str]) -> St
 /// Crawls `server` with the AI features of `extra` against `mock`; returns stderr.
 fn crawl_with_ai(server: &LocalServer, mock: &MockLlm, extra: &[&str]) -> String {
     let mut args = vec![
-        "--config-file=/dev/null".to_string(),
+        NO_CONFIG_FILE.to_string(),
         format!("--url={}", server.url()),
         LOCAL_ANALYZERS.to_string(),
         "--http-cache-dir=".to_string(),
@@ -4259,7 +4259,7 @@ fn crawl_with_ai_in_colour(server: &LocalServer, mock: &MockLlm, extra: &[&str])
     let url = format!("--url={}", server.url());
     let endpoint = format!("--ai-endpoint={}", mock.url());
     let mut args = vec![
-        "--config-file=/dev/null",
+        NO_CONFIG_FILE,
         url.as_str(),
         LOCAL_ANALYZERS,
         "--http-cache-dir=",
@@ -4441,7 +4441,7 @@ fn ai_usage_counts_a_success_whose_body_cannot_be_read() {
     let server = one_page_site(&tmp);
     let events = tmp.path.join("events.ndjson");
     let output = run_crawler(&[
-        "--config-file=/dev/null",
+        NO_CONFIG_FILE,
         &format!("--url={}", server.url()),
         LOCAL_ANALYZERS,
         "--http-cache-dir=",
@@ -4520,7 +4520,7 @@ fn ai_errors_never_carry_endpoint_credentials() {
         std::fs::create_dir_all(&out).expect("an output dir");
         let events = out.join("events.ndjson");
         let args = [
-            "--config-file=/dev/null".to_string(),
+            NO_CONFIG_FILE.to_string(),
             format!("--url={}", server.url()),
             LOCAL_ANALYZERS.to_string(),
             "--http-cache-dir=".to_string(),
@@ -4684,7 +4684,7 @@ fn ai_diagnostics_never_carry_credentials() {
         let out = tmp.path.join(name);
         std::fs::create_dir_all(&out).expect("an output dir");
         let mut args = vec![
-            "--config-file=/dev/null".to_string(),
+            NO_CONFIG_FILE.to_string(),
             format!("--url={}", server.url()),
             LOCAL_ANALYZERS.to_string(),
             "--http-cache-dir=".to_string(),
@@ -4742,7 +4742,7 @@ fn crawl_answered_by(
 ) -> Vec<(String, String)> {
     std::fs::create_dir_all(out).expect("an output dir");
     let mut args = vec![
-        "--config-file=/dev/null".to_string(),
+        NO_CONFIG_FILE.to_string(),
         format!("--url={}", server.url()),
         LOCAL_ANALYZERS.to_string(),
         "--http-cache-dir=".to_string(),
@@ -5412,7 +5412,7 @@ fn ai_events_report_a_skipped_ai_phase_as_an_issue() {
     let events = tmp.path.join("events.ndjson");
     let server = one_page_site(&tmp);
     let output = run_crawler(&[
-        "--config-file=/dev/null",
+        NO_CONFIG_FILE,
         &format!("--url={}", server.url()),
         LOCAL_ANALYZERS,
         "--http-cache-dir=",
@@ -5551,7 +5551,7 @@ fn ai_events_report_failed_pipelines_as_issues() {
     std::fs::create_dir(&read_only).expect("a directory");
     std::fs::set_permissions(&read_only, std::os::unix::fs::PermissionsExt::from_mode(0o555)).expect("read-only");
     let output = run_crawler(&[
-        "--config-file=/dev/null",
+        NO_CONFIG_FILE,
         &format!("--url={}", server.url()),
         LOCAL_ANALYZERS,
         "--http-cache-dir=",
@@ -5652,7 +5652,7 @@ fn ai_events_follow_the_elaborate_gap_fill() {
 /// Runs a utility mode with `args`; returns its exit code, the one JSON object it printed on
 /// stdout, and stderr.
 fn run_ai_tool(args: &[&str]) -> (Option<i32>, serde_json::Value, String) {
-    let mut all = vec!["--config-file=/dev/null", "--no-color"];
+    let mut all = vec![NO_CONFIG_FILE, "--no-color"];
     all.extend(args);
     let output = run_crawler(&all);
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -5996,7 +5996,7 @@ fn ai_utility_modes_never_print_credentials() {
             }]);
             let endpoint = format!("--ai-endpoint=http://{user}:{PW_SENTINEL}@127.0.0.1:{}/v1", mock.port());
             let output = run_crawler(&[
-                "--config-file=/dev/null",
+                NO_CONFIG_FILE,
                 "--no-color",
                 "--ai-provider=openai-compatible",
                 &endpoint,
@@ -6016,7 +6016,7 @@ fn ai_utility_modes_never_print_credentials() {
 
         // An endpoint the options reject is quoted in the configuration error.
         let output = run_crawler(&[
-            "--config-file=/dev/null",
+            NO_CONFIG_FILE,
             "--no-color",
             "--ai-provider=openai-compatible",
             &format!("--ai-endpoint=http://{user}:{PW_SENTINEL}@127.0.0.1:BAD/v1"),
@@ -6114,7 +6114,7 @@ fn ai_endpoint_with_a_query_or_fragment_is_a_configuration_error() {
         let url = format!("--url={}", server.url());
         let output = run_crawler(
             &[
-                &["--config-file=/dev/null", "--no-color", &url, "--ai-actions=seo"],
+                &[NO_CONFIG_FILE, "--no-color", &url, "--ai-actions=seo"],
                 &connection[..],
             ]
             .concat(),
@@ -6147,7 +6147,7 @@ fn ai_utility_mode_errors_are_json_also_from_a_config_file_or_a_malformed_flag()
     .expect("a config file");
     let config_arg = format!("--config-file={}", config.display());
     let connection = [
-        "--config-file=/dev/null",
+        NO_CONFIG_FILE,
         "--ai-provider=openai-compatible",
         "--ai-endpoint=http://127.0.0.1:9/v1",
         "--ai-model=m",
@@ -6656,7 +6656,7 @@ fn ai_consistency_end_to_end_on_the_corpus() {
     let report_dir = tmp.path.join("reports");
     let events_path = tmp.path.join("events.ndjson");
     let output = run_crawler(&[
-        "--config-file=/dev/null",
+        NO_CONFIG_FILE,
         &format!("--url={}", server.url()),
         LOCAL_ANALYZERS,
         "--http-cache-dir=",
@@ -6913,7 +6913,7 @@ fn ai_consistency_review_asks_again_for_the_groups_an_answer_left_out() {
     );
     let report_dir = tmp.path.join("reports");
     let output = run_crawler(&[
-        "--config-file=/dev/null",
+        NO_CONFIG_FILE,
         &format!("--url={}", server.url()),
         LOCAL_ANALYZERS,
         "--http-cache-dir=",
@@ -7033,7 +7033,7 @@ fn consistency_left_out_value_case(name: &str, reask: [usize; 2]) -> (Vec<String
     );
     let report_dir = tmp.path.join("reports");
     let output = run_crawler(&[
-        "--config-file=/dev/null",
+        NO_CONFIG_FILE,
         &format!("--url={}", server.url()),
         LOCAL_ANALYZERS,
         "--http-cache-dir=",
@@ -7163,7 +7163,7 @@ fn ai_consistency_json_keeps_every_grouping_decision() {
     );
     let report_dir = tmp.path.join("reports");
     let output = run_crawler(&[
-        "--config-file=/dev/null",
+        NO_CONFIG_FILE,
         &format!("--url={}", server.url()),
         LOCAL_ANALYZERS,
         "--http-cache-dir=",
@@ -7274,7 +7274,7 @@ fn consistency_disjoint_case(name: &str, reask: serde_json::Value) -> (Vec<Strin
     );
     let report_dir = tmp.path.join("reports");
     let output = run_crawler(&[
-        "--config-file=/dev/null",
+        NO_CONFIG_FILE,
         &format!("--url={}", server.url()),
         LOCAL_ANALYZERS,
         "--http-cache-dir=",
@@ -7579,7 +7579,7 @@ fn consistency_corpus_live() {
     let expected = consistency_expected();
     let server = LocalServer::start(&consistency_corpus_dir());
     let mut args = vec![
-        "--config-file=/dev/null".to_string(),
+        NO_CONFIG_FILE.to_string(),
         format!("--url={}{}", server.url(), expected["start"].as_str().expect("start")),
         LOCAL_ANALYZERS.to_string(),
         "--http-cache-dir=".to_string(),
@@ -7962,7 +7962,7 @@ fn geo_site_with(robots: &str, private_status: &str) -> RecordingServer {
 /// Crawls the GEO fixture site with `extra`; returns the process output.
 fn crawl_geo(server: &RecordingServer, extra: &[&str]) -> std::process::Output {
     let mut args = vec![
-        "--config-file=/dev/null".to_string(),
+        NO_CONFIG_FILE.to_string(),
         format!("--url={}", server.url()),
         LOCAL_ANALYZERS.to_string(),
         "--http-cache-dir=".to_string(),
@@ -8651,7 +8651,7 @@ fn ai_geo_reads_the_robots_txt_of_the_origin_the_homepage_redirects_to() {
     let port = server.port();
     let report_dir = tmp.path.join("reports");
     let output = run_crawler(&[
-        "--config-file=/dev/null",
+        NO_CONFIG_FILE,
         &format!("--url=http://acme.test:{port}/"),
         &format!("--resolve=acme.test:{port}:127.0.0.1"),
         &format!("--resolve=www.acme.test:{port}:127.0.0.1"),
@@ -8722,7 +8722,7 @@ fn ai_geo_compares_the_raw_html_with_the_rendered_page_in_browser_mode() {
     let server = LocalServer::start(&site);
     let reports = tmp.path.join("reports");
     let output = run_crawler(&[
-        "--config-file=/dev/null",
+        NO_CONFIG_FILE,
         &format!("--url={}", server.url()),
         "--single-page",
         "--browser",
@@ -8882,7 +8882,7 @@ fn ai_geo_links_the_fact_consistency_report_of_the_same_run() {
     let mock = MockLlm::start_routed(routes, Vec::new());
     let reports = tmp.path.join("reports");
     let output = run_crawler(&[
-        "--config-file=/dev/null",
+        NO_CONFIG_FILE,
         &format!("--url={}", server.url()),
         LOCAL_ANALYZERS,
         "--http-cache-dir=",

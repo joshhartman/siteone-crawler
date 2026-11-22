@@ -5047,7 +5047,12 @@ mod tests {
     #[test]
     fn ai_geo_alone_needs_no_model_for_its_deterministic_checks() {
         let argv = |extra: &[&str]| -> Vec<String> {
-            ["bin", "--url=https://example.com", "--config-file=/dev/null"]
+            let no_config_file = if cfg!(windows) {
+                "--config-file=NUL"
+            } else {
+                "--config-file=/dev/null"
+            };
+            ["bin", "--url=https://example.com", no_config_file]
                 .iter()
                 .chain(extra)
                 .map(|arg| arg.to_string())

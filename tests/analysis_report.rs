@@ -4,7 +4,7 @@
 #[allow(dead_code)]
 mod common;
 
-use common::{LocalServer, TempDir, run_crawler};
+use common::{LocalServer, NO_CONFIG_FILE, TempDir, run_crawler};
 
 #[test]
 fn technologies_table_reaches_text_json_and_html_outputs() {
@@ -27,7 +27,7 @@ fn technologies_table_reaches_text_json_and_html_outputs() {
     let html_file = tmp.path.join("report.html");
 
     let output = run_crawler(&[
-        "--config-file=/dev/null",
+        NO_CONFIG_FILE,
         &format!("--url={}", server.url()),
         "--analyzer-filter-regex=/Technologies/",
         "--http-cache-dir=",
@@ -89,7 +89,7 @@ fn deeply_nested_label_does_not_abort_the_crawl() {
     let server = LocalServer::start(&site);
 
     let output = run_crawler(&[
-        "--config-file=/dev/null",
+        NO_CONFIG_FILE,
         &format!("--url={}", server.url()),
         "--analyzer-filter-regex=/Accessibility/",
         "--http-cache-dir=",
