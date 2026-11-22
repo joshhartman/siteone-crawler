@@ -1,6 +1,8 @@
 //! The Link checker tab: every crawled URL that answered 4xx or 5xx or failed without an answer,
 //! split into internal pages and internal assets, and the external links as the app's check after
-//! the crawl found them (GUI-SPEC §4.7, §6.3). *Found on* is the page or stylesheet that referenced
+//! the crawl found them (GUI-SPEC §4.7, §6.3), and the links whose scheme is a typo of `http` or
+//! `https` (`htp://…`), which the crawler lists in its result and never requests: status "Mistyped
+//! scheme", never retried. *Found on* is the page or stylesheet that referenced
 //! the URL: the `url` event's `source` as the URL arrives (every status), then — with
 //! `--link-details` — every referring page of the result JSON's `links` table; for runs of a
 //! crawler before link data, the result JSON's `404` table (404s only).
@@ -94,6 +96,13 @@ pub fn status_text(status: i32) -> String {
         code => code.to_string(),
     }
 }
+
+/// The status of a link whose scheme is a typo of `http`/`https` (`htp://…`), never requested.
+pub const MISTYPED_SCHEME: &str = "Mistyped scheme";
+
+/// What [`MISTYPED_SCHEME`] means, for its tooltip.
+const MISTYPED_SCHEME_TIP: &str =
+    "The link's scheme is misspelled (not http or https), so a browser cannot open it. The crawler did not request it.";
 
 /// The host of a URL for "same site": lower-case, without a leading `www.`.
 pub fn site_host(url: &str) -> Option<String> {
@@ -228,7 +237,9 @@ pub fn classify<'a>(
 pub struct BrokenIndex {
     /// `(URL row, where, kind)` of every broken or queued row, in arrival order.
     pub entries: Vec<(u32, Where, LinkKind)>,
-    /// Counts of the broken rows by [`Where`].
+    /// `(where, kind)` of each link with a mistyped scheme, in the order of the run's list.
+    pub mistyped: Vec<(Where, LinkKind)>,
+    /// Counts of the broken rows (the links with a mistyped scheme included) by [`Where`].
     pub counts: [u64; 3],
     /// A row names the page it was found on: the crawler reports referring pages.
     pub sources_reported: bool,
@@ -242,13 +253,14 @@ pub struct BrokenIndex {
 }
 
 impl BrokenIndex {
-    /// Brings the index up to date with `rows`; `revision` is theirs (a retry changes rows in
-    /// place).
+    /// Brings the index up to date with `rows` and the links with a mistyped scheme (they arrive
+    /// with the result); `revision` is the rows' (a retry changes rows in place).
     pub fn sync(
         &mut self,
         rows: &[UrlRow],
         site: Option<&str>,
         graph: Option<&LinkGraph>,
+        mistyped: &[(String, CrawlerRef)],
         retries: &RetryState,
         revision: u64,
     ) {
@@ -257,6 +269,7 @@ impl BrokenIndex {
             || self.graph != graph.is_some()
             || rows.len() < self.scanned
             || self.revisions != revisions
+            || self.mistyped.len() != mistyped.len()
         {
             *self = Self {
                 site: site.map(str::to_string),
@@ -280,6 +293,16 @@ impl BrokenIndex {
             }
         }
         self.scanned = rows.len();
+        if self.mistyped.is_empty() {
+            for (url, reference) in mistyped {
+                let refs = graph.and_then(|graph| graph.target(url));
+                let (place, kind, _) = classify(url, reference_attrs(Some(reference), refs), site);
+                if let Some(count) = self.counts.get_mut(place.slot()) {
+                    *count += 1;
+                }
+                self.mistyped.push((place, kind));
+            }
+        }
     }
 
     pub fn total(&self) -> u64 {
@@ -356,12 +379,21 @@ pub struct BrokenFilter {
     pub text: String,
 }
 
-/// A row of the tab: a broken crawled URL (position in [`BrokenIndex::entries`]) or a checked
-/// external link (position in the check's results).
+/// A row of the tab: a broken crawled URL (position in [`BrokenIndex::entries`]), a checked
+/// external link (position in the check's results) or a link with a mistyped scheme (position in
+/// the run's list of them).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowRef {
     Crawled(u32),
     Link(u32),
+    Mistyped(u32),
+}
+
+impl RowRef {
+    /// Whether the row can be retried: a link with a mistyped scheme cannot be requested.
+    pub fn retryable(self) -> bool {
+        !matches!(self, RowRef::Mistyped(_))
+    }
 }
 
 /// What a row shows.
@@ -377,6 +409,16 @@ enum Item<'a> {
     },
     /// A checked external link, with its referrers from the crawler's `links` table.
     Link(&'a LinkResult, Option<&'a TargetRefs>),
+    /// A link whose scheme is a typo of `http`/`https`, never requested: the URL as written, the
+    /// page and attribute of the crawler's `skipped` table, and every kept referrer from its
+    /// `links` table (`--link-details`).
+    Mistyped {
+        url: &'a str,
+        reference: &'a CrawlerRef,
+        place: Where,
+        kind: LinkKind,
+        refs: Option<&'a TargetRefs>,
+    },
 }
 
 impl<'a> Item<'a> {
@@ -384,19 +426,20 @@ impl<'a> Item<'a> {
         match self {
             Item::Crawled { row, .. } => &row.url,
             Item::Link(link, _) => &link.url,
+            Item::Mistyped { url, .. } => url,
         }
     }
 
     fn place(&self) -> Where {
         match self {
-            Item::Crawled { place, .. } => *place,
+            Item::Crawled { place, .. } | Item::Mistyped { place, .. } => *place,
             Item::Link(..) => Where::External,
         }
     }
 
     fn kind(&self) -> LinkKind {
         match self {
-            Item::Crawled { kind, .. } => *kind,
+            Item::Crawled { kind, .. } | Item::Mistyped { kind, .. } => *kind,
             Item::Link(..) => self.kind_and_attr().0,
         }
     }
@@ -406,6 +449,9 @@ impl<'a> Item<'a> {
         match self {
             Item::Crawled { row, refs, .. } => kind_of(&row.url, reference_attrs(row.link.as_deref(), *refs)),
             Item::Link(link, refs) => kind_of(&link.url, reference_attrs(None, *refs)),
+            Item::Mistyped {
+                url, reference, refs, ..
+            } => kind_of(url, reference_attrs(Some(*reference), *refs)),
         }
     }
 
@@ -415,6 +461,7 @@ impl<'a> Item<'a> {
             Item::Crawled { row, .. } if is_broken(row.status) => Outcome::Broken,
             Item::Crawled { .. } => Outcome::Ok,
             Item::Link(link, _) => link.outcome,
+            Item::Mistyped { .. } => Outcome::Broken,
         }
     }
 
@@ -423,6 +470,7 @@ impl<'a> Item<'a> {
         match self {
             Item::Crawled { row, .. } => i64::from(row.status),
             Item::Link(link, _) => link.status.map_or(-1, i64::from),
+            Item::Mistyped { .. } => -1,
         }
     }
 
@@ -434,6 +482,16 @@ impl<'a> Item<'a> {
         match self {
             Item::Crawled { row, .. } => status_text(row.status),
             Item::Link(link, _) => link.status_label(),
+            Item::Mistyped { .. } => MISTYPED_SCHEME.to_string(),
+        }
+    }
+
+    /// What the status chip's tooltip explains: why a link got no answer.
+    fn status_tip(&self) -> Option<&'a str> {
+        match self {
+            Item::Link(link, _) => link.error.as_deref(),
+            Item::Mistyped { .. } => Some(MISTYPED_SCHEME_TIP),
+            Item::Crawled { .. } => None,
         }
     }
 
@@ -445,13 +503,14 @@ impl<'a> Item<'a> {
                 (_, Some(status)) => super::urls::status_tone(i32::from(status)),
                 (_, None) => Tone::Danger,
             },
+            Item::Mistyped { .. } => Tone::Danger,
         }
     }
 
     fn title(&self) -> &str {
         match self {
             Item::Link(link, _) => link.title.as_deref().unwrap_or(""),
-            Item::Crawled { .. } => "",
+            Item::Crawled { .. } | Item::Mistyped { .. } => "",
         }
     }
 
@@ -460,7 +519,10 @@ impl<'a> Item<'a> {
     /// `url` event, else the page of the `404` table; for an external link the check's pages.
     fn referrers(&self) -> Vec<Referrer<'a>> {
         match self {
-            Item::Crawled { refs: Some(refs), .. } => refs.refs.iter().map(Referrer::of).collect(),
+            Item::Crawled { refs: Some(refs), .. } | Item::Mistyped { refs: Some(refs), .. } => {
+                refs.refs.iter().map(Referrer::of).collect()
+            }
+            Item::Mistyped { reference, .. } => vec![Referrer::of(reference)],
             Item::Crawled { row, found_on, .. } => match row.link.as_deref() {
                 Some(link) => vec![Referrer::of(link)],
                 None => found_on.iter().map(|page| Referrer::page(page)).collect(),
@@ -479,7 +541,10 @@ impl<'a> Item<'a> {
     /// The first page it was found on.
     fn found_on(&self) -> &'a str {
         match self {
-            Item::Crawled { refs: Some(refs), .. } => refs.refs.first().map_or("", |r| &*r.source),
+            Item::Crawled { refs: Some(refs), .. } | Item::Mistyped { refs: Some(refs), .. } => {
+                refs.refs.first().map_or("", |r| &*r.source)
+            }
+            Item::Mistyped { reference, .. } => &reference.source,
             Item::Crawled { row, found_on, .. } => row
                 .link
                 .as_deref()
@@ -500,8 +565,10 @@ impl<'a> Item<'a> {
     fn total(&self) -> usize {
         let known = self.sources().len();
         match self {
-            Item::Crawled { refs: Some(refs), .. } | Item::Link(_, Some(refs)) => (refs.in_links as usize).max(known),
-            Item::Crawled { .. } | Item::Link(_, None) => known,
+            Item::Crawled { refs: Some(refs), .. }
+            | Item::Mistyped { refs: Some(refs), .. }
+            | Item::Link(_, Some(refs)) => (refs.in_links as usize).max(known),
+            Item::Crawled { .. } | Item::Mistyped { .. } | Item::Link(_, None) => known,
         }
     }
 
@@ -527,7 +594,7 @@ impl<'a> Item<'a> {
 
     fn in_scope(&self, scope: Scope, retries: &RetryState) -> bool {
         let flagged = self.outcome() != Outcome::Ok;
-        let crawled_in = |wanted: Where| matches!(self, Item::Crawled { place, .. } if *place == wanted);
+        let crawled_in = |wanted: Where| matches!(self, Item::Crawled { place, .. } | Item::Mistyped { place, .. } if *place == wanted);
         match scope {
             Scope::AllBroken => flagged,
             Scope::InternalPages => flagged && crawled_in(Where::InternalPage),
@@ -558,6 +625,9 @@ struct Context<'a> {
     /// The crawler's `links` table (`--link-details`), once the result is loaded.
     graph: Option<&'a LinkGraph>,
     links: &'a [LinkResult],
+    /// The links with a mistyped scheme, and their place and kind ([`BrokenIndex::mistyped`]).
+    mistyped: &'a [(String, CrawlerRef)],
+    mistyped_places: &'a [(Where, LinkKind)],
     texts: &'a LinkTexts,
     retries: &'a RetryState,
     /// The revision of the rows (a retry changes rows in place).
@@ -584,6 +654,17 @@ impl<'a> Context<'a> {
                 .links
                 .get(position as usize)
                 .map(|link| Item::Link(link, self.graph.and_then(|graph| graph.target(&link.url)))),
+            RowRef::Mistyped(position) => {
+                let (url, reference) = self.mistyped.get(position as usize)?;
+                let (place, kind) = self.mistyped_places.get(position as usize)?;
+                Some(Item::Mistyped {
+                    url,
+                    reference,
+                    place: *place,
+                    kind: *kind,
+                    refs: self.graph.and_then(|graph| graph.target(url)),
+                })
+            }
         }
     }
 
@@ -642,6 +723,7 @@ fn order_key(row: RowRef) -> (u8, u32) {
     match row {
         RowRef::Crawled(position) => (0, position),
         RowRef::Link(position) => (1, position),
+        RowRef::Mistyped(position) => (2, position),
     }
 }
 
@@ -650,10 +732,18 @@ impl BrokenView {
         &self.rows
     }
 
+    /// How many rows can be retried ([`RowRef::retryable`]).
+    pub fn retryable(&self) -> usize {
+        self.rows.iter().filter(|row| row.retryable()).count()
+    }
+
     fn sync(&mut self, context: &Context<'_>, filter: &BrokenFilter, sort: BrokenSort, ascending: bool) {
-        // How many of the result's joins have arrived (the `404` table, and the crawler's `links`
-        // table, which may classify rows again; each arrives once, maybe in different frames).
-        let joined = u8::from(context.found_on.is_some()) + u8::from(context.graph.is_some());
+        // How many of the result's joins have arrived (the `404` table, the crawler's `links`
+        // table, which may classify rows again, and the links with a mistyped scheme; each arrives
+        // once, maybe in different frames).
+        let joined = u8::from(context.found_on.is_some())
+            + u8::from(context.graph.is_some())
+            + u8::from(!context.mistyped_places.is_empty());
         // New link texts change what the filter and the sort see.
         let texts = context.texts.pages.len();
         let total = context.entries.len();
@@ -674,24 +764,22 @@ impl BrokenView {
             return;
         }
         let needle = filter.text.trim().to_lowercase();
-        let crawled = |range: std::ops::Range<usize>| {
+        let matching = |range: std::ops::Range<usize>, row: fn(u32) -> RowRef| {
             range
                 .filter_map(|position| u32::try_from(position).ok())
-                .map(RowRef::Crawled)
+                .map(row)
                 .filter(|row| context.matches(*row, filter, &needle))
                 .collect::<Vec<_>>()
         };
-        let checked = |range: std::ops::Range<usize>| {
-            range
-                .filter_map(|position| u32::try_from(position).ok())
-                .map(RowRef::Link)
-                .filter(|row| context.matches(*row, filter, &needle))
-                .collect::<Vec<_>>()
-        };
+        let crawled = |range| matching(range, RowRef::Crawled);
+        let checked = |range| matching(range, RowRef::Link);
         if !current || total < self.scanned || links < self.scanned_links {
             self.rebuilds += 1;
             self.rows = crawled(0..total);
             self.rows.extend(checked(0..links));
+            // They arrive with the result, all at once: only a rebuild adds them.
+            self.rows
+                .extend(matching(0..context.mistyped_places.len(), RowRef::Mistyped));
             self.rows
                 .sort_unstable_by(|a, b| context.compare(*a, *b, sort, ascending));
             self.scanned = total;
@@ -816,6 +904,8 @@ fn context_of<'a>(
         found_on,
         graph: view.links.graph,
         links: view.links.results,
+        mistyped: view.links.mistyped,
+        mistyped_places: &index.mistyped,
         texts: view.links.texts,
         retries: view.retry.state,
         revision: view.state.revision,
@@ -887,6 +977,8 @@ pub struct ShownFrom<'a> {
     pub links: &'a [LinkResult],
     pub texts: &'a LinkTexts,
     pub graph: Option<&'a LinkGraph>,
+    /// The links with a mistyped scheme.
+    pub mistyped: &'a [(String, CrawlerRef)],
     pub retries: &'a RetryState,
 }
 
@@ -963,6 +1055,7 @@ impl BrokenUi {
             &view.state.urls,
             site.as_deref(),
             view.links.graph,
+            view.links.mistyped,
             retries,
             view.state.revision,
         );
@@ -998,6 +1091,8 @@ impl BrokenUi {
             found_on: self.found_on.as_ref(),
             graph: view.links.graph,
             links,
+            mistyped: view.links.mistyped,
+            mistyped_places: &self.index.mistyped,
             texts: view.links.texts,
             retries,
             revision: view.state.revision,
@@ -1015,9 +1110,15 @@ impl BrokenUi {
         self.by_page && groups_by_page(self.filter.scope)
     }
 
-    /// The URL of each row as drawn (`None` for a page heading), for a click on a checkbox.
+    /// The URL of each row as drawn (`None` for a page heading and a row that cannot be retried),
+    /// for a click on a checkbox.
     fn shown_urls(&self, context: &Context<'_>) -> Vec<Option<String>> {
-        let url = |row: RowRef| context.item(row).map(|item| item.url().to_string());
+        let url = |row: RowRef| {
+            context
+                .item(row)
+                .filter(|_| row.retryable())
+                .map(|item| item.url().to_string())
+        };
         if self.shows_by_page() {
             self.pages
                 .rows()
@@ -1081,6 +1182,8 @@ impl BrokenUi {
             found_on: self.found_on.as_ref(),
             graph: rows.graph,
             links: rows.links,
+            mistyped: rows.mistyped,
+            mistyped_places: &self.index.mistyped,
             texts: rows.texts,
             retries: rows.retries,
             revision: 0,
@@ -1119,7 +1222,7 @@ fn shown_row(item: &Item<'_>, link_text: TextLookup<'_>, texts: &LinkTexts) -> S
         title: Some(item.title().to_string()).filter(|title| !title.is_empty()),
         final_url: match item {
             Item::Link(link, _) => link.final_url.clone(),
-            Item::Crawled { .. } => None,
+            Item::Crawled { .. } | Item::Mistyped { .. } => None,
         },
         link_text: link_text.text().to_string(),
         positions: referrers
@@ -1494,6 +1597,7 @@ fn filter_row(ui: &mut Ui, view: &RunView<'_>, broken: &mut BrokenUi, focus: boo
                 links: view.links.results,
                 texts: view.links.texts,
                 graph: view.links.graph,
+                mistyped: view.links.mistyped,
                 retries: view.retry.state,
             };
             let (text, count) = if by_page {
@@ -1605,6 +1709,7 @@ fn broken_table(ui: &mut Ui, view: &RunView<'_>, broken: &mut BrokenUi, actions:
     let mut click = None;
     let context = broken.context(view);
     let rows = broken.view.rows();
+    let retryable = broken.view.retryable();
     let selection = &broken.selection;
     let selected = || selection.in_view_order(&broken.view, &context);
     egui::Frame::new()
@@ -1686,7 +1791,7 @@ fn broken_table(ui: &mut Ui, view: &RunView<'_>, broken: &mut BrokenUi, actions:
                 .header(HEADER_HEIGHT, |mut header| {
                     if selectable {
                         header.col(|ui| {
-                            if let Some(clicked) = selection::header_checkbox(ui, selection, count) {
+                            if let Some(clicked) = selection::header_checkbox(ui, selection, retryable) {
                                 click = Some(clicked);
                             }
                         });
@@ -1705,22 +1810,25 @@ fn broken_table(ui: &mut Ui, view: &RunView<'_>, broken: &mut BrokenUi, actions:
                 .body(|body| {
                     body.rows(ROW_HEIGHT, count, |mut row| {
                         let position = row.index();
-                        let Some(item) = rows.get(position).and_then(|row| context.item(*row)) else {
+                        let Some(&row_ref) = rows.get(position) else {
+                            return;
+                        };
+                        let Some(item) = context.item(row_ref) else {
                             return;
                         };
                         if selectable {
                             row.col(|ui| {
-                                if let Some(clicked) = selection::row_checkbox(ui, selection, position, item.url()) {
+                                if row_ref.retryable()
+                                    && let Some(clicked) = selection::row_checkbox(ui, selection, position, item.url())
+                                {
                                     click = Some(clicked);
                                 }
                             });
                         }
                         row.col(|ui| {
                             let chip = widgets::chip(ui, item.status_text(), item.tone());
-                            if let Item::Link(link, _) = &item
-                                && let Some(error) = &link.error
-                            {
-                                chip.on_hover_text(error);
+                            if let Some(tip) = item.status_tip() {
+                                chip.on_hover_text(tip);
                             }
                             retry::mark(ui, &view.retry, item.url());
                         });
@@ -1747,7 +1855,7 @@ fn broken_table(ui: &mut Ui, view: &RunView<'_>, broken: &mut BrokenUi, actions:
                             actions.push(RunAction::OpenUrl(item.url().to_string()));
                         }
                         response.context_menu(|ui| {
-                            if selectable {
+                            if selectable && row_ref.retryable() {
                                 let in_selection = if selection.contains(item.url()) {
                                     selection.len()
                                 } else {
@@ -1799,7 +1907,7 @@ fn page_table(ui: &mut Ui, view: &RunView<'_>, broken: &mut BrokenUi, actions: &
     let pages = &broken.pages;
     let rows = pages.rows();
     let count = rows.len();
-    let links = broken.view.rows().len();
+    let retryable = broken.view.retryable();
     let selection = &broken.selection;
     let selected = || selection.in_view_order(&broken.view, &context);
     let unknown = UnknownPage::of(view, result_ready, broken.index.sources_reported);
@@ -1836,7 +1944,7 @@ fn page_table(ui: &mut Ui, view: &RunView<'_>, broken: &mut BrokenUi, actions: &
                 .header(HEADER_HEIGHT, |mut header| {
                     if selectable {
                         header.col(|ui| {
-                            if let Some(clicked) = selection::header_checkbox(ui, selection, links) {
+                            if let Some(clicked) = selection::header_checkbox(ui, selection, retryable) {
                                 click = Some(clicked);
                             }
                         });
@@ -1891,8 +1999,9 @@ fn page_table(ui: &mut Ui, view: &RunView<'_>, broken: &mut BrokenUi, actions: &
                                 let page = pages.page(*at);
                                 if selectable {
                                     row.col(|ui| {
-                                        if let Some(clicked) =
-                                            selection::row_checkbox(ui, selection, position, item.url())
+                                        if link_row.retryable()
+                                            && let Some(clicked) =
+                                                selection::row_checkbox(ui, selection, position, item.url())
                                         {
                                             click = Some(clicked);
                                         }
@@ -1900,10 +2009,8 @@ fn page_table(ui: &mut Ui, view: &RunView<'_>, broken: &mut BrokenUi, actions: &
                                 }
                                 row.col(|ui| {
                                     let chip = widgets::chip(ui, item.status_text(), item.tone());
-                                    if let Item::Link(link, _) = &item
-                                        && let Some(error) = &link.error
-                                    {
-                                        chip.on_hover_text(error);
+                                    if let Some(tip) = item.status_tip() {
+                                        chip.on_hover_text(tip);
                                     }
                                     retry::mark(ui, &view.retry, item.url());
                                 });
@@ -1928,7 +2035,7 @@ fn page_table(ui: &mut Ui, view: &RunView<'_>, broken: &mut BrokenUi, actions: &
                                     actions.push(RunAction::OpenUrl(item.url().to_string()));
                                 }
                                 response.context_menu(|ui| {
-                                    if selectable {
+                                    if selectable && link_row.retryable() {
                                         let in_selection = if selection.contains(item.url()) {
                                             selection.len()
                                         } else {
@@ -2057,6 +2164,9 @@ fn title_cell(ui: &mut Ui, item: &Item<'_>) {
         Item::Crawled { .. } => {
             ui.label(widgets::weak(ui, "crawled"))
                 .on_hover_text("Crawled by an older version of the external link check.");
+        }
+        Item::Mistyped { .. } => {
+            ui.label(widgets::weak(ui, "—"));
         }
     }
 }
@@ -2508,6 +2618,8 @@ mod tests {
                 found_on: None,
                 graph,
                 links: &[],
+                mistyped: &[],
+                mistyped_places: &[],
                 texts: &texts,
                 retries: &retries,
                 revision: 0,
@@ -2524,7 +2636,7 @@ mod tests {
         };
 
         // Live: the event's reference only.
-        index.sync(&rows, Some("site.example"), None, &retries, 0);
+        index.sync(&rows, Some("site.example"), None, &[], &retries, 0);
         let places: Vec<(Where, LinkKind)> = index.entries.iter().map(|(_, place, kind)| (*place, *kind)).collect();
         assert_eq!(
             places,
@@ -2548,7 +2660,7 @@ mod tests {
 
         // The `links` table arrives with the result: the rows already collected are classified
         // again, and the counts follow.
-        index.sync(&rows, Some("site.example"), Some(&graph), &retries, 0);
+        index.sync(&rows, Some("site.example"), Some(&graph), &[], &retries, 0);
         assert_eq!(index.entries[1], (1, Where::InternalAsset, LinkKind::Image));
         assert_eq!(index.counts, [1, 3, 0]);
         assert_eq!(
@@ -2560,6 +2672,195 @@ mod tests {
             ["https://site.example/gone"]
         );
         assert_eq!(scope_urls(&rows, &index, &retries, 0, Scope::InternalAssets).len(), 3);
+    }
+
+    #[test]
+    fn links_with_a_mistyped_scheme_are_broken_rows_that_cannot_be_retried() {
+        use crate::model::link_data::LinkRow;
+        use selection::Click;
+        let rows = vec![
+            row("https://site.example/", 200, ContentKind::Html),
+            row("https://site.example/gone", 404, ContentKind::Html),
+        ];
+        let links = vec![link("https://dead.example/", Outcome::Broken, None)];
+        let reference = |source: &str, attr: &str| CrawlerRef {
+            source: Arc::from(source),
+            attr: Arc::from(attr),
+            text: None,
+            line: None,
+            column: None,
+        };
+        // As the crawler's `skipped` table gives them: one on the site's host, one on another.
+        let mistyped = vec![
+            (
+                "htp://site.example/about".to_string(),
+                reference("https://site.example/contact/", "<a href>"),
+            ),
+            (
+                "htps://partner.example/logo.png".to_string(),
+                reference("https://site.example/", "<img src>"),
+            ),
+        ];
+        // The `links` table has every page of the first one; the second one is not in it.
+        let referrer = |source: &str, text: &str, line: Option<u32>| LinkRow {
+            url: "htp://site.example/about".to_string(),
+            source_url: source.to_string(),
+            source_attr: "<a href>".to_string(),
+            link_text: text.to_string(),
+            source_line: line,
+            in_links: Some(3),
+            ..LinkRow::default()
+        };
+        let graph = LinkGraph::build(
+            [
+                referrer("https://site.example/contact/", "About us", Some(12)),
+                referrer("https://site.example/team/", "", None),
+            ],
+            [],
+        );
+        let texts = LinkTexts::default();
+        let retries = RetryState::default();
+        let mut broken = BrokenUi::default();
+        broken
+            .index
+            .sync(&rows, Some("site.example"), Some(&graph), &mistyped, &retries, 0);
+        assert_eq!(
+            broken.index.mistyped,
+            [
+                (Where::InternalPage, LinkKind::Page),
+                (Where::External, LinkKind::Image)
+            ]
+        );
+        assert_eq!(broken.index.counts, [2, 0, 1], "the counts include them");
+        let context = Context {
+            rows: &rows,
+            entries: &broken.index.entries,
+            found_on: None,
+            graph: Some(&graph),
+            links: &links,
+            mistyped: &mistyped,
+            mistyped_places: &broken.index.mistyped,
+            texts: &texts,
+            retries: &retries,
+            revision: 0,
+            queue_order: false,
+        };
+        let view_of = |scope| {
+            let mut view = BrokenView::default();
+            let filter = BrokenFilter {
+                scope,
+                ..BrokenFilter::default()
+            };
+            view.sync(&context, &filter, BrokenSort::Where, true);
+            view
+        };
+        let shown = |scope| -> Vec<ShownRow> {
+            view_of(scope)
+                .rows()
+                .iter()
+                .filter_map(|row| context.item(*row))
+                .map(|item| shown_row(&item, item.link_text(&texts), &texts))
+                .collect()
+        };
+        let all = shown(Scope::AllBroken);
+        let summary: Vec<(&str, i64, Where, &str)> = all
+            .iter()
+            .map(|row| (row.status.as_str(), row.code, row.place, row.url.as_str()))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                ("Mistyped scheme", -1, Where::InternalPage, "htp://site.example/about"),
+                ("404", 404, Where::InternalPage, "https://site.example/gone"),
+                (
+                    "Mistyped scheme",
+                    -1,
+                    Where::External,
+                    "htps://partner.example/logo.png"
+                ),
+                ("DNS lookup failed", -1, Where::External, "https://dead.example/"),
+            ]
+        );
+        // The tab's badge and the view's count agree with the rows: crawled and mistyped, plus the
+        // broken external link of the check.
+        assert_eq!(broken.index.total() + 1, all.len() as u64);
+        // Found on, link text, position and "+N more" from the `links` table; else the page of the
+        // `skipped` table.
+        let internal = &all[0];
+        assert_eq!(
+            internal.sources,
+            ["https://site.example/contact/", "https://site.example/team/"]
+        );
+        assert_eq!(
+            (
+                internal.link_text.as_str(),
+                internal.positions[0].as_str(),
+                internal.more
+            ),
+            ("About us", ":12", 1)
+        );
+        assert_eq!(all[2].sources, ["https://site.example/"]);
+        assert!(!all[2].checked);
+        // Where: internal by kind, External with the external links.
+        let urls = |scope| -> Vec<String> { shown(scope).into_iter().map(|row| row.url).collect() };
+        assert_eq!(
+            urls(Scope::InternalPages),
+            ["htp://site.example/about", "https://site.example/gone"]
+        );
+        assert!(urls(Scope::InternalAssets).is_empty());
+        assert_eq!(
+            urls(Scope::ExternalBroken),
+            ["htps://partner.example/logo.png", "https://dead.example/"]
+        );
+        // The kind by the existing rule, and the status explained in the chip's tooltip.
+        let external = context.item(RowRef::Mistyped(1)).expect("row");
+        assert_eq!(external.kind_and_attr(), (LinkKind::Image, Some("<img src>")));
+        assert_eq!(external.status_tip(), Some(MISTYPED_SCHEME_TIP));
+        // Copy list.
+        assert!(
+            copy_text(&all, false)
+                .contains("Mistyped scheme\tExternal\thtps://partner.example/logo.png\t\thttps://site.example/\n")
+        );
+        // By page: under every page it was found on.
+        let mut pages = PageView::default();
+        let view = view_of(Scope::AllBroken);
+        pages.sync(&view, &context, &BrokenFilter::default());
+        let contact = pages
+            .groups
+            .iter()
+            .position(|(page, _)| page.as_deref() == Some("https://site.example/contact/"))
+            .expect("a group");
+        assert!(
+            pages
+                .rows()
+                .contains(&PageRow::Link(RowRef::Mistyped(0), contact as u32))
+        );
+
+        // Not retryable: no checkbox URL, so Select all and the header's count leave them out.
+        broken.view = view;
+        assert_eq!(broken.view.retryable(), 2);
+        let drawn = broken.shown_urls(&context);
+        assert_eq!(
+            drawn,
+            [
+                None,
+                Some("https://site.example/gone".to_string()),
+                None,
+                Some("https://dead.example/".to_string()),
+            ]
+        );
+        broken.selection.apply(Click::All(true), &drawn);
+        assert_eq!(broken.selection.len(), 2);
+        assert!(!RowRef::Mistyped(0).retryable() && RowRef::Crawled(0).retryable() && RowRef::Link(0).retryable());
+
+        // A result without them: the rows and counts of before.
+        let mut index = BrokenIndex::default();
+        index.sync(&rows, Some("site.example"), Some(&graph), &mistyped, &retries, 0);
+        index.sync(&rows, Some("site.example"), Some(&graph), &[], &retries, 0);
+        assert_eq!(
+            (index.counts, index.mistyped.len(), index.entries.len()),
+            ([1, 0, 0], 0, 1)
+        );
     }
 
     #[test]
@@ -2577,10 +2878,10 @@ mod tests {
             row("https://example.com/a", 404, ContentKind::Html),
         ];
         let mut index = BrokenIndex::default();
-        index.sync(&rows, Some("example.com"), None, &RetryState::default(), 0);
+        index.sync(&rows, Some("example.com"), None, &[], &RetryState::default(), 0);
         assert_eq!(index.entries, vec![(1, Where::InternalPage, LinkKind::Page)]);
         rows.push(row("https://ext.org/", -2, ContentKind::Other));
-        index.sync(&rows, Some("example.com"), None, &RetryState::default(), 0);
+        index.sync(&rows, Some("example.com"), None, &[], &RetryState::default(), 0);
         assert_eq!(index.counts, [1, 0, 1]);
     }
 
@@ -2590,7 +2891,7 @@ mod tests {
         let rows = vec![row("https://site.example/gone", 404, ContentKind::Html)];
         let texts = LinkTexts::default();
         let mut index = BrokenIndex::default();
-        index.sync(&rows, Some("site.example"), None, &RetryState::default(), 0);
+        index.sync(&rows, Some("site.example"), None, &[], &RetryState::default(), 0);
         let mut links = vec![
             link("https://ok.example/", Outcome::Ok, Some(200)),
             link("https://refused.example/", Outcome::Refused, Some(403)),
@@ -2607,6 +2908,8 @@ mod tests {
                 found_on: None,
                 graph: None,
                 links,
+                mistyped: &[],
+                mistyped_places: &[],
                 texts: &texts,
                 retries: &no_retries,
                 revision: 0,
@@ -2626,6 +2929,8 @@ mod tests {
                 found_on: None,
                 graph: None,
                 links: &links,
+                mistyped: &[],
+                mistyped_places: &[],
                 texts: &texts,
                 retries: &no_retries,
                 revision: 0,
@@ -2645,6 +2950,8 @@ mod tests {
             found_on: None,
             graph: None,
             links: &links,
+            mistyped: &[],
+            mistyped_places: &[],
             texts: &texts,
             retries: &no_retries,
             revision: 0,
@@ -2666,6 +2973,8 @@ mod tests {
             found_on: None,
             graph: None,
             links: &fresh,
+            mistyped: &[],
+            mistyped_places: &[],
             texts: &texts,
             retries: &no_retries,
             revision: 0,
@@ -2717,6 +3026,8 @@ mod tests {
             found_on: None,
             graph: None,
             links: &[],
+            mistyped: &[],
+            mistyped_places: &[],
             texts: &texts,
             retries,
             revision,
@@ -2751,7 +3062,7 @@ mod tests {
         retries.enqueue("https://site.example/c", first(&state.urls[2]));
         retries.enqueue("https://site.example/a", first(&state.urls[0]));
         let mut index = BrokenIndex::default();
-        index.sync(&state.urls, Some("site.example"), None, &retries, state.revision);
+        index.sync(&state.urls, Some("site.example"), None, &[], &retries, state.revision);
         let urls = |index: &BrokenIndex, retries: &RetryState, revision, scope| {
             scope_urls(&state.urls, index, retries, revision, scope)
         };
@@ -2770,7 +3081,7 @@ mod tests {
         retries.record_answer("https://site.example/a", answer);
         retries.apply_to_state(&mut state);
         let revision = state.revision;
-        index.sync(&state.urls, Some("site.example"), None, &retries, revision);
+        index.sync(&state.urls, Some("site.example"), None, &[], &retries, revision);
         assert_eq!(index.total(), 2, "the counts follow");
         assert_eq!(index.entries.len(), 2, "neither broken nor queued: out of the index");
         let urls = |scope| scope_urls(&state.urls, &index, &retries, revision, scope);
@@ -2791,13 +3102,15 @@ mod tests {
         let texts = LinkTexts::default();
         let retries = RetryState::default();
         let mut index = BrokenIndex::default();
-        index.sync(&rows, Some("site.example"), None, &retries, 0);
+        index.sync(&rows, Some("site.example"), None, &[], &retries, 0);
         let context = Context {
             rows: &rows,
             entries: &index.entries,
             found_on: None,
             graph: None,
             links: &[],
+            mistyped: &[],
+            mistyped_places: &[],
             texts: &texts,
             retries: &retries,
             revision: 0,
@@ -2868,7 +3181,7 @@ mod tests {
         let texts = LinkTexts::default();
         let retries = RetryState::default();
         let mut index = BrokenIndex::default();
-        index.sync(&rows, Some("site.example"), None, &retries, 0);
+        index.sync(&rows, Some("site.example"), None, &[], &retries, 0);
         let found_on = FoundOn(HashMap::from([
             (
                 "https://site.example/gone".to_string(),
@@ -2891,6 +3204,8 @@ mod tests {
             found_on: Some(&found_on),
             graph: None,
             links: &links,
+            mistyped: &[],
+            mistyped_places: &[],
             texts: &texts,
             retries: &retries,
             revision: 0,

@@ -11,9 +11,9 @@ use super::{App, PastLoad};
 use crate::backend::shell;
 use crate::model::coverage::{self, CrawlScope, Gap, GapInput};
 use crate::model::link_check::{Outcome, OutcomeCounts, RunLinks};
-use crate::model::link_data::{Referrer, text_on};
+use crate::model::link_data::{CrawlerRef, Referrer, text_on};
 use crate::model::link_report::{LinkReport, ReportGroup, ReportRow, group_by_page};
-use crate::model::run_state::{RunState, UrlRow};
+use crate::model::run_state::RunState;
 use crate::ui::run::broken::{self, Where};
 use crate::ui::widgets::format;
 
@@ -46,20 +46,21 @@ fn gather(source: &Source<'_>) -> LinkReport {
             more: total.saturating_sub(referrers.len()),
             found_on: referrers.iter().map(|referrer| referrer.page.to_string()).collect(),
         };
-    // A crawled URL: every kept referrer of the crawler's `links` table, else the page of its `url`
-    // event, else the page of the `404` table (crawlers before link data).
-    let crawled_row = |row: &UrlRow, status: String, kind: &str| {
-        let target = graph.and_then(|graph| graph.target(&row.url));
-        let referrers: Vec<Referrer<'_>> = match (target, row.link.as_deref()) {
+    // A crawled URL (or a link with a mistyped scheme): every kept referrer of the crawler's `links`
+    // table, else the page of its `url` event (of the `skipped` table), else the page of the `404`
+    // table (crawlers before link data).
+    let crawled_row = |url: &str, link: Option<&CrawlerRef>, status: String, kind: &str| {
+        let target = graph.and_then(|graph| graph.target(url));
+        let referrers: Vec<Referrer<'_>> = match (target, link) {
             (Some(target), _) => target.refs.iter().map(Referrer::of).collect(),
             (None, Some(link)) => vec![Referrer::of(link)],
             (None, None) => found_on
-                .get(row.url.trim().trim_end_matches('/'))
+                .get(url.trim().trim_end_matches('/'))
                 .map(|page| vec![Referrer::page(page)])
                 .unwrap_or_default(),
         };
         let total = target.map_or(referrers.len(), |target| target.in_links as usize);
-        row_of(status, &row.url, kind.to_string(), referrers, total)
+        row_of(status, url, kind.to_string(), referrers, total)
     };
     let link_row = |link: &crate::model::link_check::LinkResult| {
         let target = graph.and_then(|graph| graph.target(&link.url));
@@ -84,15 +85,24 @@ fn gather(source: &Source<'_>) -> LinkReport {
     let mut pages = Vec::new();
     let mut assets = Vec::new();
     let mut external = Vec::new();
-    for row in &source.state.urls {
-        if !broken::is_broken(row.status) {
-            continue;
-        }
-        let refs = graph.and_then(|graph| graph.target(&row.url));
-        let attrs = broken::reference_attrs(row.link.as_deref(), refs);
-        let (place, kind, attr) = broken::classify(&row.url, attrs, site_host.as_deref());
+    // The broken crawled URLs, then the links with a mistyped scheme (never requested).
+    let crawled = source
+        .state
+        .urls
+        .iter()
+        .filter(|row| broken::is_broken(row.status))
+        .map(|row| (&*row.url, row.link.as_deref(), broken::status_text(row.status)));
+    let mistyped = source
+        .links
+        .mistyped
+        .iter()
+        .map(|(url, reference)| (url.as_str(), Some(reference), broken::MISTYPED_SCHEME.to_string()));
+    for (url, link, status) in crawled.chain(mistyped) {
+        let refs = graph.and_then(|graph| graph.target(url));
+        let attrs = broken::reference_attrs(link, refs);
+        let (place, kind, attr) = broken::classify(url, attrs, site_host.as_deref());
         let kind = broken::referenced_by(kind, attr).unwrap_or_else(|| kind.label().to_string());
-        let shown = crawled_row(row, broken::status_text(row.status), &kind);
+        let shown = crawled_row(url, link, status, &kind);
         match place {
             Where::InternalPage => pages.push(shown),
             Where::InternalAsset => assets.push(shown),
@@ -291,8 +301,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::model::link_data::CrawlerRef;
-    use crate::model::run_state::ContentKind;
+    use crate::model::run_state::{ContentKind, UrlRow};
 
     #[test]
     fn the_report_gives_the_kind_with_the_reference_that_decided_it() {
@@ -333,5 +342,89 @@ mod tests {
                 .render()
                 .contains("<td>Image, referenced by &lt;img src&gt;</td>")
         );
+    }
+
+    #[test]
+    fn links_with_a_mistyped_scheme_are_broken_links_of_the_report() {
+        let mut state = RunState::new();
+        state.urls.push(UrlRow::new(
+            "https://site.example/gone",
+            404,
+            ContentKind::Html,
+            1,
+            1,
+            false,
+        ));
+        let reference = |source: &str, attr: &str| CrawlerRef {
+            source: Arc::from(source),
+            attr: Arc::from(attr),
+            text: None,
+            line: None,
+            column: None,
+        };
+        let links = RunLinks {
+            mistyped: vec![
+                (
+                    "htp://site.example/about".to_string(),
+                    reference("https://site.example/contact/", "<a href>"),
+                ),
+                (
+                    "htps://partner.example/logo.png".to_string(),
+                    reference("https://site.example/", "<img src>"),
+                ),
+            ],
+            ..RunLinks::default()
+        };
+        let report = gather(&Source {
+            state: &state,
+            links: &links,
+            site: "https://site.example/".to_string(),
+        });
+        let rows = |group: usize| -> Vec<(&str, &str, &str, Vec<String>)> {
+            report.groups[group]
+                .rows
+                .iter()
+                .map(|row| {
+                    (
+                        row.status.as_str(),
+                        row.url.as_str(),
+                        row.title_or_kind.as_str(),
+                        row.found_on.clone(),
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(
+            rows(0),
+            [
+                ("404", "https://site.example/gone", "Page", vec![]),
+                (
+                    "Mistyped scheme",
+                    "htp://site.example/about",
+                    "Page",
+                    vec!["https://site.example/contact/".to_string()]
+                ),
+            ]
+        );
+        assert!(rows(1).is_empty(), "no broken asset");
+        assert_eq!(
+            rows(2),
+            [(
+                "Mistyped scheme",
+                "htps://partner.example/logo.png",
+                "Image, referenced by <img src>",
+                vec!["https://site.example/".to_string()]
+            )]
+        );
+        assert_eq!(report.counts[0], ("broken internal pages".to_string(), 2));
+        assert_eq!(report.counts[2], ("broken external links".to_string(), 1));
+        // By page: each under the page it was found on.
+        assert!(
+            report
+                .by_page
+                .iter()
+                .any(|group| group.page.as_deref() == Some("https://site.example/contact/"))
+        );
+        assert!(report.render().contains("Mistyped scheme"));
     }
 }

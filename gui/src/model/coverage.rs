@@ -8,7 +8,7 @@
 //! many.
 
 use super::config::ACTION_LINK_PATTERNS;
-use super::link_check::{LinkResult, Outcome, REASON_OTHER_HOST, cell, column};
+use super::link_check::{LinkResult, Outcome, REASON_MISTYPED_SCHEME, REASON_OTHER_HOST, cell, column};
 use super::results::ResultData;
 use super::run_state::{RunOutcome, StatusCounts};
 
@@ -28,7 +28,8 @@ const DISABLE_OPTIONS: &[(&str, &str)] = &[
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CrawlScope {
     /// URLs the crawler skipped, per reason, other than those on another host (the app's link
-    /// list counts those): `(reason, count)`, in the order of the file.
+    /// list counts those) and those with a mistyped scheme (the Link checker lists them as broken):
+    /// `(reason, count)`, in the order of the file.
     pub skipped: Vec<(String, u64)>,
     pub ignore_regex: Vec<String>,
     pub include_regex: Vec<String>,
@@ -94,13 +95,14 @@ impl CrawlScope {
     }
 }
 
-/// `(reason, count)` of the skipped URLs other than other hosts: summed from `skipped-summary`
-/// (count per reason and domain), or counted in `skipped` when the summary is missing.
+/// `(reason, count)` of the skipped URLs other than other hosts and mistyped schemes: summed from
+/// `skipped-summary` (count per reason and domain), or counted in `skipped` when the summary is
+/// missing.
 fn skipped_by_reason(data: &ResultData) -> Vec<(String, u64)> {
     let mut counts: Vec<(String, u64)> = Vec::new();
     let mut add = |reason: &str, count: u64| {
         let reason = reason.trim();
-        if reason.is_empty() || reason == REASON_OTHER_HOST || count == 0 {
+        if reason.is_empty() || reason == REASON_OTHER_HOST || reason == REASON_MISTYPED_SCHEME || count == 0 {
             return;
         }
         match counts.iter_mut().find(|(known, _)| known == reason) {
@@ -425,9 +427,11 @@ mod tests {
         let rows = parse_result(
             r#"{"tables":{"skipped":{"columns":{"reason":{},"url":{}},"rows":[
             {"reason":"Robots.txt","url":"/a"},{"reason":"Robots.txt","url":"/b"},
-            {"reason":"Not allowed host","url":"https://x.example/"}]}}}"#,
+            {"reason":"Not allowed host","url":"https://x.example/"},
+            {"reason":"Mistyped scheme","url":"htp://x.example/"}]}}}"#,
         )
         .expect("parses");
+        // Links with a mistyped scheme are no gap: the Link checker lists them as broken.
         assert_eq!(CrawlScope::from_result(&rows).skipped, [("Robots.txt".to_string(), 2)]);
         // Options of an unexpected type are left out, never an error.
         let odd =

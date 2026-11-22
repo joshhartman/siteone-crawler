@@ -55,6 +55,9 @@ pub const MAX_SOURCES: usize = 20;
 /// The reason of a skipped URL on another host (`SkippedUrlsAnalyzer`).
 pub(crate) const REASON_OTHER_HOST: &str = "Not allowed host";
 
+/// The reason of a link whose scheme is a typo of `http`/`https` (`SkippedUrlsAnalyzer`).
+pub(crate) const REASON_MISTYPED_SCHEME: &str = "Mistyped scheme";
+
 /// The `sourceAttr` of a link (`SkippedUrlsAnalyzer::get_source_short_name`).
 const SOURCE_LINK: &str = "<a href>";
 
@@ -505,6 +508,8 @@ pub struct RunLinks {
     pub error: Option<String>,
     /// `(404 URL, page it was found on)` of the result JSON's `404` table.
     pub internal: Vec<(String, String)>,
+    /// The links whose scheme is a typo of `http`/`https` ([`mistyped_links`]).
+    pub mistyped: Vec<(String, CrawlerRef)>,
     /// The link texts found so far (`link-texts.json`).
     pub texts: LinkTexts,
     /// The source pages of the external links are wanted too (the external link check ran).
@@ -535,6 +540,7 @@ impl RunLinks {
             report,
             error: errors.pop(),
             internal,
+            mistyped: data.map(|data| mistyped_links(data, site_url)).unwrap_or_default(),
             texts,
             texts_settled: false,
             scope: data.map(CrawlScope::from_result),
@@ -649,6 +655,37 @@ fn internal_pairs(data: &ResultData) -> Vec<(String, String)> {
         .iter()
         .map(|row| (cell(row, url).trim().to_string(), cell(row, source).trim().to_string()))
         .filter(|(url, source)| !url.is_empty() && !source.is_empty())
+        .collect()
+}
+
+/// The links of the `skipped` table whose scheme is a typo of `http`/`https` (`htp://…`), which the
+/// crawler never requests: the URL as written, with the page (resolved against `site_url`) and the
+/// attribute it was first found in.
+fn mistyped_links(data: &ResultData, site_url: &str) -> Vec<(String, CrawlerRef)> {
+    let Some(table) = data.table("skipped") else {
+        return Vec::new();
+    };
+    let base = url::Url::parse(site_url.trim()).ok();
+    let (reason, url, attr, source) = (
+        column(table, "reason"),
+        column(table, "url"),
+        column(table, "sourceAttr"),
+        column(table, "sourceUqId"),
+    );
+    table
+        .rows
+        .iter()
+        .filter(|row| cell(row, reason) == REASON_MISTYPED_SCHEME && !cell(row, url).trim().is_empty())
+        .map(|row| {
+            let reference = CrawlerRef {
+                source: Arc::from(resolve_source(cell(row, source), base.as_ref())),
+                attr: Arc::from(cell(row, attr).trim()),
+                text: None,
+                line: None,
+                column: None,
+            };
+            (cell(row, url).trim().to_string(), reference)
+        })
         .collect()
 }
 
@@ -783,6 +820,86 @@ mod tests {
             ]
         );
         assert_eq!(page.count, 7);
+    }
+
+    #[test]
+    fn links_with_a_mistyped_scheme_are_read_and_never_checked() {
+        use crate::model::link_data::{LinkRow, UrlFacts};
+        let skipped = table(
+            "skipped",
+            &["reason", "url", "sourceAttr", "sourceUqId"],
+            &[
+                &[
+                    "reason=Mistyped scheme",
+                    "url=htp://site.example/about",
+                    "sourceAttr=<a href>",
+                    "sourceUqId=/contact/",
+                ],
+                &[
+                    "reason=Mistyped scheme",
+                    "url=htps://partner.example/logo.png",
+                    "sourceAttr=<img src>",
+                    "sourceUqId=/",
+                ],
+                &[
+                    "reason=Not allowed host",
+                    "url=https://ok.example/page",
+                    "sourceAttr=<a href>",
+                    "sourceUqId=/",
+                ],
+            ],
+        );
+        let mut data = data(&[skipped]);
+        let links = RunLinks::load(Path::new("no-such-run"), Some(&data), "https://site.example/");
+        let read: Vec<(&str, &str, &str)> = links
+            .mistyped
+            .iter()
+            .map(|(url, reference)| (url.as_str(), &*reference.source, &*reference.attr))
+            .collect();
+        assert_eq!(
+            read,
+            [
+                ("htp://site.example/about", "https://site.example/contact/", "<a href>"),
+                ("htps://partner.example/logo.png", "https://site.example/", "<img src>"),
+            ]
+        );
+        // The external link check requests neither, from the `skipped` table or the `links` table.
+        let urls = |list: &LinkList| list.links.iter().map(|link| link.url.clone()).collect::<Vec<_>>();
+        let list = link_list(&data, "https://site.example/");
+        assert_eq!(
+            (urls(&list), list.files),
+            (vec!["https://ok.example/page".to_string()], 0)
+        );
+        let row = |url: &str, attr: &str, external: bool| LinkRow {
+            url: url.to_string(),
+            source_url: "https://site.example/".to_string(),
+            source_attr: attr.to_string(),
+            external,
+            ..LinkRow::default()
+        };
+        data.links = Some(Arc::new(LinkGraph::build(
+            [
+                row("htp://site.example/about", "<a href>", false),
+                row("htps://partner.example/x", "<a href>", true),
+                row("https://ok.example/page", "<a href>", true),
+            ],
+            Vec::<(String, UrlFacts)>::new(),
+        )));
+        let list = link_list(&data, "https://site.example/");
+        assert_eq!(
+            (urls(&list), list.files),
+            (vec!["https://ok.example/page".to_string()], 0)
+        );
+        // An older crawler: no such rows.
+        assert!(
+            RunLinks::load(
+                Path::new("no-such-run"),
+                Some(&parse_result(FIXTURE).expect("fixture")),
+                ""
+            )
+            .mistyped
+            .is_empty()
+        );
     }
 
     #[test]

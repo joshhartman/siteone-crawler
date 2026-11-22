@@ -28,7 +28,7 @@ use crate::backend::shell;
 use crate::model::coverage::CrawlScope;
 use crate::model::history::{RecordedOutcome, RunRecord};
 use crate::model::link_check::{CheckReport, LinkList, LinkResult, RunLinks};
-use crate::model::link_data::LinkGraph;
+use crate::model::link_data::{CrawlerRef, LinkGraph};
 use crate::model::link_text::LinkTexts;
 use crate::model::results::{ResultLoad, Severity};
 use crate::model::retry::{self, RetryState};
@@ -199,6 +199,8 @@ pub struct LinksView<'a> {
     pub scope: Option<&'a CrawlScope>,
     /// The crawler's `links` table and link facts (`--link-details`, from the result JSON).
     pub graph: Option<&'a LinkGraph>,
+    /// The links whose scheme is a typo of `http`/`https` (from the result JSON).
+    pub mistyped: &'a [(String, CrawlerRef)],
 }
 
 impl<'a> LinksView<'a> {
@@ -242,6 +244,7 @@ impl<'a> LinksView<'a> {
             texts_pending: false,
             scope: links.scope.as_ref(),
             graph: links.graph.as_deref(),
+            mistyped: &links.mistyped,
         }
     }
 
@@ -311,6 +314,7 @@ fn shown_from(app: &App) -> Option<broken::ShownFrom<'_>> {
         links: link_results(links, active_for(run_dir)),
         texts: &links.texts,
         graph: links.graph.as_deref(),
+        mistyped: &links.mistyped,
         retries,
     })
 }

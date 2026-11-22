@@ -358,7 +358,8 @@ makes no request.
 
 After a run has finished, single URLs can be requested again without crawling the site again
 (`model/retry.rs`, `backend/retry.rs`, `app/retry.rs`). A URL is *retryable* when the Link checker
-tab lists it: a crawled URL that failed (4xx/5xx or no answer), or an external link of the check.
+tab lists it: a crawled URL that failed (4xx/5xx or no answer), or an external link of the check
+(not a link with a mistyped scheme, which cannot be requested).
 The app does not keep track of what was retried: a retry's answer replaces the URL's answer, and the
 views show what is still broken.
 
@@ -478,7 +479,7 @@ external resource, light and dark by `prefers-color-scheme`, printable).
   | only the start page (`--single-page`); pages deeper than `--max-depth` | `options` | — |
   | cart and action links (the app's patterns, §5.2) | `options.ignoreRegex` | — |
   | URLs matching the user's own `--ignore-regex` patterns (named) | `options.ignoreRegex` | — |
-  | disallowed by robots.txt; any other reason of the crawler's skip list, verbatim | `skipped-summary` (or `skipped` rows) | yes |
+  | disallowed by robots.txt; any other reason of the crawler's skip list, verbatim (not "Mistyped scheme": those links are broken links of the report) | `skipped-summary` (or `skipped` rows) | yes |
   | content types not downloaded (`--disable-images`, …) | `options` | — |
   | external links found but not checked; over the app's cap | link list, check | yes |
   | files on other websites (the app checks links only) | link list | yes |
@@ -899,7 +900,16 @@ crawl's outcome, which does not wait for the check.
   referenced by `<img src>`", as does the link report's *title or kind*. The kind is set as each
   URL arrives and again when the `links` table is loaded; and the external links of the app's
   check (§4.7) that are broken or refused, with the status in words ("Refused 403", "404",
-  "Connection failed", "Timeout", "TLS error", "Too many redirects"). *Found on* comes from the
+  "Connection failed", "Timeout", "TLS error", "Too many redirects"); and the links whose scheme is
+  a typo of `http`/`https` (`htp://…`, `htps://…`), which the crawler never requests and lists in
+  its `skipped` table with the reason "Mistyped scheme" (rows that come with the result; a run of an
+  older crawler has none): the URL as written, the status "Mistyped scheme" (styled like a link
+  without an answer; the tooltip says the scheme is misspelled, so a browser cannot open it), the
+  kind and *Where* as for a crawled URL (the site's host internal, another host *External*, so in
+  *External broken* and *All external*), *Found on* from the `links` table, else the page of the
+  `skipped` row. They are counted like other broken links, are in Copy list and the link report,
+  and cannot be retried (no checkbox, not in *Select all*, no retry entries in the row menu); the
+  external link check does not request them. *Found on* comes from the
   crawler for crawled URLs of every status — the `url` event's page as the URL arrives, then every
   kept page of the `links` table (§4.8); joined from the `404` table for runs of an older crawler —
   and is the check's pages for external links (from the `links` table, all of them). The first is
