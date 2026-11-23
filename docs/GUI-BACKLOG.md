@@ -142,6 +142,22 @@ crawler as it is. Each entry says what the GUI does instead today.
       (`new URL(location.href)`); telling the two apart needs the style blocks to be cut out of
       the page first.
 
+19. **HTML character references in a URL attribute.** `FoundUrl::normalize_url` decodes only
+    `&amp;` and `&#38;`; every other reference is taken literally. Seen in crawls of a local
+    page (not fixed):
+    - `href="caf&eacute;.html"` is requested as `/caf&eacute;.html`: a 404 for a page that
+      exists and that a browser opens.
+    - `href="t.html?a=1&#038;b=2"` (how WordPress writes `&`), `?c=1&#x26;d=2` and
+      `dir&#x2F;p.html` are not requested at all.
+    - With `--browser`, Chromium writes a non-breaking space in an attribute as `&nbsp;`, so
+      the link of item 18 is reported as `/&nbsp;/x`, not `/%C2%A0/x` (a 404 either way, under
+      the wrong URL).
+
+    The GUI's own reading of a page parses the HTML and so decodes them: for such a link it
+    finds no reference ("not found on the page", no line). The fix belongs in the crawler:
+    decode the character references of an HTML attribute value before `normalize_url` (not in
+    stylesheet or script text).
+
 ## Requests
 
 7. **Default User-Agent.** The desktop default is `Chrome/<two-digit year>.0.0.0` (currently
