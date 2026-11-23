@@ -299,7 +299,7 @@ too (`style.min.css:1:20345`), any other reference by its line. Pages the crawle
 position for are **not fetched again**.
 
 **The app's own reading** is the fallback (`backend/link_text.rs`): the app fetches a page a broken
-or external link was found on and reads the text of the link that points to it and where in the
+(also one with a mistyped scheme) or external link was found on and reads the text of the link that points to it and where in the
 file it is — only for a reference the crawler gave no position for that the reading can locate (an
 HTML attribute or a stylesheet's `url()`: a run without `--link-details`, a page rendered with
 `--browser`), and for a run of a crawler without link data (its `404` table, as before). References
@@ -329,7 +329,8 @@ makes no request.
 - **The text**: the elements that reference the target (`a`/`area[href]`, `img[src|srcset]`,
   `source[src|srcset]`, `script[src]`, `link[href]`, `iframe[src]`, `video[src|poster]`,
   `audio[src]`), URLs resolved against the page and `<base href>` and compared normalized (scheme
-  and host case, default port, fragment, trailing slash, percent-encoding). `<a>`: its text,
+  and host case, default port, fragment, trailing slash, percent-encoding; only ASCII whitespace
+  around a URL is dropped, a non-breaking space is part of it, as for the crawler). `<a>`: its text,
   whitespace collapsed (around an image without text: `[image: alt]` / `[image]`); `<area>`/`<img>`:
   `alt`; otherwise the tag (`<script src>`). Up to three different texts joined by ` | `, at most 200
   characters. A page that does not reference the target: *not found on the page*. A reference

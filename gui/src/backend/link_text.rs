@@ -163,7 +163,7 @@ pub fn link_texts(html: &str, page_url: &str, targets: &[String]) -> BTreeMap<St
                 vec![value]
             };
             for url in urls {
-                let Ok(resolved) = base.join(url.trim()) else {
+                let Ok(resolved) = base.join(url.trim_ascii()) else {
                     continue;
                 };
                 let key = normalized(&resolved);
@@ -382,8 +382,9 @@ fn attribute_references(tag: &str, name: &str, raw: &str, start: usize, found: &
             }
         }
         _ => {
-            let lead = value.len() - value.trim_start().len();
-            let url = value.trim();
+            // Only ASCII whitespace is not part of the URL (a non-breaking space is).
+            let lead = value.len() - value.trim_ascii_start().len();
+            let url = value.trim_ascii();
             if !url.is_empty() {
                 found.push(Reference {
                     offset: at(lead),
@@ -537,7 +538,7 @@ pub fn locate(source: &str, url: &str, kind: SourceKind, targets: &[String]) -> 
     let wanted: HashSet<String> = targets.iter().map(|target| url_key(target)).collect();
     let mut found: BTreeMap<String, (usize, String, u32)> = BTreeMap::new();
     for reference in references {
-        let written = reference.url.trim();
+        let written = reference.url.trim_ascii();
         if written.is_empty() {
             continue;
         }
@@ -1096,6 +1097,37 @@ mod tests {
                 // Only in a comment and in a script: no position.
                 None,
                 None,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_url_is_matched_as_the_crawler_reports_it() {
+        // Only ASCII whitespace around a URL is not part of it: a non-breaking space is (the
+        // crawler requests `/%C2%A0/x.html`). A mistyped scheme is compared as written.
+        let html = "<p><a href=\"\u{a0}/x.html\">Nbsp</a>\n<a href=\" /y.html \">Spaces</a>\n<a href=\"htp://site.example/typo\">Typo</a></p>";
+        let targets = [
+            "https://site.example/%C2%A0/x.html",
+            "https://site.example/y.html",
+            "htp://site.example/typo",
+            "https://site.example/x.html",
+        ];
+        assert_eq!(
+            texts(html, "https://site.example/", &targets),
+            [
+                Some("Nbsp".to_string()),
+                Some("Spaces".to_string()),
+                Some("Typo".to_string()),
+                None
+            ]
+        );
+        assert_eq!(
+            positions(html, "https://site.example/", SourceKind::Html, &targets),
+            [
+                Some((1, 13, 1, false)),
+                Some((2, 11, 1, false)),
+                Some((3, 10, 1, false)),
+                None
             ]
         );
     }

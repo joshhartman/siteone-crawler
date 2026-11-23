@@ -575,6 +575,19 @@ impl RunLinks {
                 }
             }
         }
+        // A link with a mistyped scheme is no URL row: its pages are those of the `links` table,
+        // else the one the skipped URLs table names.
+        for (url, reference) in &self.mistyped {
+            let references: Vec<&CrawlerRef> = match self.graph.as_deref().and_then(|graph| graph.target(url)) {
+                Some(target) => target.refs.iter().collect(),
+                None => vec![reference],
+            };
+            for reference in references {
+                if reference.needs_fetch() {
+                    pairs.push((url.clone(), reference.source.to_string()));
+                }
+            }
+        }
         // The crawler named no page for these rows: the `404` table (crawlers before link data).
         pairs.extend(
             self.internal
@@ -1048,6 +1061,58 @@ mod tests {
             false,
         )];
         assert!(plain.crawled_pairs(&ok).is_empty());
+    }
+
+    #[test]
+    fn the_page_of_a_mistyped_link_is_read_when_the_crawler_gave_no_position() {
+        use crate::model::link_data::{LinkRow, UrlFacts};
+        let typo = "htp://site.example/typo";
+        let reference = CrawlerRef {
+            source: Arc::from("https://site.example/"),
+            attr: Arc::from("<a href>"),
+            text: None,
+            line: None,
+            column: None,
+        };
+        // Without link details: the page named by the skipped URLs table.
+        let mut links = RunLinks {
+            mistyped: vec![(typo.to_string(), reference)],
+            ..RunLinks::default()
+        };
+        let crawled = links.crawled_pairs(&[]);
+        assert_eq!(crawled, [(typo.to_string(), "https://site.example/".to_string())]);
+        assert_eq!(links.wanted_pages(&crawled), ["https://site.example/"]);
+        assert_eq!(links.text_targets(&crawled), [typo]);
+
+        // With link details: every page of the `links` table, and only those without a position
+        // (a page rendered with `--browser`).
+        let row = |source: &str, line: Option<u32>| LinkRow {
+            url: typo.to_string(),
+            source_url: source.to_string(),
+            source_attr: "<a href>".to_string(),
+            link_text: "Typo".to_string(),
+            source_line: line,
+            source_column: line.map(|_| 3),
+            in_links: Some(2),
+            external: false,
+        };
+        let graph = |rows: Vec<LinkRow>| Some(Arc::new(LinkGraph::build(rows, Vec::<(String, UrlFacts)>::new())));
+        links.graph = graph(vec![
+            row("https://site.example/", Some(7)),
+            row("https://site.example/b", Some(9)),
+        ]);
+        assert!(links.crawled_pairs(&[]).is_empty(), "complete crawler data: no fetch");
+        links.graph = graph(vec![
+            row("https://site.example/", None),
+            row("https://site.example/b", None),
+        ]);
+        assert_eq!(
+            links.crawled_pairs(&[]),
+            [
+                (typo.to_string(), "https://site.example/".to_string()),
+                (typo.to_string(), "https://site.example/b".to_string())
+            ]
+        );
     }
 
     #[test]
